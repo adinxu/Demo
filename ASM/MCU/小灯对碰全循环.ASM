@@ -1,0 +1,33 @@
+P11 EQU 20H
+P31 EQU 21H
+    MOV P11,#0FEH
+    MOV P31,#7FH
+S: MOV P1,P11
+     MOV P3,P31
+     ACALL DE
+     MOV A,P11
+     RL A
+     MOV P11,A
+     MOV A,P31
+     RR A
+     MOV P31,A
+     JNB 07H,S1
+     SJMP S
+S1: MOV P1,P11
+    MOV P3,P31
+    ACALL DE
+    MOV A,P11
+     RR A
+     MOV P11,A
+     MOV A,P31
+     RL A
+     MOV P31,A
+     JNB 00H,S
+     SJMP S1
+DE: MOV R4,#50 ;ÑÓÊ±×Ó³ÌÐò
+DE0:MOV R3,#20
+DE1:MOV R2,#250
+    DJNZ R2,$
+    DJNZ R3,DE1
+    DJNZ R4,DE0
+    RET
