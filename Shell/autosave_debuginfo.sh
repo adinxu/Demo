@@ -1,14 +1,15 @@
 #!/bin/bash
 #基本原理:1.linux中使用aarch64-none-linux-gnu-objcopy的--only-keep-debug选项可以将进程文件的调试信息单独保存到一个调试文件，以用于后续调试
-#2.在gdb中可以使用add-symbol-file来添加调试文件用来调试，在使用时指定的地址为对进程文件使用readelf -S的输出信息中.text段的Address字段值
+#2.在gdb中可以使用add-symbol-file来添加调试文件用来调试，在使用时指定的地址为对进程文件使用readelf -S的输出信息中.text段的Address字段值(位于第4列)
 #目标:结合上述基本原理中的原理1和原理2，生成一个shell脚本，这个脚本可以在脚本参数指定的路径下遍历的所有进程文件，应用下面提到的单个进程处理逻辑，然后生成一系列调试文件到由脚本参数指定的另一路径下，
-#这些调试文件的命名是由{对应进程的名字_add-symbol-file_Address字段值.dbg}组成的，生成这些调试文件后，就可以在gdb中自定义gdb函数，
-#从调试文件名中提取出对应进程的名字和加载指令，以应用调试文件，最后组成的指令为{add-symbol-file 调试文件名 加载指令}
+#这些调试文件的命名是由{对应进程的名字_add-symbol-file_Address字段值.dbg}组成的，生成这些调试文件后，再继续分别对每个调试文件生成单个的gdb脚本文件，这个gdb脚本文件的内容是用于gdb调试的，
+#这个gdb脚本文件的内容是用来调试对应进程的，指令为{add-symbol-file 调试文件名 加载指令}，其中的加载指令是从调试文件的文件名中提取的。这个gdb脚本的文件名是{对应进程的名字.gdb}
 #单个进程处理逻辑:
 #1.获取进程名字
 #2.使用readelf -S命令获取进程的.text段的Address字段值,将字段值前面附加0x，以便后续使用
 #3.将第1步中的进程名字，指令add-symbol-file，以及第2步中的Address字段值拼接，组成要生成的调试文件的文件名，例如进程名字为test，Address字段值为0x1000，则要生成的调试文件的文件名为{test_add-symbol-file_0x1000.dbg}
 #4.使用aarch64-none-linux-gnu-objcopy的--only-keep-debug选项将调试信息保存到调试文件中，命名为第3步中的文件名
+#完成所有的调试文件生成后，再依照上述目标中的要求生成gdb脚本文件
 
 # 检查参数个数
 if [ $# -ne 2 ]; then
@@ -17,7 +18,7 @@ if [ $# -ne 2 ]; then
 fi
 
 PROCESS_PATH=$1
-DEBUG_PATH=$3
+DEBUG_PATH=$2
 
 # 确保目标目录存在
 mkdir -p "$DEBUG_PATH"
@@ -52,3 +53,17 @@ find "$PROCESS_PATH" -type f -executable | while read process_file; do
         fi
     fi
 done
+
+# 清空之前生成的gdb文件
+rm -f "$DEBUG_PATH"/*.gdb
+
+# 生成gdb脚本文件
+for debug_file in "$DEBUG_PATH"/*_add-symbol-file_*.dbg; do
+    process_name=$(basename "$debug_file" | cut -d'_' -f1)
+    text_addr=$(basename "$debug_file" | cut -d'_' -f3 | cut -d'.' -f1)
+    gdb_script="${DEBUG_PATH}/${process_name}.gdb"
+    
+    echo "add-symbol-file $(basename "$debug_file") $text_addr" > "$gdb_script"
+    echo "Successfully created gdb script: $gdb_script"
+done
+
