@@ -1,4 +1,13 @@
 #!/bin/bash
+<<COMMENT
+V1.0 编写完成
+#若是拷贝内容到脚本保存，需要注意linux和winodws换行符差异！！！
+SCRIPT_SH_URL=https://yfgitlab.dahuatech.com/-/snippets/338/raw/main/autosave_debuginfo.sh?inline=false
+GENERATE_SCRIPT_SH_URL=https://yfgitlab.dahuatech.com/-/snippets/255/raw/main/generate_script.sh?inline=false
+source <(curl -sSfk ${GENERATE_SCRIPT_SH_URL})
+generate_new_script ${SCRIPT_SH_URL}
+COMMENT
+
 #基本原理:1.linux中使用aarch64-none-linux-gnu-objcopy的--only-keep-debug选项可以将进程文件的调试信息单独保存到一个调试文件，以用于后续调试
 #2.在gdb中可以使用add-symbol-file来添加调试文件用来调试，在使用时指定的地址为对进程文件使用readelf -S的输出信息中.text段的Address字段值(位于第4列)
 #目标:结合上述基本原理中的原理1和原理2，生成一个shell脚本，这个脚本可以在脚本参数指定的路径下遍历的所有进程文件，应用下面提到的单个进程处理逻辑，然后生成一系列调试文件到由脚本参数指定的另一路径下，
@@ -63,7 +72,9 @@ for debug_file in "$DEBUG_PATH"/*_add-symbol-file_*.dbg; do
     text_addr=$(basename "$debug_file" | cut -d'_' -f3 | cut -d'.' -f1)
     gdb_script="${DEBUG_PATH}/${process_name}.gdb"
     
-    echo "add-symbol-file $(basename "$debug_file") $text_addr" > "$gdb_script"
+    # 添加 set confirm off 以自动确认所有提示
+    echo "set confirm off" > "$gdb_script"
+    echo "add-symbol-file $(basename "$debug_file") $text_addr" >> "$gdb_script"
     echo "Successfully created gdb script: $gdb_script"
 done
 

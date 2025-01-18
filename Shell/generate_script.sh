@@ -41,5 +41,6 @@ function generate_new_script() {
 	self_print "processing ${SCRIPT_SH_URL}"
 	chmod +x ${SCRIPT_NAME}
 	self_print "process over,now you can use ${SCRIPT_NAME} now"
+	self_print "如有bug，请联系徐伟东(344272)解决"
 }
 
