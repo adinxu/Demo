@@ -3,7 +3,7 @@
 ## 问题陈述与背景
 - 交付一个可复用的 C 终端发现代理，能够运行在异构交换机操作系统上（首期锁定 Realtek SDK，后续覆盖 Netforward/Linux 等变体）。
 - 通过过路的二层报文识别终端、维护存活状态，并以最小的特定平台代码将终端状态暴露给交换设备的上层模块。
-- 现有 Realtek 平台默认仅在创建虚接口时上送 ARP，需要新模块在设备启动时主动确保所有二层口的 ARP 报文 copy-to-CPU 能力，以支撑发现流程。
+- 现有 Realtek 平台已完成 ACL 适配，可持续上送 ARP 报文，不再需要终端发现模块额外确保 copy-to-CPU 能力。
 
 ## 目标
 - 通过检查二层控制报文发现终端（当前聚焦 ARP，可扩展至 DHCP 等协议）。
@@ -18,19 +18,19 @@
 - 不提供 UI/CLI 集成，仅关注后端接口。
 
 ## 功能性需求
-1. **终端发现**：处理 ARP 广播、免费 ARP、单播回复等，按 VLAN/接口识别终端；后续需可扩展至 DHCP 报文。
+1. **终端发现**：仅处理接收到的 ARP 广播、免费 ARP、单播回复等（本机发送的 ARP 已在适配层过滤），按 VLAN/接口识别终端；后续需可扩展至 DHCP 报文。
 2. **保活机制**：每个终端每 120 秒发送一次单播 ARP request；连续三次无响应则删除终端。
 3. **接口感知**：追踪三层 VLAN 接口生命周期（创建/删除/上下线、IP 变更），接口无效时暂停保活。
 4. **Access/Trunk 逻辑**：根据 VLAN 成员关系判定；无标签时回退到 PVID；Trunk 口 permit 但无虚接口的 VLAN 需按三层 Down 逻辑处理。
-5. **拓扑边界场景**：当关联的三层接口 down、VLAN 缺少虚接口或 IP 不同网段时保留 30 分钟，期间不发送保活；恢复后转入探测态。
-6. **多网卡支持**：兼容单网卡和多网卡设备，同时允许多个适配器并行工作。
+5. **拓扑边界场景**：当关联的三层接口 down、VLAN 缺少虚接口或出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）时保留 30 分钟，期间不发送保活；恢复后转入探测态。
+6. **平台适配**：为不同平台提供独立适配器实现，部署时按平台选择单个适配器运行（不在同一进程内并行多个适配器）。
 7. **事件上报**：
    - 支持配置最小时间间隔的增量变更通知（避免频繁上报）。
    - 支持查询当前终端表的全量快照，并确保增量上报状态与查询快照一致。
 8. **可配置项**：
    - 可配置通知节流间隔（0–3600 秒）。
    - 可配置终端保活周期、最大终端数量（200、300、500、1000 等档位）。
-   - 启动时可选择平台适配器；为每个适配器定义必要的端口/VLAN 过滤参数。
+   - 启动时按配置选择唯一的平台适配器；为该适配器定义必要的端口/VLAN 过滤参数。
 
 - **性能**：
    - 1k 终端负载时单核占用 <10%，并确保在现有硬件 ARP 限速机制基础上仍不丢包。
@@ -44,9 +44,9 @@
 ## 架构概览
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
 - **平台适配接口（PAI）**：抽象报文收发、接口事件、时钟/定时器等平台差异。
-   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`subscribe_iface_events`、`schedule_timer`、`log_write`。
+   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`subscribe_iface_events`、`schedule_timer`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
    - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
-   - Realtek 适配器在初始化时确认所有二层口均启用 ARP Copy-to-CPU ACL（当前系统已默认在启动阶段完成），并监听物理口（如 `eth0`）收包；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
+   - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
 - **事件总线**：内部队列在节流窗口内聚合终端变更并投递给上报子系统。
 - **API 接口**：提供 `terminal_query_all`、`terminal_subscribe`、`terminal_config_set` 等 C API；内部实现需兼容外部团队计划提供的 C++ API。
 
@@ -57,7 +57,7 @@
    - 事件循环可按功能设计（如 epoll、poll 或自定义调度），不强制依赖 `loop_protect_epoll_loop` 实现。
    - 报文发送通过 Raw Socket 直接绑定至 VLAN 对应的虚接口（例如 VLAN1 对应 `vlan1`），填充 ARP request 后发出，避免引入 SDK 依赖。
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
-   - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致。
+   - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
     - 预计由外部团队提供以下接口，终端发现模块需兼容其调用方式并支持 C/C++ 混合编译：
        - `typedef std::vector<std::map<std::string, std::string>> MAC_IP_INFO;`
@@ -76,12 +76,12 @@
    2. 收到 Access 口报文、且无对应虚接口时终端保持发现状态但不保活；Trunk 口报文根据 VLAN permit 集合判断是否存在虚接口，若不存在则按无虚接口逻辑处理。
    3. 需感知虚接口创建/删除、IP 变更、接口状态变更；接口无效时终端迁移至 `IFACE_INVALID` 状态，30 分钟后淘汰。
 - **报文路径**：
-   1. 适配器上报入方向帧的元数据（MAC、VLAN、入接口、时间戳）给发现引擎，需解析 VLAN tag。
+   1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。
    3. 发送路径依据虚接口信息构造 ARP request，经 Raw Socket 发送至三层口，无需查二层转发表。
 - **终端状态机**：
    - `(收到报文) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`。
-   - `ACTIVE → IFACE_INVALID`：接口 down、ARP request 非同网段或 VLAN 无虚接口；`IFACE_INVALID` 保留 30 分钟后删除。
+         - `ACTIVE → IFACE_INVALID`：接口 down、出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）或 VLAN 无虚接口；`IFACE_INVALID` 保留 30 分钟后删除。
    - `IFACE_INVALID → PROBING`：接口 up、IP 改为同网段或新增虚接口时复活。
    - `PROBING → ACTIVE`：收到回应即恢复活跃。
 - **保活循环**：
@@ -143,7 +143,7 @@
 
 ## 未决问题
 - Realtek 平台上，当 trunk 口混合存在未建虚接口的 VLAN 时的报文行为需在实验室确认。
-- 无 VLANIF 时广播/单播 ARP 是否始终 copy-to-CPU 仍需确认，避免丢失关键发现报文。
+- 无 VLANIF 时广播/单播 ARP copy-to-CPU 行为已由平台 ACL 保障，终端发现模块无需额外确认。
 - Netforward、通用 Linux 平台的接口事件获取机制尚未确定，需要在适配器设计时补齐。
 - 事件负载的消费者使用的格式（计划采用的二进制 TLV 还是 JSON）仍需与系统集成团队确认，避免接口不匹配。
 

@@ -2,7 +2,7 @@
 
 该示例重新建立终端发现项目阶段 0 的验证基线，提供一个 C 语言程序，可实现：
 
-- **接收模式**：在物理接口（如 `eth0`）上捕获 ARP 帧，可选加载经典 BPF 过滤器，并在存在 VLAN 标签时输出 VLAN 信息；
+- **接收模式**：在物理接口（如 `eth0`）上捕获入方向 ARP 帧，程序会强制加载内建 BPF 过滤器（筛 EtherType 与 `pkttype`）并启用 `PACKET_AUXDATA`，即使内核剥离了 802.1Q 标签也能打印 VLAN 信息；本机发送的 ARP 会被过滤；
 - **发送模式**：在 VLAN 接口（如 `vlan1`）上按可配置节奏发送 ARP 请求，用于验证瑞昱平台 100 ms 探测节奏的可行性。
 
 两个模式可以同时开启。
@@ -23,12 +23,11 @@ make CC=mipsel-linux-gnu-gcc CFLAGS="-std=c11 -O2"
 ### 接收模式
 
 ```sh
-sudo ./stage0_raw_socket_demo --rx-iface eth0 [--timeout 60] [--no-bpf] [--verbose]
+sudo ./stage0_raw_socket_demo --rx-iface eth0 [--timeout 60] [--verbose]
 ```
 
 - `--rx-iface`：指定抓包接口，默认 `eth0`；
 - `--timeout`：接口在指定秒数内无数据后退出（默认不退出）；
-- `--no-bpf`：禁用默认 ARP 过滤器，改为捕获全部以太帧；
 - `--verbose`：输出每帧前 64 字节的十六进制预览。
 
 ### 发送模式

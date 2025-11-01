@@ -6,6 +6,7 @@
 
 ## 假设与非目标
 - Realtek 平台具备 Raw Socket 能力并允许绑定 VLAN 虚接口（如 `vlan1`），推荐交叉编译前缀为 `mips-rtl83xx-linux-`（如 `mips-rtl83xx-linux-gcc`）；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
+- 终端发现逻辑仅依赖入方向 ARP 报文；适配器需在收包侧过滤掉本机发送的 ARP，避免无意义事件，并在内核剥离 VLAN tag 时通过 `PACKET_AUXDATA` 取回原始 VLAN。
 - 设备启动阶段已默认为所有二层口启用 ARP Copy-to-CPU ACL，适配器无需额外校验或感知该配置。
 - 设备上存在网络测试仪或等效工具，可模拟 ≥300 个终端。
 - 暂不考虑软件层面的 ARP 限速策略；若后续平台启用，需要重新评估。
@@ -20,7 +21,7 @@
 ### 阶段 0：Realtek Demo 验证
 1. 搭建测试环境：网络测试仪与目标交换机实连，确保 `eth0` 抓取/发送能力正常。
 2. 编写最小 Raw Socket demo（以 C 语言实现）：
-   - 接收端监听 `eth0` 并应用 BPF 过滤器（实现见 `src/demo/stage0_raw_socket_demo.c`）。
+   - 接收端必须监听 `eth0` 且强制加载内建 BPF 过滤器（实现见 `src/demo/stage0_raw_socket_demo.c`），BPF 同时筛 EtherType 与 `pkttype`，仅让入方向 ARP 通过；并启用 `PACKET_AUXDATA` 以解读被内核剥离的 VLAN 标签。
    - 发送端绑定 `vlan1`，周期性下发 ARP request；使用同一程序的 `--tx-iface` 参数可切换接口。
    - 确认收包路径正确解析 VLAN tag（无 CPU tag）。
 3. 使用网络测试仪模拟至少 300 个终端：
@@ -34,7 +35,7 @@
    - 使用可移植的线程/锁与事件循环（epoll/poll/自定义）。
    - 集成 Raw Socket+BPF 接收链路，保持与 demo 一致，解析 VLAN tag 并映射 Access/Trunk 上下文。
    - 在 VLAN 虚接口上发送 ARP keepalive，无需 SDK 依赖，并按 100ms 节奏分散探测报文。
-3. 补充配置加载与日志抽象，支持运行时切换适配器或调试级别。
+3. 补充配置加载与日志抽象，支持在启动阶段选择单个适配器并调整调试级别。
 
 ### 阶段 2：核心终端引擎
 1. 实现终端数据结构、状态机（ACTIVE/PROBING/IFACE_INVALID）。

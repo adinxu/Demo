@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,7 +41,6 @@ struct options {
     int interval_ms;
     unsigned long long count;
     int timeout_sec;
-    bool use_bpf;
     bool verbose;
     bool rx_enabled;
     bool tx_enabled;
@@ -122,8 +122,13 @@ static void hex_dump(const uint8_t *data, size_t len) {
 }
 
 static int attach_arp_filter(int fd) {
-    /* Accept plain ARP and single-tag VLAN ARP frames. */
+    /* Accept inbound ARP and single-tag VLAN ARP frames. */
     struct sock_filter code[] = {
+        {BPF_LD | BPF_B | BPF_ABS, 0, 0, SKF_AD_OFF + SKF_AD_PKTTYPE},        /* packet direction */
+        {BPF_JMP | BPF_JEQ | BPF_K, 3, 0, PACKET_HOST},                       /* accept host */
+        {BPF_JMP | BPF_JEQ | BPF_K, 2, 0, PACKET_BROADCAST},                  /* accept broadcast */
+        {BPF_JMP | BPF_JEQ | BPF_K, 1, 0, PACKET_MULTICAST},                  /* accept multicast */
+        {BPF_RET | BPF_K, 0, 0, 0},                                           /* reject others */
         {BPF_LD | BPF_H | BPF_ABS, 0, 0, 12},                        /* EtherType */
         {BPF_JMP | BPF_JEQ | BPF_K, 6, 0, htons(ETH_P_ARP)},         /* direct ARP */
         {BPF_JMP | BPF_JEQ | BPF_K, 2, 0, htons(ETH_P_8021Q)},       /* 802.1Q */
@@ -147,7 +152,7 @@ static int attach_arp_filter(int fd) {
     return 0;
 }
 
-static int create_recv_socket(const char *iface, bool use_bpf) {
+static int create_recv_socket(const char *iface) {
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (fd < 0) {
         perror("socket(AF_PACKET)");
@@ -176,7 +181,14 @@ static int create_recv_socket(const char *iface, bool use_bpf) {
         return -1;
     }
 
-    if (use_bpf && attach_arp_filter(fd) < 0) {
+    if (attach_arp_filter(fd) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    int enable_aux = 1;
+    if (setsockopt(fd, SOL_PACKET, PACKET_AUXDATA, &enable_aux, sizeof(enable_aux)) < 0) {
+        perror("setsockopt(PACKET_AUXDATA)");
         close(fd);
         return -1;
     }
@@ -347,14 +359,26 @@ static void *receiver_thread(void *arg) {
         }
 
         struct sockaddr_ll addr;
-        socklen_t addr_len = sizeof(addr);
-        ssize_t received = recvfrom(args->fd, buffer, sizeof(buffer), 0,
-                                    (struct sockaddr *)&addr, &addr_len);
+        uint8_t control[CMSG_SPACE(sizeof(struct tpacket_auxdata))];
+        struct iovec iov = {
+            .iov_base = buffer,
+            .iov_len = sizeof(buffer),
+        };
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_name = &addr;
+        msg.msg_namelen = sizeof(addr);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        ssize_t received = recvmsg(args->fd, &msg, 0);
         if (received < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("recvfrom");
+            perror("recvmsg");
             continue;
         }
         if (received < (ssize_t)(sizeof(struct ethhdr))) {
@@ -367,6 +391,27 @@ static void *receiver_thread(void *arg) {
         memcpy(&eth_local, buffer, sizeof(eth_local));
         uint16_t ether_type = ntohs(eth_local.h_proto);
         int vlan_id = -1;
+
+        if (msg.msg_controllen >= sizeof(struct cmsghdr)) {
+            for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+                 cmsg != NULL;
+                 cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                if (cmsg->cmsg_level == SOL_PACKET && cmsg->cmsg_type == PACKET_AUXDATA) {
+                    const struct tpacket_auxdata *aux = (const struct tpacket_auxdata *)CMSG_DATA(cmsg);
+#ifdef TP_STATUS_VLAN_VALID
+                    if (aux->tp_status & TP_STATUS_VLAN_VALID) {
+                        vlan_id = aux->tp_vlan_tci & 0x0FFF;
+                        break;
+                    }
+#else
+                    if (aux->tp_vlan_tci != 0 || aux->tp_vlan_tpid != 0) {
+                        vlan_id = aux->tp_vlan_tci & 0x0FFF;
+                        break;
+                    }
+#endif
+                }
+            }
+        }
 
         if (ether_type == ETH_P_8021Q || ether_type == ETH_P_8021AD) {
             if (received < (ssize_t)(sizeof(struct ethhdr) + sizeof(struct vlan_header))) {
@@ -464,7 +509,6 @@ static void print_usage(const char *prog) {
             "Receive options:\n"
             "  --rx-iface <ifname>     Interface to capture ARP frames (default eth0)\n"
             "  --timeout <sec>        Stop receiver after idle seconds (0 disables)\n"
-            "  --no-bpf               Disable built-in ARP BPF filter\n"
             "  --verbose              Hex dump captured frames (first 64 bytes)\n"
             "\n"
             "Transmit options:\n"
@@ -490,7 +534,6 @@ static void init_default_options(struct options *opts) {
     snprintf(opts->rx_iface, IFNAMSIZ, "%s", DEFAULT_RX_IFACE);
     opts->interval_ms = DEFAULT_INTERVAL_MS;
     opts->timeout_sec = 0;
-    opts->use_bpf = true;
     opts->rx_enabled = true;
     memset(opts->dst_mac, 0xFF, ETH_ALEN);
     parse_ip_address("192.168.1.100", &opts->dst_ip);
@@ -511,14 +554,13 @@ int main(int argc, char *argv[]) {
         {"interval-ms", required_argument, NULL, 'i'},
         {"count", required_argument, NULL, 'c'},
         {"timeout", required_argument, NULL, 'T'},
-        {"no-bpf", no_argument, NULL, 'b'},
         {"verbose", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "r:t:m:s:M:d:i:c:T:bvh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "r:t:m:s:M:d:i:c:T:vh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'r':
             snprintf(opts.rx_iface, IFNAMSIZ, "%s", optarg);
@@ -572,9 +614,6 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             break;
-        case 'b':
-            opts.use_bpf = false;
-            break;
         case 'v':
             opts.verbose = true;
             break;
@@ -606,7 +645,7 @@ int main(int argc, char *argv[]) {
     memset(&rx_args, 0, sizeof(rx_args));
 
     if (opts.rx_enabled) {
-        int recv_fd = create_recv_socket(opts.rx_iface, opts.use_bpf);
+        int recv_fd = create_recv_socket(opts.rx_iface);
         if (recv_fd < 0) {
             if (!opts.tx_enabled) {
                 return 1;
