@@ -1,0 +1,357 @@
+#define _GNU_SOURCE
+
+#include "terminal_manager.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <net/if.h>
+#include <netinet/if_ether.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "td_logging.h"
+
+#ifndef TERMINAL_BUCKET_COUNT
+#define TERMINAL_BUCKET_COUNT 256
+#endif
+
+struct terminal_manager {
+    struct terminal_manager_config cfg;
+    td_adapter_t *adapter;
+    terminal_probe_fn probe_cb;
+    void *probe_ctx;
+
+    pthread_mutex_t lock;
+    struct terminal_entry *table[TERMINAL_BUCKET_COUNT];
+};
+
+static size_t hash_key(const struct terminal_key *key) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < ETH_ALEN; ++i) {
+        hash ^= key->mac[i];
+        hash *= 1099511628211ULL;
+    }
+    const uint8_t *ip_bytes = (const uint8_t *)&key->ip.s_addr;
+    for (size_t i = 0; i < sizeof(key->ip.s_addr); ++i) {
+        hash ^= ip_bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return (size_t)hash;
+}
+
+static struct terminal_entry *find_entry(struct terminal_manager *mgr,
+                                         const struct terminal_key *key,
+                                         size_t bucket,
+                                         struct terminal_entry ***prev_next_out) {
+    struct terminal_entry **prev_next = &mgr->table[bucket];
+    struct terminal_entry *node = mgr->table[bucket];
+    while (node) {
+        if (memcmp(node->key.mac, key->mac, ETH_ALEN) == 0 &&
+            node->key.ip.s_addr == key->ip.s_addr) {
+                if (prev_next_out) {
+                    *prev_next_out = prev_next;
+                }
+                return node;
+            }
+        prev_next = &node->next;
+        node = node->next;
+    }
+    if (prev_next_out) {
+        *prev_next_out = prev_next;
+    }
+    return NULL;
+}
+
+static const char *state_to_string(terminal_state_t state) {
+    switch (state) {
+    case TERMINAL_STATE_ACTIVE:
+        return "ACTIVE";
+    case TERMINAL_STATE_PROBING:
+        return "PROBING";
+    case TERMINAL_STATE_IFACE_INVALID:
+        return "IFACE_INVALID";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void update_binding_from_packet(struct terminal_entry *entry,
+                                       const struct td_adapter_packet_view *packet) {
+    if (!packet) {
+        return;
+    }
+    if (packet->ifname[0]) {
+        snprintf(entry->meta.ingress_ifname, sizeof(entry->meta.ingress_ifname), "%s", packet->ifname);
+    }
+    entry->meta.ingress_ifindex = packet->ifindex;
+    entry->meta.vlan_id = packet->vlan_id;
+
+    /* Bind the TX interface to the ingress context if not already set or changed. */
+    if (packet->ifname[0]) {
+        snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", packet->ifname);
+    }
+    entry->tx_ifindex = packet->ifindex;
+}
+
+static struct terminal_entry *create_entry(const struct terminal_key *key,
+                                           const struct td_adapter_packet_view *packet) {
+    struct terminal_entry *entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        return NULL;
+    }
+
+    entry->key = *key;
+    entry->state = TERMINAL_STATE_ACTIVE;
+    clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+    entry->last_probe.tv_sec = 0;
+    entry->last_probe.tv_nsec = 0;
+    entry->failed_probes = 0;
+    memset(&entry->meta, 0, sizeof(entry->meta));
+    entry->meta.vlan_id = -1;
+    entry->tx_iface[0] = '\0';
+    entry->tx_ifindex = -1;
+    entry->next = NULL;
+
+    if (packet) {
+        update_binding_from_packet(entry, packet);
+    }
+
+    return entry;
+}
+
+struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
+                                                  td_adapter_t *adapter,
+                                                  terminal_probe_fn probe_cb,
+                                                  void *probe_ctx) {
+    if (!cfg || !adapter) {
+        return NULL;
+    }
+
+    struct terminal_manager *mgr = calloc(1, sizeof(*mgr));
+    if (!mgr) {
+        return NULL;
+    }
+
+    mgr->cfg = *cfg;
+    mgr->adapter = adapter;
+    mgr->probe_cb = probe_cb;
+    mgr->probe_ctx = probe_ctx;
+    pthread_mutex_init(&mgr->lock, NULL);
+
+    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
+        mgr->table[i] = NULL;
+    }
+
+    return mgr;
+}
+
+void terminal_manager_destroy(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
+        struct terminal_entry *node = mgr->table[i];
+        while (node) {
+            struct terminal_entry *next = node->next;
+            free(node);
+            node = next;
+        }
+        mgr->table[i] = NULL;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    pthread_mutex_destroy(&mgr->lock);
+    free(mgr);
+}
+
+static void log_transition(const struct terminal_entry *entry, terminal_state_t new_state) {
+    char mac_buf[18];
+    snprintf(mac_buf, sizeof(mac_buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+             entry->key.mac[0], entry->key.mac[1], entry->key.mac[2],
+             entry->key.mac[3], entry->key.mac[4], entry->key.mac[5]);
+
+    char ip_buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &entry->key.ip, ip_buf, sizeof(ip_buf));
+
+    td_log_writef(TD_LOG_DEBUG,
+                  "terminal_manager",
+                  "terminal %s/%s state %s -> %s (iface=%s vlan=%d)",
+                  mac_buf,
+                  ip_buf,
+                  state_to_string(entry->state),
+                  state_to_string(new_state),
+                  entry->tx_iface,
+                  entry->meta.vlan_id);
+}
+
+static void set_state(struct terminal_entry *entry, terminal_state_t new_state) {
+    if (entry->state == new_state) {
+        return;
+    }
+    log_transition(entry, new_state);
+    entry->state = new_state;
+}
+
+void terminal_manager_on_packet(struct terminal_manager *mgr,
+                                const struct td_adapter_packet_view *packet) {
+    if (!mgr || !packet) {
+        return;
+    }
+
+    if (packet->payload_len < sizeof(struct ether_arp)) {
+        return;
+    }
+
+    const struct ether_arp *arp = (const struct ether_arp *)packet->payload;
+    struct terminal_key key;
+    memcpy(key.mac, arp->arp_sha, ETH_ALEN);
+    memcpy(&key.ip.s_addr, arp->arp_spa, sizeof(key.ip.s_addr));
+
+    size_t bucket = hash_key(&key) % TERMINAL_BUCKET_COUNT;
+
+    pthread_mutex_lock(&mgr->lock);
+
+    struct terminal_entry **prev_next = NULL;
+    struct terminal_entry *entry = find_entry(mgr, &key, bucket, &prev_next);
+    if (!entry) {
+        entry = create_entry(&key, packet);
+        if (!entry) {
+            pthread_mutex_unlock(&mgr->lock);
+            return;
+        }
+        entry->next = mgr->table[bucket];
+        mgr->table[bucket] = entry;
+        td_log_writef(TD_LOG_INFO,
+                      "terminal_manager",
+                      "new terminal discovered on %s vlan=%d",
+                      entry->tx_iface,
+                      entry->meta.vlan_id);
+    } else {
+        clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+        update_binding_from_packet(entry, packet);
+    }
+
+    entry->failed_probes = 0;
+    clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+
+    if (entry->state == TERMINAL_STATE_IFACE_INVALID) {
+        set_state(entry, TERMINAL_STATE_PROBING);
+    } else {
+        set_state(entry, TERMINAL_STATE_ACTIVE);
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+static bool is_iface_available(const struct terminal_entry *entry) {
+    return entry->tx_iface[0] != '\0' && entry->tx_ifindex > 0;
+}
+
+static bool has_expired(const struct terminal_manager *mgr,
+                        const struct terminal_entry *entry,
+                        const struct timespec *now) {
+    (void)mgr;
+    if (entry->state != TERMINAL_STATE_IFACE_INVALID) {
+        return false;
+    }
+
+    time_t diff = now->tv_sec - entry->last_seen.tv_sec;
+    return diff >= (time_t)mgr->cfg.iface_invalid_holdoff_sec;
+}
+
+void terminal_manager_on_timer(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    pthread_mutex_lock(&mgr->lock);
+
+    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
+        struct terminal_entry **prev_next = &mgr->table[i];
+        struct terminal_entry *entry = mgr->table[i];
+        while (entry) {
+            bool remove = false;
+
+            if (has_expired(mgr, entry, &now)) {
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_manager",
+                              "terminal expired after iface invalid holdoff: state=%s", state_to_string(entry->state));
+                remove = true;
+            } else {
+                time_t since_last_seen = now.tv_sec - entry->last_seen.tv_sec;
+                time_t since_last_probe = entry->last_probe.tv_sec ? (now.tv_sec - entry->last_probe.tv_sec) : (time_t)mgr->cfg.keepalive_interval_sec;
+
+                bool need_probe = since_last_seen >= (time_t)mgr->cfg.keepalive_interval_sec &&
+                                   since_last_probe >= (time_t)mgr->cfg.keepalive_interval_sec;
+
+                if (need_probe) {
+                    if (!is_iface_available(entry)) {
+                        set_state(entry, TERMINAL_STATE_IFACE_INVALID);
+                    } else {
+                        set_state(entry, TERMINAL_STATE_PROBING);
+                        entry->last_probe = now;
+                        entry->failed_probes += 1;
+
+                        if (mgr->probe_cb) {
+                            mgr->probe_cb(entry, mgr->probe_ctx);
+                        }
+
+                        if (entry->failed_probes >= mgr->cfg.keepalive_miss_threshold) {
+                            td_log_writef(TD_LOG_INFO,
+                                          "terminal_manager",
+                                          "terminal exceeded probe failure threshold (iface=%s)",
+                                          entry->tx_iface);
+                            remove = true;
+                        }
+                    }
+                }
+            }
+
+            if (remove) {
+                struct terminal_entry *to_free = entry;
+                *prev_next = entry->next;
+                entry = entry->next;
+                free(to_free);
+            } else {
+                prev_next = &entry->next;
+                entry = entry->next;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+void terminal_manager_on_iface_event(struct terminal_manager *mgr,
+                                     const struct td_adapter_iface_event *event) {
+    if (!mgr || !event) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
+        for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
+            if (strncmp(entry->tx_iface, event->ifname, sizeof(entry->tx_iface)) == 0) {
+                bool now_up = (event->flags_after & IFF_UP) != 0;
+                if (!now_up) {
+                    set_state(entry, TERMINAL_STATE_IFACE_INVALID);
+                    clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+                } else {
+                    set_state(entry, TERMINAL_STATE_PROBING);
+                    entry->failed_probes = 0;
+                    entry->last_probe.tv_sec = 0;
+                    entry->last_probe.tv_nsec = 0;
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+}
