@@ -1,52 +1,64 @@
-# 阶段 0 Raw Socket 演示程序
+# 阶段 0 Raw Socket 演示
 
-该示例用于验证在 Linux 环境下通过 Raw Socket 捕获 ARP 报文，并在指定 VLAN 虚接口周期发送 ARP 探测的可行性。程序采用 C 语言编写，可在 x86 开发机直接编译运行，若需在 Realtek MIPS 平台上验证，可通过交叉编译获得可执行文件。
+该示例重新建立终端发现项目阶段 0 的验证基线，提供一个 C 语言程序，可实现：
 
-## 编译步骤
+- **接收模式**：在物理接口（如 `eth0`）上捕获 ARP 帧，可选加载经典 BPF 过滤器，并在存在 VLAN 标签时输出 VLAN 信息；
+- **发送模式**：在 VLAN 接口（如 `vlan1`）上按可配置节奏发送 ARP 请求，用于验证瑞昱平台 100 ms 探测节奏的可行性。
 
-```bash
+两个模式可以同时开启。
+
+## 编译
+
+```sh
 cd src/demo
 make
-# 或交叉编译（示例）
+# 交叉编译示例
 make CC=mipsel-linux-gnu-gcc CFLAGS="-std=c11 -O2"
 ```
 
-生成的二进制位于 `src/demo/stage0_raw_socket_demo`。
+生成的可执行文件为 `stage0_raw_socket_demo`。运行时需具备 `sudo` 权限或授予二进制 `cap_net_raw` 能力。
 
-> **注意**：交叉编译时请将 `mipsel-linux-gnu-gcc` 替换为实际使用的工具链前缀，并确保链接 pthread 库。
+## 使用方法
 
-## 运行示例
+### 接收模式
 
-```bash
-sudo ./stage0_raw_socket_demo \
-  --rx-iface eth0 \
-  --tx-iface vlan1 \
-  --target-ip 192.168.1.1 \
-  --interval 120
+```sh
+sudo ./stage0_raw_socket_demo --rx-iface eth0 [--timeout 60] [--no-bpf] [--verbose]
 ```
 
-参数说明：
+- `--rx-iface`：指定抓包接口，默认 `eth0`；
+- `--timeout`：接口在指定秒数内无数据后退出（默认不退出）；
+- `--no-bpf`：禁用默认 ARP 过滤器，改为捕获全部以太帧；
+- `--verbose`：输出每帧前 64 字节的十六进制预览。
 
-- `--rx-iface`：监听 ARP 报文的物理接口，默认 `eth0`。
-- `--tx-iface`：发送 ARP 探测的 VLAN 虚接口，默认 `vlan1`。
-- `--target-ip`：周期探测的目标 IPv4 地址，通常为默认网关。
-- `--interval`：探测间隔，单位为秒，默认 120。
+### 发送模式
 
-程序启动后会在标准输出打印收到的 ARP 报文信息，并在标准错误输出提示发送动作。按 `Ctrl+C` 可正常退出。
+```sh
+sudo ./stage0_raw_socket_demo \
+  --tx-iface vlan1 \
+  --dst-ip 192.168.1.100 \
+  --src-ip 192.168.1.1 \
+  --src-mac 00:11:22:33:44:55 \
+  --dst-mac ff:ff:ff:ff:ff:ff \
+  --interval-ms 100 \
+  --count 0
+```
 
-## 实机验证流程
+- `--tx-iface`：指定发送接口；不提供则发送模式保持关闭；
+- `--src-mac` / `--src-ip`：覆盖接口默认源 MAC / IP（未提供时自动查询）；
+- `--dst-mac` / `--dst-ip`：设置 ARP 目标（MAC 默认广播）；
+- `--interval-ms`：探测间隔，默认 100 ms；
+- `--count`：发送次数上限（0 表示持续发送直至中断）。
 
-1. 将交叉编译后的可执行文件拷贝到 Realtek MIPS 目标设备。
-2. 确认 `eth0` 和 `vlan1`（或其它指定接口）已正确配置，并具备 Raw Socket 权限。
-3. 准备网络测试仪或其它流量发生工具，模拟不少于 300 个终端的 ARP 行为。
-4. 以 root 权限运行程序，观察：
-   - 是否持续收到 ARP 请求/响应并打印。
-   - 周期性 ARP 探测是否按期发送。
-   - 终端上线/下线时输出是否及时反映。
-5. 记录 CPU/内存占用、丢包率、超时等指标，将结果整理进阶段 0 验证报告。
+## 验证清单
+
+1. 在开发机编译并运行接收模式，注入携带 VLAN 标签的 ARP 流量，确认日志中包含 VLAN ID；
+2. 交叉编译并部署到瑞昱目标设备，验证广播 ARP 无需额外 ACL 配置即可上送；
+3. 使用流量发生器模拟 ≥300 个终端，确认接收端持续输出且无丢包，发送端保持 100 ms 节奏；
+4. 在操作期间记录 CPU、内存占用，为阶段 0 报告提供数据。
 
 ## 已知限制
 
-- 运行 Raw Socket 需要 root 权限；如需非特权运行，可为可执行文件设置 `cap_net_raw` 能力。
-- 若接口未配置 IPv4 地址，程序会跳过 ARP 请求并发出警告。
-- 当前仅支持 ARP 报文，后续协议将在核心实现阶段扩展。
+- 仅支持 Linux，需要 Raw Socket 权限；
+- 目前仅解析最外层 802.1Q 标签，更多嵌套标签可通过 `--verbose` 的十六进制输出查看；
+- 按阶段 0 目标，仅关注 ARP 协议。
