@@ -5,7 +5,7 @@
 - **关联规范**：`specs/2025-10-31-terminal-discovery.md`
 
 ## 假设与非目标
-- Realtek 平台具备 Raw Socket 能力并允许绑定 VLAN 虚接口（如 `vlan1`），交叉编译使用 `mips-rtl83xx-linux-` 前缀（例如 `mips-rtl83xx-linux-gcc`）。
+- Realtek 平台具备 Raw Socket 能力并允许绑定 VLAN 虚接口（如 `vlan1`），推荐交叉编译前缀为 `mips-rtl83xx-linux-`（如 `mips-rtl83xx-linux-gcc`）；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - 设备启动阶段已默认为所有二层口启用 ARP Copy-to-CPU ACL，适配器无需额外校验或感知该配置。
 - 设备上存在网络测试仪或等效工具，可模拟 ≥300 个终端。
 - 暂不考虑软件层面的 ARP 限速策略；若后续平台启用，需要重新评估。

@@ -25,7 +25,10 @@ $(TARGET): stage0_raw_socket_demo.c
 cross:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-rtl83xx-linux- all
 
+cross-generic:
+	$(MAKE) TOOLCHAIN_PREFIX=mips-linux-gnu- all
+
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all clean cross
+.PHONY: all clean cross cross-generic
