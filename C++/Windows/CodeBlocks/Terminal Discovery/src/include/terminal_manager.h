@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -53,6 +54,35 @@ typedef bool (*terminal_iface_selector_fn)(const struct terminal_metadata *meta,
                                            int *tx_ifindex,
                                            void *user_ctx);
 
+typedef struct terminal_snapshot {
+    struct terminal_key key;
+    struct terminal_metadata meta;
+    terminal_state_t state;
+    char tx_iface[IFNAMSIZ];
+    int tx_ifindex;
+    struct timespec last_seen;
+    struct timespec last_probe;
+    uint32_t failed_probes;
+} terminal_snapshot_t;
+
+typedef struct terminal_event_modification {
+    terminal_snapshot_t before;
+    terminal_snapshot_t after;
+} terminal_event_modification_t;
+
+typedef struct terminal_event_batch {
+    terminal_snapshot_t *added;
+    size_t added_count;
+    terminal_snapshot_t *removed;
+    size_t removed_count;
+    terminal_event_modification_t *modified;
+    size_t modified_count;
+} terminal_event_batch_t;
+
+typedef void (*terminal_event_callback_fn)(const terminal_event_batch_t *batch, void *user_ctx);
+
+typedef bool (*terminal_query_callback_fn)(const terminal_snapshot_t *snapshot, void *user_ctx);
+
 struct terminal_manager;
 
 struct terminal_manager_config {
@@ -63,6 +93,7 @@ struct terminal_manager_config {
     const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
     terminal_iface_selector_fn iface_selector;
     void *iface_selector_ctx;
+    unsigned int event_throttle_sec;
 };
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
@@ -79,5 +110,16 @@ void terminal_manager_on_timer(struct terminal_manager *mgr);
 
 void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                                      const struct td_adapter_iface_event *event);
+
+int terminal_manager_set_event_sink(struct terminal_manager *mgr,
+                                    unsigned int throttle_sec,
+                                    terminal_event_callback_fn callback,
+                                    void *callback_ctx);
+
+int terminal_manager_query_all(struct terminal_manager *mgr,
+                               terminal_query_callback_fn callback,
+                               void *callback_ctx);
+
+void terminal_manager_flush_events(struct terminal_manager *mgr);
 
 #endif /* TERMINAL_MANAGER_H */

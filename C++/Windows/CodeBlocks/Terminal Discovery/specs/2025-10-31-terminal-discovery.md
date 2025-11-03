@@ -60,12 +60,13 @@
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
     - 预计由外部团队提供以下接口，终端发现模块需兼容其调用方式并支持 C/C++ 混合编译：
-       - `typedef std::vector<std::map<std::string, std::string>> MAC_IP_INFO;`
+       - `struct TerminalInfo { std::string mac; std::string ip; uint32_t port; };`
+       - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
        - `typedef void IncReportCb(const MAC_IP_INFO &add, const MAC_IP_INFO &del, const MAC_IP_INFO &mod);`
        - `int getAllTerminalIpInfo(MAC_IP_INFO &allTerIpInfo);`
        - `int setIncrementReportInterval(int second, IncReportCb cb);`
     - C 入口层需通过 `extern "C"` 桥接封装，将 C 调用转换为 C++ 实现；禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
-    - `MAC_IP_INFO` 中 map 的必填键仅包含 `mac` 与 `ip`；其他字段暂不输出，若未来需要扩展需在文档中声明并保证前向兼容。
+   - `MAC_IP_INFO` 中 Element `TerminalInfo` 的必填字段包含 `mac`、`ip`，以及整型端口号 `port`；若未来需要扩展需在文档中声明并保证前向兼容。
     - 增量上报间隔以最近一次成功调用 `getAllTerminalIpInfo` 为起点；内部需串行化重置逻辑，避免查询与回调同时访问导致竞态。
     - `setIncrementReportInterval` 需支持 0–3600 秒范围，非法入参返回错误码并保留旧配置。
     - 若回调阻塞或发生异常，模块需记录结构化日志，并在必要时触发一次空 `mod` 列表的告警回调提醒上层处理。

@@ -64,3 +64,4 @@ Release_wx_pch_h_gch
 *.htm
 *.plg
 *.tmp
+.vscode/settings.json
