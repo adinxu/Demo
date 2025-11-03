@@ -9,7 +9,7 @@
 - `src/adapter/adapter_registry.c`：延迟注册内置适配器并按名称解析，目前仅暴露 Realtek 描述符。
 - `src/adapter/realtek_adapter.c/.h`：阶段 1 的 Realtek 实现，负责原始套接字生命周期、收包回调、ARP 发送与日志透传。
 - `src/include/td_logging.h` + `src/common/td_logging.c`：进程内轻量日志器，可配置日志级别与输出函数。
-- `src/include/td_config.h` + `src/common/td_config.c`：读取 `TD_ADAPTER_*` 环境变量，支持运行时选择适配器、RX/TX 接口、探测间隔与日志级别。
+- `src/include/td_config.h` + `src/common/td_config.c`：提供统一默认配置装载器，方便核心模块在引入配置文件前使用既定的适配器/RX/TX/节流/日志默认值。
 - `src/Makefile`：生成静态库 `libterminal_discovery.a`，打包阶段 1 产物以供后续链接。
 
 ## 关键数据结构
@@ -36,7 +36,7 @@
 - `atomic_bool running`：协调控制面与工作线程的启动/停止。
 
 ## 配置与日志
-- `td_config_load_from_env` 读取 `TD_ADAPTER_NAME`、`TD_ADAPTER_RX_IFACE`、`TD_ADAPTER_TX_IFACE`、`TD_ADAPTER_TX_INTERVAL_MS`、`TD_LOG_LEVEL`，默认值分别为 `realtek`、`eth0`、`vlan1`、100ms、INFO。
+- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口 `vlan1`、ARP 节流间隔 100ms、日志级别 INFO。
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
 
 ## 构建产物

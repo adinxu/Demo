@@ -1,8 +1,6 @@
 #ifndef TD_CONFIG_H
 #define TD_CONFIG_H
 
-#include <stdbool.h>
-
 #include "adapter_api.h"
 
 #ifdef __cplusplus
@@ -19,7 +17,7 @@ struct td_runtime_config {
     td_log_level_t log_level;
 };
 
-int td_config_load_from_env(struct td_runtime_config *cfg);
+int td_config_load_defaults(struct td_runtime_config *cfg);
 
 #ifdef __cplusplus
 }

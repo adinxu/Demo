@@ -19,54 +19,71 @@
 ## 分阶段计划
 
 ### 阶段 0：Realtek Demo 验证（已完成）
-1. 搭建测试环境：网络测试仪与目标交换机实连，确保 `eth0` 抓取/发送能力正常。
-2. 编写最小 Raw Socket demo（以 C 语言实现）：
-   - 接收端必须监听 `eth0` 且强制加载内建 BPF 过滤器（实现见 `src/demo/stage0_raw_socket_demo.c`），BPF 同时筛 EtherType 与 `pkttype`，仅让入方向 ARP 通过；并启用 `PACKET_AUXDATA` 以解读被内核剥离的 VLAN 标签。
-   - 发送端绑定 `vlan1`，周期性下发 ARP request；使用同一程序的 `--tx-iface` 参数可切换接口。
-   - 确认收包路径正确解析 VLAN tag（无 CPU tag）。
-   - ✅ 实机验证：在 `eth0` 正确收包并恢复 VLAN Tag，能从对应三层虚接口成功发包。
-3. 使用网络测试仪模拟至少 300 个终端：
-   - 验证发现、保活及上报节流逻辑的可行性。
-   - 记录 CPU、内存占用，统计丢包/超时情况，并确认 100ms 发包节奏满足竞分约束。
-4. 汇总验证结果与瓶颈分析，为后续方案设计提供输入。
+1. ✅ 搭建测试环境：网络测试仪直连交换机，确认 `eth0` 具备 Raw Socket 收发能力，VLAN1 对应虚接口可成功发包。
+2. ✅ 开发 `src/demo/stage0_raw_socket_demo.c`：
+   - 接收端固定监听 `eth0`，加载 BPF 过滤器并启用 `PACKET_AUXDATA` 恢复 VLAN；收到 ARP 时打印 opcode/VLAN/源目标信息，可选择十六进制转储。
+   - 发送端允许指定 `--tx-iface`、源/目的 MAC/IP、间隔、次数；默认绑定 `vlan1`，周期性下发 ARP 请求。
+3. ✅ 实机验证（基础）：确认 RX 能恢复 VLAN、忽略本机发送帧；TX 在 `vlan1` 下发 ARP 且保持 100ms 间隔。
+4. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
 
 ### 阶段 1：适配层设计与实现（已完成）
-1. ✅ 设计 `src/include/adapter_api.h`，定义错误码、回调契约、ARP 请求封装及计时句柄；同时补充 `src/include/td_adapter_registry.h` 以统一选择单适配器。
-2. ✅ 在 `src/adapter/realtek_adapter.c` 提供 Realtek 适配器骨架，复用 Raw Socket+BPF 逻辑解析入方向 ARP（含 VLAN 恢复），并通过发送线程锁与 100ms 节奏约束 `send_arp`；构建后输出 `libterminal_discovery.a` 供核心引擎链接。
-3. ✅ 以 `src/common/td_config.c`/`td_logging.c` 实现环境配置与日志抽象，支持读取 `TD_ADAPTER_*` / `TD_LOG_LEVEL` 环境变量，运行前选择单一适配器并统一日志级别。
+1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、计时器、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
+2. ✅ Realtek 适配器：
+   - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ifindex、MAC 并回调。
+   - TX：`realtek_send_arp` 使用 `send_lock` 节流；优先采用请求内 `tx_iface`，缺省回落到配置接口；必要时调用 `SO_BINDTODEVICE`、查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
+   - 接口与定时器：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），定时逻辑采用 Linux 单调时钟相关 API，避免系统时间调整对节奏造成影响。
+   - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
+3. ✅ 公共组件：
+   - `td_config_load_defaults` 提供统一的默认运行配置（适配器名称 `realtek`、`eth0`/`vlan1`、100ms 节流、INFO 日志级别）。
+   - `td_log_writef` 提供结构化日志输出与外部注入能力。
 
 ### 阶段 2：核心终端引擎
-1. 实现终端数据结构、状态机（ACTIVE/PROBING/IFACE_INVALID）。
-2. 引入时间轮或小根堆调度器，驱动保活与超时删除，支持 30 分钟保留策略与单终端定时。
-3. 维护“发现接口”绑定：终端保活需沿最近一次有效报文对应的三层虚接口发送，发送前在原始套接字上绑定该接口（动态 `SO_BINDTODEVICE` 或复用接口专属套接字），接口失效时转入 `IFACE_INVALID` 并停止保活。
-4. 处理接口事件：跟踪 VLAN 虚接口创建删除、IP 变更、UP/DOWN，并在 Access/Trunk/PVID 规则触发时切换状态。
+1. 终端表与状态机：
+   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据、`tx_iface` 绑定、`last_seen/last_probe/failed_probes`。
+   - 状态流转：`ACTIVE ↔ PROBING` 基于报文/保活结果，接口失效或跨网段进入 `IFACE_INVALID` 并保留 30 分钟。
+2. 调度策略：
+   - 初始实现采用固定周期（默认 1s，可配置）遍历整个哈希表；计算与配置项关联的保活/过期条件并触发探测。
+   - ⚠️ 待评估：扫描周期与 CPU 负载基线尚未量化，需要后续实测；若不满足性能指标再引入时间轮或小根堆。
+3. 保活执行：
+   - 调用注入的 `probe_cb` 生成 `td_adapter_arp_request`，填充 `tx_iface/tx_ifindex`，委托适配器发送。
+   - 失败计数达到 `keepalive_miss_threshold` 删除终端并记录事件。
+4. 接口感知：
+   - `tx_iface/tx_ifindex` 取自终端最近一次有效报文绑定的入口信息（`terminal_entry` 中的 ingress 记录），保活前如有新报文会同步刷新。
+   - 入口信息解析需结合 VLAN tag 完成平台映射：例如 Realtek 平台 VLAN1 对应接口名 `vlan1`，而 GNOS 平台为 `Vlan1`，终端记录时需存储原始 VLAN ID 并在发包前转换为平台实际接口名。
+   - 从适配器/平台事件同步接口状态；Realtek 平台默认通过标准 netlink 订阅 VLANIF 上下线、IP 变更、flags 变更。
+   - Trunk 口的 VLAN permit 已由底层 ACL 规则保障，当前阶段不额外获取许可列表；若未来平台行为变更，再评估是否需补充判定流程。
+5. 并发与锁：使用互斥量保护哈希桶，对外暴露线程安全 API；针对定时扫描线程与报文线程的协作需写明确步骤。
 
 ### 阶段 3：报文解码与事件上报
-1. 完成 ARP 解析模块，归一化 VLAN/接口上下文（含 Access/Trunk、PVID 判定）并触发状态更新。
-2. 实现增量事件队列，支持节流窗口聚合；北向事件负载暂按字符串形式输出 `mac`、`ip` 字段，后续如需改为 TLV/JSON 再行评估。
-3. 实现全量查询 API，返回有序终端快照。
-4. 设计 C `extern "C"` 桥接层，封装 `getAllTerminalIpInfo`、`setIncrementReportInterval` 等 C++ 实现，保证异常被捕获并写日志。
-5. 在桥接层中构建/转换 `MAC_IP_INFO`，仅填充 `mac`、`ip` 字段，同时保留扩展钩子以便后续增加字段时无需破坏现有接口。
-6. 定义回调派发策略（复制数据异步投递），防止上层阻塞核心线程。
-7. 串行化 `getAllTerminalIpInfo` 与节流配置更新，避免查询与回调同时访问导致竞态。
+1. 报文解析：
+   - 将阶段 1 适配器回调的 `td_adapter_packet_view` 转换为内部事件，补齐 VLAN/接口上下文并校验 IP 与接口网段。
+   - 依赖 ACL 提供的 VLAN tag 判定终端归属；无需再查询 Access/Trunk 配置，仅在缺失对应 VLANIF 时按三层 Down 逻辑处理（如平台后续引入无标签报文，再补充 PVID 判定）。
+2. 事件队列：
+   - 构建新增/删除/修改三类事件；按照节流窗口聚合后上报。
+   - 支持自定义节流秒级配置，默认 0 表示实时。
+3. 北向接口：
+   - C API 提供查询 (`terminal_query_all`) 与订阅 (`terminal_subscribe`)；C++ 桥接层包装外部 `MAC_IP_INFO`/回调。
+   - 轮询与回调串行化，避免竞态；异常捕获后写日志并保护运行。
+4. ⚠️ 待补充：增量事件的数据结构及持久化策略尚未定稿。
 
 ### 阶段 4：配置、日志与文档
-1. 提供配置接口/文件读取，允许调整探测间隔、节流窗口等参数。
-2. 集成结构化日志与基础指标（探测数、丢包数等）。
-3. 编写开发者指南，说明构建、部署、适配器扩展方法以及 C/C++ 混合编译配置与接口契约（当前仅包含 `mac`、`ip` 字段的输出约定与节流配置范围）。
+1. 配置体系：
+   - 扩展 `td_config` 支持终端保活间隔、失败阈值、节流窗口、最大终端数量等参数；后续引擎统一从配置文件读取，暂不使用环境变量通道。
+2. 日志与指标：
+   - 引入核心模块结构化日志标签（如 `terminal_manager`, `event_queue`）。
+   - 暴露探测计数、失败数、接口波动等指标，预留对接 Prometheus 或 CLI 的采集口。
+3. 文档：
+   - 编写阶段 2+ 核心引擎设计说明、API 参考、构建部署指南。
 
 ### 阶段 5：测试与验收
-1. 编写单元测试覆盖状态机、超时与事件节流逻辑，包括 30 分钟保留与接口恢复场景。
-2. 实现基于 mock 适配器的集成测试（发现、保活、接口波动）。
-3. 为 C/C++ 桥接层补充单元测试与回调桩测试，覆盖异常捕获、字段完整性（仅 `mac`、`ip`）、全量查询排序；核心逻辑侧保持 C 语言实现，桥接层仅封装 ABI 差异。
-4. 重跑 Realtek 平台 300 终端 demo，确认 VLAN tag 解析与 100ms 发包节奏满足指标。
-5. 进行 1000 终端压力试验（如可行），采集性能数据。
-6. 执行 C++ 接口联调测试：
-   - 验证 `getAllTerminalIpInfo` 稳定排序与空结果返回。
-   - 验证 `setIncrementReportInterval` 0–3600 秒范围及非法值返回。
-   - 验证增量回调节流窗口（0–3600 秒）与异常保护逻辑。
-   - 确认回调输出仅包含 `mac`、`ip` 字段。
-7. 汇总测试报告，并准备回滚策略文档。
+1. 单元测试：覆盖状态机（含 30 分钟保留）、接口事件恢复、节流窗口逻辑；使用 mock 终端表验证遍历调度正确性。
+2. 集成测试：基于模拟适配器重放报文、接口事件；验证保活探测、删除、接口失效恢复、事件聚合。
+3. 北向测试：
+   - C/C++ 桥接层回调桩，验证异常捕获、字段完整性、节流配置上下界。
+   - 全量查询排序与并发访问。
+4. 实机/压力验证：
+   - 300 终端 Realtek Demo 回归；1k 终端压力测试记录 CPU/内存/丢包。
+5. 验收输出：整理测试报告、回滚策略、性能曲线。
 
 ## 依赖与风险
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。
