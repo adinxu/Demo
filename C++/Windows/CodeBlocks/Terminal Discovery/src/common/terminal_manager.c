@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <net/if.h>
 #include <netinet/if_ether.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,31 @@
 #define TERMINAL_BUCKET_COUNT 256
 #endif
 
+#ifndef TERMINAL_SCAN_INTERVAL_DEFAULT_MS
+#define TERMINAL_SCAN_INTERVAL_DEFAULT_MS 1000U
+#endif
+
+#ifndef TERMINAL_KEEPALIVE_INTERVAL_DEFAULT_SEC
+#define TERMINAL_KEEPALIVE_INTERVAL_DEFAULT_SEC 120U
+#endif
+
+#ifndef TERMINAL_KEEPALIVE_MISS_DEFAULT
+#define TERMINAL_KEEPALIVE_MISS_DEFAULT 3U
+#endif
+
+#ifndef TERMINAL_IFACE_INVALID_HOLDOFF_DEFAULT_SEC
+#define TERMINAL_IFACE_INVALID_HOLDOFF_DEFAULT_SEC 1800U
+#endif
+
+#ifndef TERMINAL_DEFAULT_VLAN_IFACE_FORMAT
+#define TERMINAL_DEFAULT_VLAN_IFACE_FORMAT "vlan%u"
+#endif
+
+struct probe_task {
+    terminal_probe_request_t request;
+    struct probe_task *next;
+};
+
 struct terminal_manager {
     struct terminal_manager_config cfg;
     td_adapter_t *adapter;
@@ -24,7 +50,15 @@ struct terminal_manager {
 
     pthread_mutex_t lock;
     struct terminal_entry *table[TERMINAL_BUCKET_COUNT];
+
+    pthread_mutex_t worker_lock;
+    pthread_cond_t worker_cond;
+    bool worker_stop;
+    bool worker_started;
+    pthread_t worker_thread;
 };
+
+static bool is_iface_available(const struct terminal_entry *entry);
 
 static size_t hash_key(const struct terminal_key *key) {
     uint64_t hash = 1469598103934665603ULL;
@@ -38,6 +72,43 @@ static size_t hash_key(const struct terminal_key *key) {
         hash *= 1099511628211ULL;
     }
     return (size_t)hash;
+}
+
+static struct timespec timespec_add_ms(const struct timespec *base, unsigned int ms) {
+    struct timespec result = *base;
+    result.tv_sec += ms / 1000U;
+    result.tv_nsec += (long)(ms % 1000U) * 1000000L;
+    if (result.tv_nsec >= 1000000000L) {
+        result.tv_sec += 1;
+        result.tv_nsec -= 1000000000L;
+    }
+    return result;
+}
+
+static void *terminal_manager_worker(void *arg) {
+    struct terminal_manager *mgr = (struct terminal_manager *)arg;
+
+    pthread_mutex_lock(&mgr->worker_lock);
+    while (!mgr->worker_stop) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        struct timespec wake = timespec_add_ms(&now, mgr->cfg.scan_interval_ms);
+
+        int rc = 0;
+        while (!mgr->worker_stop && rc != ETIMEDOUT) {
+            rc = pthread_cond_timedwait(&mgr->worker_cond, &mgr->worker_lock, &wake);
+        }
+
+        if (mgr->worker_stop) {
+            break;
+        }
+
+        pthread_mutex_unlock(&mgr->worker_lock);
+        terminal_manager_on_timer(mgr);
+        pthread_mutex_lock(&mgr->worker_lock);
+    }
+    pthread_mutex_unlock(&mgr->worker_lock);
+    return NULL;
 }
 
 static struct terminal_entry *find_entry(struct terminal_manager *mgr,
@@ -76,25 +147,63 @@ static const char *state_to_string(terminal_state_t state) {
     }
 }
 
-static void update_binding_from_packet(struct terminal_entry *entry,
-                                       const struct td_adapter_packet_view *packet) {
-    if (!packet) {
+static void resolve_tx_interface(struct terminal_manager *mgr, struct terminal_entry *entry) {
+    if (!entry) {
         return;
     }
+    char candidate[IFNAMSIZ] = {0};
+    int candidate_ifindex = -1;
+    bool resolved = false;
+
+    if (mgr->cfg.iface_selector) {
+        resolved = mgr->cfg.iface_selector(&entry->meta, candidate, &candidate_ifindex, mgr->cfg.iface_selector_ctx);
+    }
+
+    if (!resolved && mgr->cfg.vlan_iface_format && entry->meta.vlan_id >= 0) {
+        snprintf(candidate, sizeof(candidate), mgr->cfg.vlan_iface_format, (unsigned int)entry->meta.vlan_id);
+        candidate_ifindex = (int)if_nametoindex(candidate);
+        if (candidate_ifindex <= 0) {
+            candidate_ifindex = -1;
+        }
+        resolved = true;
+    }
+
+    if (!resolved && entry->meta.ingress_ifname[0]) {
+        snprintf(candidate, sizeof(candidate), "%s", entry->meta.ingress_ifname);
+        candidate_ifindex = entry->meta.ingress_ifindex > 0 ? entry->meta.ingress_ifindex : -1;
+        resolved = true;
+    }
+
+    if (resolved) {
+        snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", candidate);
+        entry->tx_ifindex = candidate_ifindex > 0 ? candidate_ifindex : -1;
+    } else if (entry->tx_iface[0] == '\0') {
+        entry->tx_ifindex = -1;
+    }
+}
+
+static void apply_packet_binding(struct terminal_manager *mgr,
+                                 struct terminal_entry *entry,
+                                 const struct td_adapter_packet_view *packet) {
+    if (!packet || !entry) {
+        return;
+    }
+
     if (packet->ifname[0]) {
         snprintf(entry->meta.ingress_ifname, sizeof(entry->meta.ingress_ifname), "%s", packet->ifname);
     }
-    entry->meta.ingress_ifindex = packet->ifindex;
+    if (packet->ifindex > 0) {
+        entry->meta.ingress_ifindex = packet->ifindex;
+    } else if (!entry->meta.ingress_ifname[0]) {
+        entry->meta.ingress_ifindex = -1;
+    }
     entry->meta.vlan_id = packet->vlan_id;
 
-    /* Bind the TX interface to the ingress context if not already set or changed. */
-    if (packet->ifname[0]) {
-        snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", packet->ifname);
-    }
-    entry->tx_ifindex = packet->ifindex;
+    resolve_tx_interface(mgr, entry);
 }
 
 static struct terminal_entry *create_entry(const struct terminal_key *key,
+                                           struct terminal_manager *mgr,
                                            const struct td_adapter_packet_view *packet) {
     struct terminal_entry *entry = calloc(1, sizeof(*entry));
     if (!entry) {
@@ -109,12 +218,13 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
     entry->failed_probes = 0;
     memset(&entry->meta, 0, sizeof(entry->meta));
     entry->meta.vlan_id = -1;
+    entry->meta.ingress_ifindex = -1;
     entry->tx_iface[0] = '\0';
     entry->tx_ifindex = -1;
     entry->next = NULL;
 
     if (packet) {
-        update_binding_from_packet(entry, packet);
+        apply_packet_binding(mgr, entry, packet);
     }
 
     return entry;
@@ -134,13 +244,39 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     }
 
     mgr->cfg = *cfg;
+    if (mgr->cfg.keepalive_interval_sec == 0) {
+        mgr->cfg.keepalive_interval_sec = TERMINAL_KEEPALIVE_INTERVAL_DEFAULT_SEC;
+    }
+    if (mgr->cfg.keepalive_miss_threshold == 0) {
+        mgr->cfg.keepalive_miss_threshold = TERMINAL_KEEPALIVE_MISS_DEFAULT;
+    }
+    if (mgr->cfg.iface_invalid_holdoff_sec == 0) {
+        mgr->cfg.iface_invalid_holdoff_sec = TERMINAL_IFACE_INVALID_HOLDOFF_DEFAULT_SEC;
+    }
+    if (mgr->cfg.scan_interval_ms == 0) {
+        mgr->cfg.scan_interval_ms = TERMINAL_SCAN_INTERVAL_DEFAULT_MS;
+    }
+    if (!mgr->cfg.vlan_iface_format) {
+        mgr->cfg.vlan_iface_format = TERMINAL_DEFAULT_VLAN_IFACE_FORMAT;
+    }
+
     mgr->adapter = adapter;
     mgr->probe_cb = probe_cb;
     mgr->probe_ctx = probe_ctx;
     pthread_mutex_init(&mgr->lock, NULL);
+    pthread_mutex_init(&mgr->worker_lock, NULL);
+    pthread_cond_init(&mgr->worker_cond, NULL);
+    mgr->worker_stop = false;
+    mgr->worker_started = false;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         mgr->table[i] = NULL;
+    }
+
+    if (pthread_create(&mgr->worker_thread, NULL, terminal_manager_worker, mgr) == 0) {
+        mgr->worker_started = true;
+    } else {
+        td_log_writef(TD_LOG_ERROR, "terminal_manager", "failed to start timer worker thread");
     }
 
     return mgr;
@@ -149,6 +285,16 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
 void terminal_manager_destroy(struct terminal_manager *mgr) {
     if (!mgr) {
         return;
+    }
+
+    pthread_mutex_lock(&mgr->worker_lock);
+    mgr->worker_stop = true;
+    pthread_cond_broadcast(&mgr->worker_cond);
+    pthread_mutex_unlock(&mgr->worker_lock);
+
+    if (mgr->worker_started) {
+        pthread_join(mgr->worker_thread, NULL);
+        mgr->worker_started = false;
     }
 
     pthread_mutex_lock(&mgr->lock);
@@ -164,6 +310,8 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
     pthread_mutex_unlock(&mgr->lock);
 
     pthread_mutex_destroy(&mgr->lock);
+    pthread_mutex_destroy(&mgr->worker_lock);
+    pthread_cond_destroy(&mgr->worker_cond);
     free(mgr);
 }
 
@@ -217,7 +365,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     struct terminal_entry **prev_next = NULL;
     struct terminal_entry *entry = find_entry(mgr, &key, bucket, &prev_next);
     if (!entry) {
-        entry = create_entry(&key, packet);
+        entry = create_entry(&key, mgr, packet);
         if (!entry) {
             pthread_mutex_unlock(&mgr->lock);
             return;
@@ -227,17 +375,19 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
         td_log_writef(TD_LOG_INFO,
                       "terminal_manager",
                       "new terminal discovered on %s vlan=%d",
-                      entry->tx_iface,
+                      entry->tx_iface[0] ? entry->tx_iface : "<unresolved>",
                       entry->meta.vlan_id);
     } else {
         clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
-        update_binding_from_packet(entry, packet);
+        apply_packet_binding(mgr, entry, packet);
     }
 
     entry->failed_probes = 0;
     clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
 
-    if (entry->state == TERMINAL_STATE_IFACE_INVALID) {
+    if (!is_iface_available(entry)) {
+        set_state(entry, TERMINAL_STATE_IFACE_INVALID);
+    } else if (entry->state == TERMINAL_STATE_IFACE_INVALID) {
         set_state(entry, TERMINAL_STATE_PROBING);
     } else {
         set_state(entry, TERMINAL_STATE_ACTIVE);
@@ -247,7 +397,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 }
 
 static bool is_iface_available(const struct terminal_entry *entry) {
-    return entry->tx_iface[0] != '\0' && entry->tx_ifindex > 0;
+    return entry->tx_iface[0] != '\0';
 }
 
 static bool has_expired(const struct terminal_manager *mgr,
@@ -271,6 +421,9 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     pthread_mutex_lock(&mgr->lock);
+
+    struct probe_task *tasks_head = NULL;
+    struct probe_task *tasks_tail = NULL;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         struct terminal_entry **prev_next = &mgr->table[i];
@@ -299,7 +452,26 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                         entry->failed_probes += 1;
 
                         if (mgr->probe_cb) {
-                            mgr->probe_cb(entry, mgr->probe_ctx);
+                            struct probe_task *task = calloc(1, sizeof(*task));
+                            if (task) {
+                                task->request.key = entry->key;
+                                task->request.meta = entry->meta;
+                                snprintf(task->request.tx_iface, sizeof(task->request.tx_iface), "%s", entry->tx_iface);
+                                task->request.tx_ifindex = entry->tx_ifindex;
+                                task->request.state_before_probe = entry->state;
+                                task->request.failed_probes = entry->failed_probes;
+                                if (!tasks_head) {
+                                    tasks_head = task;
+                                    tasks_tail = task;
+                                } else {
+                                    tasks_tail->next = task;
+                                    tasks_tail = task;
+                                }
+                            } else {
+                                td_log_writef(TD_LOG_WARN,
+                                              "terminal_manager",
+                                              "failed to allocate probe task for terminal");
+                            }
                         }
 
                         if (entry->failed_probes >= mgr->cfg.keepalive_miss_threshold) {
@@ -326,6 +498,17 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     }
 
     pthread_mutex_unlock(&mgr->lock);
+
+    /* Execute probe callbacks outside the manager lock to avoid deadlocks. */
+    struct probe_task *task = tasks_head;
+    while (task) {
+        if (mgr->probe_cb) {
+            mgr->probe_cb(&task->request, mgr->probe_ctx);
+        }
+        struct probe_task *next = task->next;
+        free(task);
+        task = next;
+    }
 }
 
 void terminal_manager_on_iface_event(struct terminal_manager *mgr,
@@ -343,11 +526,16 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                 if (!now_up) {
                     set_state(entry, TERMINAL_STATE_IFACE_INVALID);
                     clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+                    entry->tx_ifindex = -1;
                 } else {
                     set_state(entry, TERMINAL_STATE_PROBING);
                     entry->failed_probes = 0;
                     entry->last_probe.tv_sec = 0;
                     entry->last_probe.tv_nsec = 0;
+                    int ifindex = (int)if_nametoindex(event->ifname);
+                    if (ifindex > 0) {
+                        entry->tx_ifindex = ifindex;
+                    }
                 }
             }
         }

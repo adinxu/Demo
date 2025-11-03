@@ -37,7 +37,21 @@ struct terminal_entry {
     struct terminal_entry *next;
 };
 
-typedef void (*terminal_probe_fn)(const struct terminal_entry *entry, void *user_ctx);
+typedef struct terminal_probe_request {
+    struct terminal_key key;
+    struct terminal_metadata meta;
+    char tx_iface[IFNAMSIZ];
+    int tx_ifindex;
+    terminal_state_t state_before_probe;
+    uint32_t failed_probes;
+} terminal_probe_request_t;
+
+typedef void (*terminal_probe_fn)(const terminal_probe_request_t *request, void *user_ctx);
+
+typedef bool (*terminal_iface_selector_fn)(const struct terminal_metadata *meta,
+                                           char tx_iface[IFNAMSIZ],
+                                           int *tx_ifindex,
+                                           void *user_ctx);
 
 struct terminal_manager;
 
@@ -45,6 +59,10 @@ struct terminal_manager_config {
     unsigned int keepalive_interval_sec;
     unsigned int keepalive_miss_threshold;
     unsigned int iface_invalid_holdoff_sec;
+    unsigned int scan_interval_ms;
+    const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
+    terminal_iface_selector_fn iface_selector;
+    void *iface_selector_ctx;
 };
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,

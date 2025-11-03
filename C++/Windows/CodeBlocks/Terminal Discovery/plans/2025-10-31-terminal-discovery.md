@@ -38,21 +38,22 @@
    - `td_log_writef` 提供结构化日志输出与外部注入能力。
 
 ### 阶段 2：核心终端引擎
-1. 终端表与状态机：
-   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据、`tx_iface` 绑定、`last_seen/last_probe/failed_probes`。
-   - 状态流转：`ACTIVE ↔ PROBING` 基于报文/保活结果，接口失效或跨网段进入 `IFACE_INVALID` 并保留 30 分钟。
-2. 调度策略：
-   - 初始实现采用固定周期（默认 1s，可配置）遍历整个哈希表；计算与配置项关联的保活/过期条件并触发探测。
-   - ⚠️ 待评估：扫描周期与 CPU 负载基线尚未量化，需要后续实测；若不满足性能指标再引入时间轮或小根堆。
-3. 保活执行：
-   - 调用注入的 `probe_cb` 生成 `td_adapter_arp_request`，填充 `tx_iface/tx_ifindex`，委托适配器发送。
-   - 失败计数达到 `keepalive_miss_threshold` 删除终端并记录事件。
-4. 接口感知：
-   - `tx_iface/tx_ifindex` 取自终端最近一次有效报文绑定的入口信息（`terminal_entry` 中的 ingress 记录），保活前如有新报文会同步刷新。
-   - 入口信息解析需结合 VLAN tag 完成平台映射：例如 Realtek 平台 VLAN1 对应接口名 `vlan1`，而 GNOS 平台为 `Vlan1`，终端记录时需存储原始 VLAN ID 并在发包前转换为平台实际接口名。
-   - 从适配器/平台事件同步接口状态；Realtek 平台默认通过标准 netlink 订阅 VLANIF 上下线、IP 变更、flags 变更。
-   - Trunk 口的 VLAN permit 已由底层 ACL 规则保障，当前阶段不额外获取许可列表；若未来平台行为变更，再评估是否需补充判定流程。
-5. 并发与锁：使用互斥量保护哈希桶，对外暴露线程安全 API；针对定时扫描线程与报文线程的协作需写明确步骤。
+1. ✅ 终端表与状态机：
+   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_ifindex`）。
+   - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换，接口失效进入 `IFACE_INVALID` 并按 `iface_invalid_holdoff_sec` 保留 30 分钟。
+2. ✅ 调度策略：
+   - 专用 `terminal_manager_worker` 线程按 `scan_interval_ms` 周期驱动 `terminal_manager_on_timer`，统一处理过期、保活、删除流程。
+   - 后续若需要提高规模弹性，再评估时间轮/小根堆方案，目前观测以 1s 节拍满足需求。
+3. ✅ 保活执行：
+   - `terminal_manager_on_timer` 聚合需要探测的终端，生成 `terminal_probe_request_t` 队列，脱离主锁逐个回调 `probe_cb`。
+   - 超过 `keepalive_miss_threshold` 后清理终端并记录日志，避免 livelock。
+4. ✅ 接口感知：
+   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，但若底层未提供 ingress 接口名或 ifindex，则回落到配置/选择器给出的发包接口。
+   - 接口事件 `terminal_manager_on_iface_event` 及时更新 `tx_ifindex`、重置探测计数，保持 VLANIF 变更后仍可恢复。
+   - Trunk 口 VLAN permit 仍依赖底层 ACL 保障，若平台策略改变再跟进。
+5. ✅ 并发与锁：
+   - 哈希桶访问由主互斥保护，探测回调在 worker 锁外执行，杜绝回调 re-entry 死锁。
+6. ✅ 文档：`doc/design/stage2_terminal_manager.md` 描述线程模型、接口解析策略与配置参数取值。
 
 ### 阶段 3：报文解码与事件上报
 1. 报文解析：
@@ -100,5 +101,5 @@
 - 由于平台差异，所有实机验证步骤需在 MIPS 目标环境手动执行，并记录操作过程与结果。
 
 ## 审批与下一步
-- 当前状态：阶段 2 需求梳理中（2025-11-01 更新）。
-- 下一步：进入阶段 2，围绕终端核心引擎的数据结构、定时器与接口事件处理展开设计，并复核字符串格式北向负载需求。
+- 当前状态：阶段 2 实施与文档已完成（2025-11-03 更新）。
+- 下一步：启动阶段 3，聚焦报文解码、事件聚合与北向接口对接的详细设计与实现，评估事件节流需求，同步测试计划。
