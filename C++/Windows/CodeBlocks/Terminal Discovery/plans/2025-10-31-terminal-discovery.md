@@ -12,7 +12,7 @@
 - 暂不考虑软件层面的 ARP 限速策略；若后续平台启用，需要重新评估。
 - 外部团队提供的 C++ API（`MAC_IP_INFO` 及相关回调）按约定稳定，且允许我们在构建链中启用 C/C++ 混合编译。
 - 项目默认采用 C 语言实现；仅在对接外部 C++ ABI 时引入必要的桥接代码。
-- 当前回调/查询仅要求输出 `mac` 与 `ip` 字段，并以字符串形式携带这两个字段；未来扩展将另行评估，并需支持 0–3600 秒的节流配置。
+- 当前回调/查询要求输出 `mac`、`ip`、`port` 与变更标签四个字段，并以字符串/整型形式携带；未来扩展将另行评估，并需支持 0–3600 秒的节流配置。
 - 开发环境为 x86，而目标 Realtek 平台为 MIPS；与硬件相关的测试需在目标平台上手动运行与验证。
 - 不在本轮实现 CLI/UI、DHCP/ND 嗅探或与 FIB 的深度集成。
 
@@ -60,11 +60,11 @@
    - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；缺失入口口名/ifindex 时回退到 VLAN 模板或选择器结果，保证事件始终携带 VLAN 信息。
    - 依赖 ACL 提供的 VLAN tag 判定终端归属；若 VLANIF 缺失则进入 `IFACE_INVALID`，恢复后重新探测。
 2. ✅ 事件队列：
-   - 新增 `terminal_snapshot_t` + 三类链表队列，集中在 `terminal_manager_maybe_dispatch_events` 内按节流窗口批量分发；默认实时，支持 0–3600 秒自定义节流。
-   - 事件分发脱离主锁执行，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。
+   - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/port + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内按节流窗口批量分发；默认实时，支持 0–3600 秒自定义节流。
+   - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。
 3. ✅ 北向接口：
-   - 新增 `terminal_manager_set_event_sink`、`terminal_manager_query_all`、`terminal_manager_flush_events`，与 C++ 侧 `MAC_IP_INFO=std::vector<TerminalInfo>` 对接（字段 `mac`/`ip`/`port`）。
-   - 查询阶段复制快照后脱锁回调，订阅阶段支持节流重置与首次强制推送，确保序列一致性。
+   - 新增 `terminal_manager_set_event_sink`、`terminal_manager_query_all`、`terminal_manager_flush_events`，由本项目导出 `getAllTerminalIpInfo`/`setIncrementReportInterval`，外部团队提供非阻塞的 `IncReportCb`。
+   - 查询阶段生成 `terminal_event_record_t` 数组后脱锁回调；订阅阶段支持节流重置与首次强制推送，并在桥接层将记录映射为携带 `tag` 字段的 `MAC_IP_INFO` 单向量。
 4. ✅ 文档：
    - `doc/design/stage3_event_pipeline.md` 说明事件链路设计、节流策略、关键数据结构与并发模型，便于后续维护与扩展。
 
@@ -82,7 +82,7 @@
 2. 集成测试：基于模拟适配器重放报文、接口事件；验证保活探测、删除、接口失效恢复、事件聚合。
 3. 北向测试：
    - C/C++ 桥接层回调桩，验证异常捕获、字段完整性、节流配置上下界。
-   - 全量查询排序与并发访问。
+   - 全量查询输出与并发访问。
 4. 实机/压力验证：
    - 300 终端 Realtek Demo 回归；1k 终端压力测试记录 CPU/内存/丢包。
 5. 验收输出：整理测试报告、回滚策略、性能曲线。
@@ -91,7 +91,7 @@
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。
 - Raw Socket 权限或平台安全策略可能阻止绑定 VLAN 虚接口。
 - Trunk 口在部分 VLAN 未建虚接口的报文行为仍待实验确认，可能影响终端保活策略。
-- 事件负载格式需与系统集成团队确认（二进制 TLV vs JSON），若格式变更将影响上报模块设计。
+- 若后续需要在 `TerminalInfo` 增加字段或调整序列化格式，需提前与系统集成团队确认版本策略并保持 `MAC_IP_INFO` 兼容性。
 - 接口事件源（netlink/SDK）若行为差异大，需追加适配层开发。
 
 ## 验证策略

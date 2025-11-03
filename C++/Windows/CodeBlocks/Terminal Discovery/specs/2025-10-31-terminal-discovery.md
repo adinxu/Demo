@@ -59,17 +59,20 @@
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
-    - 预计由外部团队提供以下接口，终端发现模块需兼容其调用方式并支持 C/C++ 混合编译：
-       - `struct TerminalInfo { std::string mac; std::string ip; uint32_t port; };`
-       - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
-       - `typedef void IncReportCb(const MAC_IP_INFO &add, const MAC_IP_INFO &del, const MAC_IP_INFO &mod);`
+    - 本项目提供 `getAllTerminalIpInfo` 与 `setIncrementReportInterval` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
+    - 需兼容外部团队既定的 C++ 类型定义：
+   - `struct TerminalInfo { std::string mac; std::string ip; uint32_t port; ModifyTag tag; };`
+   - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
+   - `typedef void IncReportCb(const MAC_IP_INFO &info);`
+    - 导出函数接口保持如下签名：
        - `int getAllTerminalIpInfo(MAC_IP_INFO &allTerIpInfo);`
        - `int setIncrementReportInterval(int second, IncReportCb cb);`
-    - C 入口层需通过 `extern "C"` 桥接封装，将 C 调用转换为 C++ 实现；禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
-   - `MAC_IP_INFO` 中 Element `TerminalInfo` 的必填字段包含 `mac`、`ip`，以及整型端口号 `port`；若未来需要扩展需在文档中声明并保证前向兼容。
+   - 增量回调载荷包含 MAC、IP、端口与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
+   - C 入口层通过 `extern "C"` 封装桥接至 C++ 实现，禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
+   - `MAC_IP_INFO` 中元素的扩展字段若需新增，必须保持向后兼容并在接口文档中声明。
     - 增量上报间隔以最近一次成功调用 `getAllTerminalIpInfo` 为起点；内部需串行化重置逻辑，避免查询与回调同时访问导致竞态。
     - `setIncrementReportInterval` 需支持 0–3600 秒范围，非法入参返回错误码并保留旧配置。
-    - 若回调阻塞或发生异常，模块需记录结构化日志，并在必要时触发一次空 `mod` 列表的告警回调提醒上层处理。
+   - 若回调异常或违反非阻塞约定，模块需记录结构化日志，并在必要时触发一次空 `MAC_IP_INFO` 的告警回调提醒上层处理。
 
 ## 详细行为
 - **接口管理**：
@@ -90,8 +93,9 @@
    - 发送保活前必须确认终端仍绑定可用的三层虚接口/VLAN，并沿着发现报文的接口发送 ARP（若接口失效则转入 `IFACE_INVALID` 处理流程）。
    - 探测失败计数递增；第三次失败后移除条目并发出删除事件。
 - **事件上报**：
-   - 增量事件根据节流配置合并；终端新增、删除、属性变更分别入队。
-   - 全量查询返回按 MAC、接口稳定排序的快照。
+   - 增量事件根据节流配置合并；终端新增、删除、属性变更（仅端口发生变化时产生 `MOD`）分别入队。
+   - 事件载荷使用 `terminal_event_record_t`（MAC/IP/port + ModifyTag），供外层转换为 `MAC_IP_INFO`。
+   - 全量查询返回当前快照，原始顺序由内部遍历决定；需要排序的上层可自行处理。
 - **并发模型**：
    - 终端核心数据使用读写锁保护；定时线程与报文线程的写操作通过串行化任务队列执行。
    - 上报线程消费事件队列，在节流窗口内聚合并批量下发通知；查询与配置接口需串行化重置逻辑，避免竞态。
@@ -117,8 +121,8 @@
    - 预留扩展挂钩，以支持未来的 DHCP。
 4. **上报与 API 层**
    - 实现带节流的变更通知队列。
-   - 提供稳定排序的同步查询接口。
-   - 定义输出负载（MAC/IP/VLAN/端口/状态/时间戳 的二进制 TLV），并撰写格式文档。
+   - 提供同步查询接口，返回的快照保持遍历顺序。
+   - 定义输出载荷契约：内部 `terminal_event_record_t`（MAC/IP/port + ModifyTag）转换为携带 `tag` 字段的 `MAC_IP_INFO` 单向量，并撰写桥接文档。
 5. **配置与 CLI 钩子**
    - 提供配置结构体/环境加载器，用于适配器选择、节流、探测间隔、终端阈值。
 6. **日志与遥测**
@@ -137,7 +141,7 @@
 - 在参考硬件上进行 1000 终端的 CPU 剖析，满足性能目标，并形成 200/300/500/1000 档位的资源报告。
 - 提供 Realtek 平台 300 终端 Demo 验证报告，包含测试步骤、网络测试仪配置、日志与瓶颈分析结论。
 - 日志为结构化格式，计数器可通过调试接口或日志输出查看。
-- 在 C/C++ 混合编译环境下完成 `getAllTerminalIpInfo` 与 `setIncrementReportInterval` 接口的联调验收，验证全量查询排序、增量回调节流与异常保护行为，并确认回调输出仅包含 `mac`、`ip` 字段。
+- 在 C/C++ 混合编译环境下完成 `getAllTerminalIpInfo` 与 `setIncrementReportInterval` 接口的联调验收，验证全量查询完整性、增量回调节流与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`port` 字段。
 
 ## 替代方案评估
 - 为每个终端创建线程执行保活（因扩展性差而否决）。
@@ -147,7 +151,7 @@
 - Realtek 平台上，当 trunk 口混合存在未建虚接口的 VLAN 时的报文行为需在实验室确认。
 - 无 VLANIF 时广播/单播 ARP copy-to-CPU 行为已由平台 ACL 保障，终端发现模块无需额外确认。
 - Netforward、通用 Linux 平台的接口事件获取机制尚未确定，需要在适配器设计时补齐。
-- 事件负载的消费者使用的格式（计划采用的二进制 TLV 还是 JSON）仍需与系统集成团队确认，避免接口不匹配。
+- 若未来 `TerminalInfo` 需要扩展字段，需与系统集成团队确认版本策略并保持 `MAC_IP_INFO` 兼容性。
 
 ## 发布与回退策略
 - 通过运行时配置开关控制特性，禁用适配器初始化即可回退。

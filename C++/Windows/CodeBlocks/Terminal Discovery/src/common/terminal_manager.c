@@ -38,9 +38,7 @@
 #endif
 
 struct terminal_event_node {
-    terminal_snapshot_t snapshot;
-    terminal_snapshot_t previous;
-    bool has_previous;
+    terminal_event_record_t record;
     struct terminal_event_node *next;
 };
 
@@ -54,6 +52,19 @@ struct probe_task {
     terminal_probe_request_t request;
     struct probe_task *next;
 };
+
+static pthread_mutex_t g_active_manager_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct terminal_manager *g_active_manager = NULL;
+
+static void bind_active_manager(struct terminal_manager *mgr);
+static void unbind_active_manager(struct terminal_manager *mgr);
+
+struct terminal_manager *terminal_manager_get_active(void) {
+    pthread_mutex_lock(&g_active_manager_mutex);
+    struct terminal_manager *mgr = g_active_manager;
+    pthread_mutex_unlock(&g_active_manager_mutex);
+    return mgr;
+}
 
 struct terminal_manager {
     struct terminal_manager_config cfg;
@@ -75,25 +86,46 @@ struct terminal_manager {
     unsigned int event_throttle_sec;
     bool have_last_dispatch;
     struct timespec last_dispatch;
-    struct terminal_event_queue events_added;
-    struct terminal_event_queue events_removed;
-    struct terminal_event_queue events_modified;
+    struct terminal_event_queue events;
 };
 
 static bool is_iface_available(const struct terminal_entry *entry);
 static void snapshot_from_entry(const struct terminal_entry *entry, terminal_snapshot_t *snapshot);
-static bool snapshots_equal(const terminal_snapshot_t *a, const terminal_snapshot_t *b);
+static uint32_t snapshot_port(const terminal_snapshot_t *snapshot);
+static uint32_t entry_port(const struct terminal_entry *entry);
 static void event_queue_push(struct terminal_event_queue *queue, struct terminal_event_node *node);
-static void queue_add_event(struct terminal_manager *mgr, const terminal_snapshot_t *snapshot);
-static void queue_remove_event(struct terminal_manager *mgr, const terminal_snapshot_t *snapshot);
-static void queue_modify_event(struct terminal_manager *mgr,
-                               const terminal_snapshot_t *before,
-                               const terminal_snapshot_t *after);
-static void queue_modify_event_if_changed(struct terminal_manager *mgr,
-                                          const terminal_snapshot_t *before,
-                                          const struct terminal_entry *entry);
+static void queue_event(struct terminal_manager *mgr,
+                        terminal_event_tag_t tag,
+                        const struct terminal_key *key,
+                        uint32_t port);
+static void queue_add_event(struct terminal_manager *mgr,
+                            const struct terminal_entry *entry);
+static void queue_remove_event(struct terminal_manager *mgr,
+                               const terminal_snapshot_t *snapshot);
+static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
+                                               const terminal_snapshot_t *before,
+                                               const struct terminal_entry *entry);
 static void free_event_queue(struct terminal_event_queue *queue);
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr, bool force);
+
+static void bind_active_manager(struct terminal_manager *mgr) {
+    pthread_mutex_lock(&g_active_manager_mutex);
+    if (g_active_manager && g_active_manager != mgr) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "replacing active manager instance");
+    }
+    g_active_manager = mgr;
+    pthread_mutex_unlock(&g_active_manager_mutex);
+}
+
+static void unbind_active_manager(struct terminal_manager *mgr) {
+    pthread_mutex_lock(&g_active_manager_mutex);
+    if (g_active_manager == mgr) {
+        g_active_manager = NULL;
+    }
+    pthread_mutex_unlock(&g_active_manager_mutex);
+}
 
 static size_t hash_key(const struct terminal_key *key) {
     uint64_t hash = 1469598103934665603ULL;
@@ -124,35 +156,30 @@ static void snapshot_from_entry(const struct terminal_entry *entry, terminal_sna
     snapshot->failed_probes = entry->failed_probes;
 }
 
-static bool snapshots_equal(const terminal_snapshot_t *a, const terminal_snapshot_t *b) {
-    if (!a || !b) {
-        return false;
+static uint32_t snapshot_port(const terminal_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return 0U;
     }
-    if (memcmp(a->key.mac, b->key.mac, ETH_ALEN) != 0) {
-        return false;
+    if (snapshot->meta.ingress_ifindex > 0) {
+        return (uint32_t)snapshot->meta.ingress_ifindex;
     }
-    if (a->key.ip.s_addr != b->key.ip.s_addr) {
-        return false;
+    if (snapshot->tx_ifindex > 0) {
+        return (uint32_t)snapshot->tx_ifindex;
     }
-    if (a->state != b->state) {
-        return false;
+    return 0U;
+}
+
+static uint32_t entry_port(const struct terminal_entry *entry) {
+    if (!entry) {
+        return 0U;
     }
-    if (a->meta.vlan_id != b->meta.vlan_id) {
-        return false;
+    if (entry->meta.ingress_ifindex > 0) {
+        return (uint32_t)entry->meta.ingress_ifindex;
     }
-    if (strncmp(a->meta.ingress_ifname, b->meta.ingress_ifname, sizeof(a->meta.ingress_ifname)) != 0) {
-        return false;
+    if (entry->tx_ifindex > 0) {
+        return (uint32_t)entry->tx_ifindex;
     }
-    if (a->meta.ingress_ifindex != b->meta.ingress_ifindex) {
-        return false;
-    }
-    if (strncmp(a->tx_iface, b->tx_iface, sizeof(a->tx_iface)) != 0) {
-        return false;
-    }
-    if (a->tx_ifindex != b->tx_ifindex) {
-        return false;
-    }
-    return true;
+    return 0U;
 }
 
 static void event_queue_push(struct terminal_event_queue *queue, struct terminal_event_node *node) {
@@ -185,63 +212,53 @@ static void free_event_queue(struct terminal_event_queue *queue) {
     queue->size = 0;
 }
 
-static void queue_add_event(struct terminal_manager *mgr, const terminal_snapshot_t *snapshot) {
-    if (!mgr || !snapshot || !mgr->event_cb) {
+static void queue_event(struct terminal_manager *mgr,
+                        terminal_event_tag_t tag,
+                        const struct terminal_key *key,
+                        uint32_t port) {
+    if (!mgr || !mgr->event_cb || !key) {
         return;
     }
     struct terminal_event_node *node = calloc(1, sizeof(*node));
     if (!node) {
-        td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate add-event node");
+        td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate event node");
         return;
     }
-    node->snapshot = *snapshot;
-    node->has_previous = false;
-    event_queue_push(&mgr->events_added, node);
+    memcpy(node->record.key.mac, key->mac, ETH_ALEN);
+    node->record.key.ip = key->ip;
+    node->record.port = port;
+    node->record.tag = tag;
+    event_queue_push(&mgr->events, node);
 }
 
-static void queue_remove_event(struct terminal_manager *mgr, const terminal_snapshot_t *snapshot) {
-    if (!mgr || !snapshot || !mgr->event_cb) {
+static void queue_add_event(struct terminal_manager *mgr,
+                            const struct terminal_entry *entry) {
+    if (!mgr || !entry) {
         return;
     }
-    struct terminal_event_node *node = calloc(1, sizeof(*node));
-    if (!node) {
-        td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate remove-event node");
-        return;
-    }
-    node->snapshot = *snapshot;
-    node->has_previous = false;
-    event_queue_push(&mgr->events_removed, node);
+    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, entry_port(entry));
 }
 
-static void queue_modify_event(struct terminal_manager *mgr,
-                               const terminal_snapshot_t *before,
-                               const terminal_snapshot_t *after) {
-    if (!mgr || !before || !after || !mgr->event_cb) {
+static void queue_remove_event(struct terminal_manager *mgr,
+                               const terminal_snapshot_t *snapshot) {
+    if (!mgr || !snapshot) {
         return;
     }
-    if (snapshots_equal(before, after)) {
-        return;
-    }
-    struct terminal_event_node *node = calloc(1, sizeof(*node));
-    if (!node) {
-        td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate modify-event node");
-        return;
-    }
-    node->previous = *before;
-    node->snapshot = *after;
-    node->has_previous = true;
-    event_queue_push(&mgr->events_modified, node);
+    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, snapshot_port(snapshot));
 }
 
-static void queue_modify_event_if_changed(struct terminal_manager *mgr,
-                                          const terminal_snapshot_t *before,
-                                          const struct terminal_entry *entry) {
+static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
+                                               const terminal_snapshot_t *before,
+                                               const struct terminal_entry *entry) {
     if (!mgr || !before || !entry || !mgr->event_cb) {
         return;
     }
-    terminal_snapshot_t after;
-    snapshot_from_entry(entry, &after);
-    queue_modify_event(mgr, before, &after);
+    uint32_t before_port = snapshot_port(before);
+    uint32_t after_port = entry_port(entry);
+    if (before_port == after_port) {
+        return;
+    }
+    queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, after_port);
 }
 
 static bool interval_elapsed(const struct terminal_manager *mgr,
@@ -264,27 +281,21 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr,
         return;
     }
 
-    struct terminal_event_node *added = NULL;
-    struct terminal_event_node *removed = NULL;
-    struct terminal_event_node *modified = NULL;
-    size_t added_count = 0;
-    size_t removed_count = 0;
-    size_t modified_count = 0;
+    struct terminal_event_node *head = NULL;
+    size_t count = 0;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     pthread_mutex_lock(&mgr->lock);
 
     if (!mgr->event_cb) {
-        free_event_queue(&mgr->events_added);
-        free_event_queue(&mgr->events_removed);
-        free_event_queue(&mgr->events_modified);
+        free_event_queue(&mgr->events);
         mgr->have_last_dispatch = false;
         pthread_mutex_unlock(&mgr->lock);
         return;
     }
 
-    if (!mgr->events_added.head && !mgr->events_removed.head && !mgr->events_modified.head) {
+    if (!mgr->events.head) {
         if (force) {
             mgr->last_dispatch = now;
             mgr->have_last_dispatch = true;
@@ -307,21 +318,11 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr,
         return;
     }
 
-    added = mgr->events_added.head;
-    removed = mgr->events_removed.head;
-    modified = mgr->events_modified.head;
-    added_count = mgr->events_added.size;
-    removed_count = mgr->events_removed.size;
-    modified_count = mgr->events_modified.size;
-    mgr->events_added.head = NULL;
-    mgr->events_added.tail = NULL;
-    mgr->events_added.size = 0;
-    mgr->events_removed.head = NULL;
-    mgr->events_removed.tail = NULL;
-    mgr->events_removed.size = 0;
-    mgr->events_modified.head = NULL;
-    mgr->events_modified.tail = NULL;
-    mgr->events_modified.size = 0;
+    head = mgr->events.head;
+    count = mgr->events.size;
+    mgr->events.head = NULL;
+    mgr->events.tail = NULL;
+    mgr->events.size = 0;
     mgr->last_dispatch = now;
     mgr->have_last_dispatch = true;
     terminal_event_callback_fn callback = mgr->event_cb;
@@ -329,77 +330,31 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr,
 
     pthread_mutex_unlock(&mgr->lock);
 
-    terminal_event_batch_t batch;
-    memset(&batch, 0, sizeof(batch));
-
-    if (added_count > 0) {
-        batch.added = calloc(added_count, sizeof(*batch.added));
-        if (!batch.added) {
-            td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate add batch (%zu)", added_count);
-            added_count = 0;
-        } else {
-            batch.added_count = added_count;
+    terminal_event_record_t *records = NULL;
+    if (count > 0) {
+        records = calloc(count, sizeof(*records));
+        if (!records) {
+            td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate event batch (%zu)", count);
+            count = 0;
         }
     }
+
     size_t idx = 0;
-    while (added) {
-        struct terminal_event_node *next = added->next;
-        if (batch.added && idx < batch.added_count) {
-            batch.added[idx++] = added->snapshot;
+    struct terminal_event_node *node = head;
+    while (node) {
+        struct terminal_event_node *next = node->next;
+        if (records && idx < count) {
+            records[idx++] = node->record;
         }
-        free(added);
-        added = next;
+        free(node);
+        node = next;
     }
 
-    if (removed_count > 0) {
-        batch.removed = calloc(removed_count, sizeof(*batch.removed));
-        if (!batch.removed) {
-            td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate remove batch (%zu)", removed_count);
-            removed_count = 0;
-        } else {
-            batch.removed_count = removed_count;
-        }
-    }
-    idx = 0;
-    while (removed) {
-        struct terminal_event_node *next = removed->next;
-        if (batch.removed && idx < batch.removed_count) {
-            batch.removed[idx++] = removed->snapshot;
-        }
-        free(removed);
-        removed = next;
+    if (callback && records && count > 0) {
+        callback(records, count, callback_ctx);
     }
 
-    if (modified_count > 0) {
-        batch.modified = calloc(modified_count, sizeof(*batch.modified));
-        if (!batch.modified) {
-            td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate modify batch (%zu)", modified_count);
-            modified_count = 0;
-        } else {
-            batch.modified_count = modified_count;
-        }
-    }
-    idx = 0;
-    while (modified) {
-        struct terminal_event_node *next = modified->next;
-        if (batch.modified && idx < batch.modified_count) {
-            if (modified->has_previous) {
-                batch.modified[idx].before = modified->previous;
-            }
-            batch.modified[idx].after = modified->snapshot;
-            ++idx;
-        }
-        free(modified);
-        modified = next;
-    }
-
-    if (callback) {
-        callback(&batch, callback_ctx);
-    }
-
-    free(batch.added);
-    free(batch.removed);
-    free(batch.modified);
+    free(records);
 }
 
 static struct timespec timespec_add_ms(const struct timespec *base, unsigned int ms) {
@@ -603,15 +558,9 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->event_cb_ctx = NULL;
     mgr->event_throttle_sec = mgr->cfg.event_throttle_sec;
     mgr->have_last_dispatch = false;
-    mgr->events_added.head = NULL;
-    mgr->events_added.tail = NULL;
-    mgr->events_added.size = 0;
-    mgr->events_removed.head = NULL;
-    mgr->events_removed.tail = NULL;
-    mgr->events_removed.size = 0;
-    mgr->events_modified.head = NULL;
-    mgr->events_modified.tail = NULL;
-    mgr->events_modified.size = 0;
+    mgr->events.head = NULL;
+    mgr->events.tail = NULL;
+    mgr->events.size = 0;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         mgr->table[i] = NULL;
@@ -623,6 +572,8 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
         td_log_writef(TD_LOG_ERROR, "terminal_manager", "failed to start timer worker thread");
     }
 
+    bind_active_manager(mgr);
+
     return mgr;
 }
 
@@ -630,6 +581,8 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
     if (!mgr) {
         return;
     }
+
+    unbind_active_manager(mgr);
 
     pthread_mutex_lock(&mgr->worker_lock);
     mgr->worker_stop = true;
@@ -651,9 +604,7 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
         }
         mgr->table[i] = NULL;
     }
-    free_event_queue(&mgr->events_added);
-    free_event_queue(&mgr->events_removed);
-    free_event_queue(&mgr->events_modified);
+    free_event_queue(&mgr->events);
     pthread_mutex_unlock(&mgr->lock);
 
     pthread_mutex_destroy(&mgr->lock);
@@ -751,11 +702,9 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     }
 
     if (newly_created) {
-        terminal_snapshot_t snap;
-        snapshot_from_entry(entry, &snap);
-        queue_add_event(mgr, &snap);
+        queue_add_event(mgr, entry);
     } else if (have_before_snapshot) {
-        queue_modify_event_if_changed(mgr, &before_snapshot, entry);
+        queue_modify_event_if_port_changed(mgr, &before_snapshot, entry);
     }
 
     pthread_mutex_unlock(&mgr->lock);
@@ -872,7 +821,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                 free(to_free);
             } else {
                 if (have_before_snapshot) {
-                    queue_modify_event_if_changed(mgr, &before_snapshot, entry);
+                    queue_modify_event_if_port_changed(mgr, &before_snapshot, entry);
                 }
                 prev_next = &entry->next;
                 entry = entry->next;
@@ -930,7 +879,7 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                     }
                 }
                 if (have_before_snapshot) {
-                    queue_modify_event_if_changed(mgr, &before_snapshot, entry);
+                    queue_modify_event_if_port_changed(mgr, &before_snapshot, entry);
                 }
             }
         }
@@ -959,9 +908,7 @@ int terminal_manager_set_event_sink(struct terminal_manager *mgr,
     mgr->event_throttle_sec = throttle_sec;
     mgr->have_last_dispatch = false;
     if (!callback) {
-        free_event_queue(&mgr->events_added);
-        free_event_queue(&mgr->events_removed);
-        free_event_queue(&mgr->events_modified);
+        free_event_queue(&mgr->events);
     }
     pthread_mutex_unlock(&mgr->lock);
 
@@ -988,10 +935,10 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
         }
     }
 
-    terminal_snapshot_t *snapshots = NULL;
+    terminal_event_record_t *records = NULL;
     if (count > 0) {
-        snapshots = calloc(count, sizeof(*snapshots));
-        if (!snapshots) {
+        records = calloc(count, sizeof(*records));
+        if (!records) {
             pthread_mutex_unlock(&mgr->lock);
             return -1;
         }
@@ -1000,8 +947,11 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
     size_t idx = 0;
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
-            if (snapshots && idx < count) {
-                snapshot_from_entry(entry, &snapshots[idx]);
+            if (records && idx < count) {
+                memcpy(records[idx].key.mac, entry->key.mac, ETH_ALEN);
+                records[idx].key.ip = entry->key.ip;
+                records[idx].port = entry_port(entry);
+                records[idx].tag = TERMINAL_EVENT_TAG_ADD;
             }
             ++idx;
         }
@@ -1009,15 +959,15 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
 
     pthread_mutex_unlock(&mgr->lock);
 
-    if (snapshots) {
+    if (records) {
         for (size_t i = 0; i < count; ++i) {
-            if (!callback(&snapshots[i], callback_ctx)) {
+            if (!callback(&records[i], callback_ctx)) {
                 break;
             }
         }
     }
 
-    free(snapshots);
+    free(records);
     return 0;
 }
 

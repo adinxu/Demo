@@ -65,23 +65,23 @@ typedef struct terminal_snapshot {
     uint32_t failed_probes;
 } terminal_snapshot_t;
 
-typedef struct terminal_event_modification {
-    terminal_snapshot_t before;
-    terminal_snapshot_t after;
-} terminal_event_modification_t;
+typedef enum {
+    TERMINAL_EVENT_TAG_DEL = 0,
+    TERMINAL_EVENT_TAG_ADD,
+    TERMINAL_EVENT_TAG_MOD,
+} terminal_event_tag_t;
 
-typedef struct terminal_event_batch {
-    terminal_snapshot_t *added;
-    size_t added_count;
-    terminal_snapshot_t *removed;
-    size_t removed_count;
-    terminal_event_modification_t *modified;
-    size_t modified_count;
-} terminal_event_batch_t;
+typedef struct terminal_event_record {
+    struct terminal_key key;
+    uint32_t port; /* 0 when unknown */
+    terminal_event_tag_t tag;
+} terminal_event_record_t;
 
-typedef void (*terminal_event_callback_fn)(const terminal_event_batch_t *batch, void *user_ctx);
+typedef void (*terminal_event_callback_fn)(const terminal_event_record_t *records,
+                                           size_t count,
+                                           void *user_ctx);
 
-typedef bool (*terminal_query_callback_fn)(const terminal_snapshot_t *snapshot, void *user_ctx);
+typedef bool (*terminal_query_callback_fn)(const terminal_event_record_t *record, void *user_ctx);
 
 struct terminal_manager;
 
@@ -121,5 +121,7 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
                                void *callback_ctx);
 
 void terminal_manager_flush_events(struct terminal_manager *mgr);
+
+struct terminal_manager *terminal_manager_get_active(void);
 
 #endif /* TERMINAL_MANAGER_H */

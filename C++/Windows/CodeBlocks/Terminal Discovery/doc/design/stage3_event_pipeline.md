@@ -2,58 +2,71 @@
 
 ## 范围
 - 承接阶段 2 的终端表与保活引擎，实现 **报文解码→终端事件聚合→北向接口输出** 的闭环。
-- 提供增量事件批处理、可配置节流窗口以及全量查询接口，支撑外部 C++ 桥接层的 `MAC_IP_INFO` 结构。
+- 提供增量事件批处理、可配置节流窗口以及全量查询接口，支撑外部 C++ 桥接层的 `MAC_IP_INFO` 结构与 `void IncReportCb(const MAC_IP_INFO &info)` 回调。
+- 输出字段收敛至 MAC/IP/端口 + ModifyTag，避免重复维护冗余元数据。
 
 ## 核心数据结构
 - `terminal_snapshot_t`
-  - 终端条目的只读快照，携带 `key` (MAC/IP)、`terminal_metadata`、状态、`tx_iface/tx_ifindex`、时间戳与 `failed_probes`。
-  - 同时作为查询输出和事件负载的基础单元。
+  - 终端条目的只读快照，携带 `terminal_key`、`terminal_metadata`、状态、`tx_iface/tx_ifindex` 等内部维护数据。
+  - 仅在差异检测阶段使用：例如记录删除前状态、判断端口是否发生变化。
+- `terminal_event_record_t`
+  - 北向暴露的最小事件载荷，由 `{terminal_key, port, terminal_event_tag_t}` 组成；当端口未知时 `port` 为 `0`。
+  - `terminal_event_tag_t` 与外部的 ModifyTag 语义一一对应（`DEL/ADD/MOD`）。
 - `terminal_event_node`
-  - 事件队列的链表节点，存储 `snapshot`、可选 `previous`（用于修改前镜像）以及 `next` 指针。
+  - 单个队列节点，持有一条 `terminal_event_record_t` 与 `next` 指针。
 - `terminal_event_queue`
-  - 管理新增、删除、修改三条队列的头/尾与节点数量，便于批量分发时精确分配数组容量。
+  - 统一的先进先出队列（head/tail/size），串联所有事件类型，等待批量分发。
 
 ## 事件管线
 1. **事件入队**
    - `terminal_manager_on_packet`
-     - 新条目：创建后立即生成快照并入新增队列。
-     - 存量条目：更新前采集旧快照，更新后调用 `queue_modify_event_if_changed` 判定是否入修改队列。
+     - 新条目：创建后立即入队 `ADD` 事件，端口来源于 ingress/tx ifindex。
+     - 存量条目：更新前采集快照，若推导出的端口发生变化则入队 `MOD` 事件。
    - `terminal_manager_on_timer`
-     - 每次扫描均采集旧快照；若条目被删除，构造最终快照入删除队列；否则根据差异入修改队列。
+     - 条目过期或探测失败超过阈值时入队 `DEL` 事件。
+     - 仍存活的条目仅当端口变化时才入队 `MOD` 事件。
    - `terminal_manager_on_iface_event`
-     - 接口状态变动前采集旧快照，更新后按需入修改队列。
-   - 当未配置事件接收器 (`event_cb == NULL`) 时直接跳过入队，避免无意义分配。
+     - 接口状态变更导致端口变化时入队 `MOD` 事件。
+   - 未配置事件接收器 (`event_cb == NULL`) 时跳过节点分配，避免无意义开销。
 
 2. **批量分发** – `terminal_manager_maybe_dispatch_events`
    - 在上述 API 释放互斥锁后调用，保证回调执行不持有内部锁。
-   - 使用 `event_throttle_sec` 与最近一次分发时间控制节流；`0` 表示实时。
-   - 一旦需要分发：
-     1. 从队列中摘除全部节点，记录数量。
-     2. 为新增/删除/修改分别分配定长数组并拷贝快照（修改事件带上 before/after）。
-     3. 调用外部 `terminal_event_callback_fn`，随后释放数组。
-   - 若分配失败，记录告警并丢弃该批事件，防止队列持续占用。
+   - `event_throttle_sec` 与上次分发时间共同约束节流；`0` 代表实时。
+   - 触发分发后：
+     1. 摘除整条链表并记录事件数量。
+     2. 分配连续数组，顺序拷贝 `terminal_event_record_t`。
+     3. 调用 `terminal_event_callback_fn(const terminal_event_record_t *records, size_t count, void *ctx)`。
+   - 若内存分配失败，会记录告警并丢弃该批事件（节点依旧被释放，防止堆积）。
 
 3. **显式操作**
    - `terminal_manager_set_event_sink`
-     - 配置回调地址及节流窗口，允许 0–3600 秒范围，超过上限自动钳制。
-     - 禁用回调时会清空队列；启用后立即触发一次强制分发（以避免漏报首批事件）。
+     - 配置回调及节流窗口（0–3600 秒）。禁用回调时清空队列；启用后触发一次强制分发以避免首批事件遗漏。
    - `terminal_manager_flush_events`
-     - 向外暴露的手动刷新入口（例如关闭前或测试场景）。
+     - 手动刷新入口（例如关闭前或测试时立即输出积压事件）。
 
 ## 北向查询
 - `terminal_manager_query_all`
-  - 先在互斥锁内计算条目数量、分配快照数组并填充，再解锁逐个回调用户函数，保证不会持锁执行外部逻辑。
-  - 回调返回 `false` 可提前终止遍历。
+  - 在互斥锁内统计条目数量并构造 `terminal_event_record_t` 数组，各记录的 `tag` 固定为 `ADD` 表示当前快照。
+  - 解锁后依次调用 `terminal_query_callback_fn(const terminal_event_record_t *record, void *ctx)`；回调返回 `false` 时提前终止遍历。
+
+## 北向桥接实现
+- 全局激活：`terminal_manager_create`/`terminal_manager_destroy` 通过 `bind_active_manager`/`unbind_active_manager` 维护单例指针，`terminal_manager_get_active` 为 C++ 桥接层提供检索入口，避免调用方直接持有内部句柄。
+- 查询接口：`getAllTerminalIpInfo(MAC_IP_INFO &)` 使用 `terminal_manager_query_all` 生成 `terminal_event_record_t` 序列，并映射为带 `ModifyTag` 的 `TerminalInfo`；北向按需决定展示顺序。
+- 增量回调：`setIncrementReportInterval(int, IncReportCb)` 校验节流区间并调用 `terminal_manager_set_event_sink`；当传入回调为空时自动注销事件接收。
+  - 桥接层维护 `g_inc_report_cb` 全局回调指针，使用 `g_inc_report_mutex` 串行化读写保证线程安全。
+  - `inc_report_adapter` 在事件分发线程中运行，将 `terminal_event_record_t` 批次转换成单一 `MAC_IP_INFO`，并捕获回调抛出的异常以防影响内部逻辑。
+  - 若内存分配失败或回调抛异常，会写入结构化日志并保持内部状态不变。
 
 ## 报文解码注意事项
-- `td_adapter_packet_view` 仍是唯一的数据输入：
-  - VLAN ID 必定存在（取自 `PACKET_AUXDATA`），若缺失入口口名或 ifindex，则保留现状/记为 `-1`，后续由 `resolve_tx_interface` 和外部选择器兜底。
-  - `snapshots_equal` 在判定修改时忽略 `last_seen/last_probe/failed_probes`，避免每帧都触发修改事件；状态、VLAN、入口接口与发包接口发生变化才会产生增量。
+- `td_adapter_packet_view` 仍是唯一数据输入：
+  - VLAN ID 来自 `PACKET_AUXDATA`，若缺失入口口名或 ifindex 则保留现状/记为 `-1`，后续交由 `resolve_tx_interface` 与外部选择器兜底。
+  - 端口推导优先级：`ingress_ifindex` > `tx_ifindex`；两者皆未知时返回 `0`。
+  - 端口变化是触发 `MOD` 事件的唯一条件，可避免因时间戳等细节更新导致的噪声。
 
 ## 并发与内存安全
-- 事件队列的全部修改都在主互斥锁 `lock` 内完成，确保与终端表更新一致。
-- 分发阶段在脱锁状态下执行回调并释放节点，避免潜在的回调重入造成死锁。
-- 销毁流程在释放终端条目前先清理三条事件队列，防止残留节点泄漏。
+- 所有终端表与事件队列的修改都在主互斥锁 `lock` 内完成，确保状态一致。
+- 分发阶段释放内部锁后执行回调并逐个释放节点，避免回调重入造成死锁。
+- 销毁流程会在释放终端条目前先清理事件队列，防止残留节点泄漏。
 
 ## 关键对外接口速览
 ```c
@@ -68,9 +81,9 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
 
 void terminal_manager_flush_events(struct terminal_manager *mgr);
 ```
-- 事件批次通过 `terminal_event_batch_t` 提供三个指针数组（added/removed/modified），每个元素对应 `terminal_snapshot_t`，外层负责在回调中转换为 `TerminalInfo` 或其他北向结构。
+- 事件批次通过 `terminal_event_record_t` 连续数组传递给北向；`terminal_query_callback_fn` 复用同一结构，便于直接转换为携带 `tag` 字段的 `TerminalInfo` 并填充单一 `MAC_IP_INFO`。
 
 ## 未来扩展点
-- 修改判定策略可按需调整（例如增加 `failed_probes`、`last_seen` 触发），仅需更新 `snapshots_equal`。
-- 事件队列目前使用链表 + 批量拷贝，后续可替换为 ring buffer 以减少分配开销。
-- 若需持久化节流状态，可在回调返回值中添加反馈通道，驱动下一次分发时机。
+- 如需额外字段，可在 `terminal_event_record_t` 中增补并保持顺序拷贝逻辑不变。
+- 事件队列目前采用链表 + 批量拷贝，后续可替换为有界 ring buffer 以减少分配开销或提供容量上限。
+- 若要持久化节流状态，可在回调返回值中定义反馈语义，驱动下一次分发时机。
