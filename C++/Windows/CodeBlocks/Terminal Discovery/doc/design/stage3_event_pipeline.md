@@ -2,7 +2,7 @@
 
 ## 范围
 - 承接阶段 2 的终端表与保活引擎，实现 **报文解码→终端事件聚合→北向接口输出** 的闭环。
-- 提供增量事件批处理、可配置节流窗口以及全量查询接口，支撑外部 C++ 桥接层的 `MAC_IP_INFO` 结构与 `void IncReportCb(const MAC_IP_INFO &info)` 回调。
+- 提供增量事件批处理（实时分发）及全量查询接口，支撑外部 C++ 桥接层的 `MAC_IP_INFO` 结构与 `void IncReportCb(const MAC_IP_INFO &info)` 回调。
 - 输出字段收敛至 MAC/IP/端口 + ModifyTag，避免重复维护冗余元数据。
 
 ## 核心数据结构
@@ -31,8 +31,7 @@
 
 2. **批量分发** – `terminal_manager_maybe_dispatch_events`
    - 在上述 API 释放互斥锁后调用，保证回调执行不持有内部锁。
-   - `event_throttle_sec` 与上次分发时间共同约束节流；`0` 代表实时。
-   - 触发分发后：
+   - 每次检测到队列非空即摘除整批事件：
      1. 摘除整条链表并记录事件数量。
      2. 分配连续数组，顺序拷贝 `terminal_event_record_t`。
      3. 调用 `terminal_event_callback_fn(const terminal_event_record_t *records, size_t count, void *ctx)`。
@@ -40,7 +39,7 @@
 
 3. **显式操作**
    - `terminal_manager_set_event_sink`
-     - 配置回调及节流窗口（0–3600 秒）。禁用回调时清空队列；启用后触发一次强制分发以避免首批事件遗漏。
+     - 注册或清除增量上报回调；启用时立即触发一次分发，确保历史积压事件第一时间上报。
    - `terminal_manager_flush_events`
      - 手动刷新入口（例如关闭前或测试时立即输出积压事件）。
 
@@ -52,7 +51,7 @@
 ## 北向桥接实现
 - 全局激活：`terminal_manager_create`/`terminal_manager_destroy` 通过 `bind_active_manager`/`unbind_active_manager` 维护单例指针，`terminal_manager_get_active` 为 C++ 桥接层提供检索入口，避免调用方直接持有内部句柄。
 - 查询接口：`getAllTerminalIpInfo(MAC_IP_INFO &)` 使用 `terminal_manager_query_all` 生成 `terminal_event_record_t` 序列，并映射为带 `ModifyTag` 的 `TerminalInfo`；北向按需决定展示顺序。
-- 增量回调：`setIncrementReportInterval(int, IncReportCb)` 校验节流区间并调用 `terminal_manager_set_event_sink`；当传入回调为空时自动注销事件接收。
+- 增量回调：`setIncrementReport(IncReportCb)` 在初始化阶段注册一次回调并调用 `terminal_manager_set_event_sink`；重复调用会返回错误码，避免多次注册。
   - 桥接层维护 `g_inc_report_cb` 全局回调指针，使用 `g_inc_report_mutex` 串行化读写保证线程安全。
   - `inc_report_adapter` 在事件分发线程中运行，将 `terminal_event_record_t` 批次转换成单一 `MAC_IP_INFO`，并捕获回调抛出的异常以防影响内部逻辑。
   - 若内存分配失败或回调抛异常，会写入结构化日志并保持内部状态不变。
@@ -71,7 +70,6 @@
 ## 关键对外接口速览
 ```c
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
-                                    unsigned int throttle_sec,
                                     terminal_event_callback_fn cb,
                                     void *cb_ctx);
 
@@ -86,4 +84,4 @@ void terminal_manager_flush_events(struct terminal_manager *mgr);
 ## 未来扩展点
 - 如需额外字段，可在 `terminal_event_record_t` 中增补并保持顺序拷贝逻辑不变。
 - 事件队列目前采用链表 + 批量拷贝，后续可替换为有界 ring buffer 以减少分配开销或提供容量上限。
-- 若要持久化节流状态，可在回调返回值中定义反馈语义，驱动下一次分发时机。
+````

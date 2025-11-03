@@ -22,6 +22,6 @@ using MAC_IP_INFO = std::vector<TerminalInfo>;
 using IncReportCb = void (*)(const MAC_IP_INFO &info);
 
 extern "C" int getAllTerminalIpInfo(MAC_IP_INFO &allTerIpInfo);
-extern "C" int setIncrementReportInterval(int second, IncReportCb cb);
+extern "C" int setIncrementReport(IncReportCb cb);
 
 #endif /* TERMINAL_DISCOVERY_API_HPP */

@@ -174,12 +174,11 @@ extern "C" int getAllTerminalIpInfo(MAC_IP_INFO &allTerIpInfo) {
     return 0;
 }
 
-extern "C" int setIncrementReportInterval(int second, IncReportCb cb) {
-    if (second < 0 || second > 3600) {
+extern "C" int setIncrementReport(IncReportCb cb) {
+    if (!cb) {
         td_log_writef(TD_LOG_WARN,
                       "terminal_northbound",
-                      "invalid incremental interval: %d",
-                      second);
+                      "setIncrementReport requires a non-null callback");
         return -EINVAL;
     }
 
@@ -187,26 +186,25 @@ extern "C" int setIncrementReportInterval(int second, IncReportCb cb) {
     if (!mgr) {
         td_log_writef(TD_LOG_WARN,
                       "terminal_northbound",
-                      "setIncrementReportInterval called without an active terminal manager");
+                      "setIncrementReport called without an active terminal manager");
         return -ENODEV;
     }
 
-    unsigned int throttle = static_cast<unsigned int>(second);
-
-    IncReportCb previous_cb = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_inc_report_mutex);
-        previous_cb = g_inc_report_cb;
+        if (g_inc_report_cb) {
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_northbound",
+                          "setIncrementReport invoked multiple times");
+            return -EALREADY;
+        }
         g_inc_report_cb = cb;
     }
 
-    int rc = terminal_manager_set_event_sink(mgr,
-                                             throttle,
-                                             cb ? inc_report_adapter : nullptr,
-                                             nullptr);
+    int rc = terminal_manager_set_event_sink(mgr, inc_report_adapter, nullptr);
     if (rc != 0) {
         std::lock_guard<std::mutex> lock(g_inc_report_mutex);
-        g_inc_report_cb = previous_cb;
+        g_inc_report_cb = nullptr;
         td_log_writef(TD_LOG_ERROR,
                       "terminal_northbound",
                       "terminal_manager_set_event_sink failed: %d",

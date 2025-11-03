@@ -12,7 +12,6 @@
 - `scan_interval_ms`：固定周期扫描全部终端的间隔（默认 1000ms）。
 - `vlan_iface_format`：根据 VLAN ID 生成三层虚接口名的格式串，默认 `vlan%u`。
 - `iface_selector` / `iface_selector_ctx`：可选回调，支持自定义从 `terminal_metadata` 推导发包接口名/ifindex。
-- `event_throttle_sec`：阶段 3 事件管线使用的节流窗口；阶段 2 中保持默认值即可。
 
 未显式配置的字段会在 `terminal_manager_create` 内自动落到默认值，避免调用方遗漏。
 

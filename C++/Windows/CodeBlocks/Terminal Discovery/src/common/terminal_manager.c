@@ -83,9 +83,6 @@ struct terminal_manager {
 
     terminal_event_callback_fn event_cb;
     void *event_cb_ctx;
-    unsigned int event_throttle_sec;
-    bool have_last_dispatch;
-    struct timespec last_dispatch;
     struct terminal_event_queue events;
 };
 
@@ -106,7 +103,7 @@ static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
                                                const terminal_snapshot_t *before,
                                                const struct terminal_entry *entry);
 static void free_event_queue(struct terminal_event_queue *queue);
-static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr, bool force);
+static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr);
 
 static void bind_active_manager(struct terminal_manager *mgr) {
     pthread_mutex_lock(&g_active_manager_mutex);
@@ -261,59 +258,23 @@ static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
     queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, after_port);
 }
 
-static bool interval_elapsed(const struct terminal_manager *mgr,
-                             const struct timespec *now) {
-    if (!mgr->have_last_dispatch) {
-        return true;
-    }
-    time_t diff_sec = now->tv_sec - mgr->last_dispatch.tv_sec;
-    if (diff_sec > (time_t)mgr->event_throttle_sec) {
-        return true;
-    }
-    if (diff_sec < (time_t)mgr->event_throttle_sec) {
-        return false;
-    }
-    return now->tv_nsec >= mgr->last_dispatch.tv_nsec;
-}
-
-static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr, bool force) {
+static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr) {
     if (!mgr) {
         return;
     }
 
     struct terminal_event_node *head = NULL;
     size_t count = 0;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
 
     pthread_mutex_lock(&mgr->lock);
 
     if (!mgr->event_cb) {
         free_event_queue(&mgr->events);
-        mgr->have_last_dispatch = false;
         pthread_mutex_unlock(&mgr->lock);
         return;
     }
 
     if (!mgr->events.head) {
-        if (force) {
-            mgr->last_dispatch = now;
-            mgr->have_last_dispatch = true;
-        }
-        pthread_mutex_unlock(&mgr->lock);
-        return;
-    }
-
-    bool should_dispatch = force;
-    if (!should_dispatch) {
-        if (mgr->event_throttle_sec == 0U) {
-            should_dispatch = true;
-        } else {
-            should_dispatch = interval_elapsed(mgr, &now);
-        }
-    }
-
-    if (!should_dispatch) {
         pthread_mutex_unlock(&mgr->lock);
         return;
     }
@@ -323,8 +284,6 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr,
     mgr->events.head = NULL;
     mgr->events.tail = NULL;
     mgr->events.size = 0;
-    mgr->last_dispatch = now;
-    mgr->have_last_dispatch = true;
     terminal_event_callback_fn callback = mgr->event_cb;
     void *callback_ctx = mgr->event_cb_ctx;
 
@@ -542,10 +501,6 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     if (!mgr->cfg.vlan_iface_format) {
         mgr->cfg.vlan_iface_format = TERMINAL_DEFAULT_VLAN_IFACE_FORMAT;
     }
-    if (mgr->cfg.event_throttle_sec > 3600U) {
-        mgr->cfg.event_throttle_sec = 3600U;
-    }
-
     mgr->adapter = adapter;
     mgr->probe_cb = probe_cb;
     mgr->probe_ctx = probe_ctx;
@@ -556,8 +511,6 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->worker_started = false;
     mgr->event_cb = NULL;
     mgr->event_cb_ctx = NULL;
-    mgr->event_throttle_sec = mgr->cfg.event_throttle_sec;
-    mgr->have_last_dispatch = false;
     mgr->events.head = NULL;
     mgr->events.tail = NULL;
     mgr->events.size = 0;
@@ -709,7 +662,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 
     pthread_mutex_unlock(&mgr->lock);
 
-    terminal_manager_maybe_dispatch_events(mgr, false);
+    terminal_manager_maybe_dispatch_events(mgr);
 }
 
 static bool is_iface_available(const struct terminal_entry *entry) {
@@ -842,7 +795,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
         task = next;
     }
 
-    terminal_manager_maybe_dispatch_events(mgr, false);
+    terminal_manager_maybe_dispatch_events(mgr);
 }
 
 void terminal_manager_on_iface_event(struct terminal_manager *mgr,
@@ -887,33 +840,26 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
 
     pthread_mutex_unlock(&mgr->lock);
 
-    terminal_manager_maybe_dispatch_events(mgr, false);
+    terminal_manager_maybe_dispatch_events(mgr);
 }
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
-                                    unsigned int throttle_sec,
                                     terminal_event_callback_fn callback,
                                     void *callback_ctx) {
     if (!mgr) {
         return -1;
     }
 
-    if (throttle_sec > 3600U) {
-        throttle_sec = 3600U;
-    }
-
     pthread_mutex_lock(&mgr->lock);
     mgr->event_cb = callback;
     mgr->event_cb_ctx = callback_ctx;
-    mgr->event_throttle_sec = throttle_sec;
-    mgr->have_last_dispatch = false;
     if (!callback) {
         free_event_queue(&mgr->events);
     }
     pthread_mutex_unlock(&mgr->lock);
 
     if (callback) {
-        terminal_manager_maybe_dispatch_events(mgr, true);
+        terminal_manager_maybe_dispatch_events(mgr);
     }
 
     return 0;
@@ -975,5 +921,5 @@ void terminal_manager_flush_events(struct terminal_manager *mgr) {
     if (!mgr) {
         return;
     }
-    terminal_manager_maybe_dispatch_events(mgr, true);
+    terminal_manager_maybe_dispatch_events(mgr);
 }

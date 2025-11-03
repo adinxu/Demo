@@ -93,7 +93,6 @@ struct terminal_manager_config {
     const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
     terminal_iface_selector_fn iface_selector;
     void *iface_selector_ctx;
-    unsigned int event_throttle_sec;
 };
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
@@ -112,7 +111,6 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                                      const struct td_adapter_iface_event *event);
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
-                                    unsigned int throttle_sec,
                                     terminal_event_callback_fn callback,
                                     void *callback_ctx);
 
