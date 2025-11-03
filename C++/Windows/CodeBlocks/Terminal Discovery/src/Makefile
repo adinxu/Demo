@@ -1,6 +1,5 @@
 CXX ?= g++
 CC ?= gcc
-AR ?= ar
 CROSS ?=
 
 ifeq ($(CROSS),)
@@ -15,7 +14,6 @@ endif
 
 CXX := $(if $(TOOLCHAIN_PREFIX),$(TOOLCHAIN_PREFIX)g++,$(CXX))
 CC := $(if $(TOOLCHAIN_PREFIX),$(TOOLCHAIN_PREFIX)gcc,$(CC))
-AR := $(if $(TOOLCHAIN_PREFIX),$(TOOLCHAIN_PREFIX)ar,$(AR))
 
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 CFLAGS += -Iinclude -pthread
@@ -29,18 +27,19 @@ CSRCS := \
 	common/td_config.c \
 	common/terminal_manager.c \
 	adapter/adapter_registry.c \
-	adapter/realtek_adapter.c
+	adapter/realtek_adapter.c \
+	main/terminal_main.c
 
 CPPSRCS := \
 	common/terminal_northbound.cpp
 
 OBJS := $(CSRCS:.c=.o) $(CPPSRCS:.cpp=.o)
-TARGET := libterminal_discovery.a
+TARGET := terminal_discovery
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(AR) rcs $@ $^
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

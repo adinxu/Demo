@@ -9,6 +9,10 @@
 
 #include "adapter_api.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     TERMINAL_STATE_ACTIVE = 0,
     TERMINAL_STATE_PROBING,
@@ -138,5 +142,9 @@ struct terminal_manager *terminal_manager_get_active(void);
 
 void terminal_manager_get_stats(struct terminal_manager *mgr,
                                 struct terminal_manager_stats *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* TERMINAL_MANAGER_H */
