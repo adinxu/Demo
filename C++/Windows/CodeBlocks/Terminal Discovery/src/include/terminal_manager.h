@@ -83,6 +83,19 @@ typedef void (*terminal_event_callback_fn)(const terminal_event_record_t *record
 
 typedef bool (*terminal_query_callback_fn)(const terminal_event_record_t *record, void *user_ctx);
 
+struct terminal_manager_stats {
+    uint64_t terminals_discovered;
+    uint64_t terminals_removed;
+    uint64_t capacity_drops;
+    uint64_t probes_scheduled;
+    uint64_t probe_failures;
+    uint64_t iface_down_events;
+    uint64_t iface_up_events;
+    uint64_t events_dispatched;
+    uint64_t event_dispatch_failures;
+    uint64_t current_terminals;
+};
+
 struct terminal_manager;
 
 struct terminal_manager_config {
@@ -93,6 +106,7 @@ struct terminal_manager_config {
     const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
     terminal_iface_selector_fn iface_selector;
     void *iface_selector_ctx;
+    size_t max_terminals;
 };
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
@@ -121,5 +135,8 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
 void terminal_manager_flush_events(struct terminal_manager *mgr);
 
 struct terminal_manager *terminal_manager_get_active(void);
+
+void terminal_manager_get_stats(struct terminal_manager *mgr,
+                                struct terminal_manager_stats *out);
 
 #endif /* TERMINAL_MANAGER_H */

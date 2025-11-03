@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <net/if.h>
 #include <netinet/if_ether.h>
 #include <sys/time.h>
@@ -35,6 +36,10 @@
 
 #ifndef TERMINAL_DEFAULT_VLAN_IFACE_FORMAT
 #define TERMINAL_DEFAULT_VLAN_IFACE_FORMAT "vlan%u"
+#endif
+
+#ifndef TERMINAL_DEFAULT_MAX_TERMINALS
+#define TERMINAL_DEFAULT_MAX_TERMINALS 1000U
 #endif
 
 struct terminal_event_node {
@@ -84,6 +89,9 @@ struct terminal_manager {
     terminal_event_callback_fn event_cb;
     void *event_cb_ctx;
     struct terminal_event_queue events;
+    size_t terminal_count;
+    size_t max_terminals;
+    struct terminal_manager_stats stats;
 };
 
 static bool is_iface_available(const struct terminal_entry *entry);
@@ -136,6 +144,36 @@ static size_t hash_key(const struct terminal_key *key) {
         hash *= 1099511628211ULL;
     }
     return (size_t)hash;
+}
+
+static void format_terminal_identity(const struct terminal_key *key,
+                                     char mac_buf[18],
+                                     char ip_buf[INET_ADDRSTRLEN]) {
+    if (!key) {
+        if (mac_buf) {
+            snprintf(mac_buf, 18, "<invalid>");
+        }
+        if (ip_buf) {
+            snprintf(ip_buf, INET_ADDRSTRLEN, "<invalid>");
+        }
+        return;
+    }
+
+    if (mac_buf) {
+        snprintf(mac_buf,
+                 18,
+                 "%02x:%02x:%02x:%02x:%02x:%02x",
+                 key->mac[0],
+                 key->mac[1],
+                 key->mac[2],
+                 key->mac[3],
+                 key->mac[4],
+                 key->mac[5]);
+    }
+
+    if (ip_buf) {
+        inet_ntop(AF_INET, &key->ip, ip_buf, INET_ADDRSTRLEN);
+    }
 }
 
 static void snapshot_from_entry(const struct terminal_entry *entry, terminal_snapshot_t *snapshot) {
@@ -294,7 +332,6 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr)
         records = calloc(count, sizeof(*records));
         if (!records) {
             td_log_writef(TD_LOG_WARN, "terminal_manager", "failed to allocate event batch (%zu)", count);
-            count = 0;
         }
     }
 
@@ -309,11 +346,23 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr)
         node = next;
     }
 
+    bool dispatched = false;
     if (callback && records && count > 0) {
         callback(records, count, callback_ctx);
+        dispatched = true;
     }
 
     free(records);
+
+    if (count > 0) {
+        pthread_mutex_lock(&mgr->lock);
+        if (dispatched) {
+            mgr->stats.events_dispatched += count;
+        } else {
+            mgr->stats.event_dispatch_failures += 1;
+        }
+        pthread_mutex_unlock(&mgr->lock);
+    }
 }
 
 static struct timespec timespec_add_ms(const struct timespec *base, unsigned int ms) {
@@ -501,6 +550,9 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     if (!mgr->cfg.vlan_iface_format) {
         mgr->cfg.vlan_iface_format = TERMINAL_DEFAULT_VLAN_IFACE_FORMAT;
     }
+    if (mgr->cfg.max_terminals == 0) {
+        mgr->cfg.max_terminals = TERMINAL_DEFAULT_MAX_TERMINALS;
+    }
     mgr->adapter = adapter;
     mgr->probe_cb = probe_cb;
     mgr->probe_ctx = probe_ctx;
@@ -514,6 +566,9 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->events.head = NULL;
     mgr->events.tail = NULL;
     mgr->events.size = 0;
+    mgr->terminal_count = 0;
+    mgr->max_terminals = mgr->cfg.max_terminals;
+    memset(&mgr->stats, 0, sizeof(mgr->stats));
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         mgr->table[i] = NULL;
@@ -621,8 +676,31 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     struct terminal_entry **prev_next = NULL;
     struct terminal_entry *entry = find_entry(mgr, &key, bucket, &prev_next);
     if (!entry) {
+        if (mgr->terminal_count >= mgr->max_terminals) {
+            char mac_buf[18];
+            char ip_buf[INET_ADDRSTRLEN];
+            format_terminal_identity(&key, mac_buf, ip_buf);
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_manager",
+                          "terminal capacity reached (%zu/%zu); dropping %s/%s",
+                          mgr->terminal_count,
+                          mgr->max_terminals,
+                          mac_buf,
+                          ip_buf);
+            mgr->stats.capacity_drops += 1;
+            pthread_mutex_unlock(&mgr->lock);
+            return;
+        }
         entry = create_entry(&key, mgr, packet);
         if (!entry) {
+            char mac_buf[18];
+            char ip_buf[INET_ADDRSTRLEN];
+            format_terminal_identity(&key, mac_buf, ip_buf);
+            td_log_writef(TD_LOG_ERROR,
+                          "terminal_manager",
+                          "failed to allocate terminal entry for %s/%s",
+                          mac_buf,
+                          ip_buf);
             pthread_mutex_unlock(&mgr->lock);
             return;
         }
@@ -634,6 +712,9 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
                       entry->tx_iface[0] ? entry->tx_iface : "<unresolved>",
                       entry->meta.vlan_id);
         newly_created = true;
+        mgr->terminal_count += 1;
+        mgr->stats.terminals_discovered += 1;
+        mgr->stats.current_terminals = mgr->terminal_count;
     } else {
         if (track_events) {
             snapshot_from_entry(entry, &before_snapshot);
@@ -700,6 +781,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
         struct terminal_entry *entry = mgr->table[i];
         while (entry) {
             bool remove = false;
+            bool removed_due_to_probe_failure = false;
             terminal_snapshot_t before_snapshot;
             bool have_before_snapshot = false;
 
@@ -744,6 +826,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                                     tasks_tail->next = task;
                                     tasks_tail = task;
                                 }
+                                mgr->stats.probes_scheduled += 1;
                             } else {
                                 td_log_writef(TD_LOG_WARN,
                                               "terminal_manager",
@@ -757,6 +840,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                                           "terminal exceeded probe failure threshold (iface=%s)",
                                           entry->tx_iface);
                             remove = true;
+                            removed_due_to_probe_failure = true;
                         }
                     }
                 }
@@ -771,6 +855,14 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                 }
                 *prev_next = entry->next;
                 entry = entry->next;
+                if (mgr->terminal_count > 0) {
+                    mgr->terminal_count -= 1;
+                }
+                mgr->stats.terminals_removed += 1;
+                mgr->stats.current_terminals = mgr->terminal_count;
+                if (removed_due_to_probe_failure) {
+                    mgr->stats.probe_failures += 1;
+                }
                 free(to_free);
             } else {
                 if (have_before_snapshot) {
@@ -806,6 +898,12 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
 
     pthread_mutex_lock(&mgr->lock);
     bool track_events = mgr->event_cb != NULL;
+    bool now_up_event = (event->flags_after & IFF_UP) != 0;
+    if (now_up_event) {
+        mgr->stats.iface_up_events += 1;
+    } else {
+        mgr->stats.iface_down_events += 1;
+    }
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
@@ -816,8 +914,7 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                     snapshot_from_entry(entry, &before_snapshot);
                     have_before_snapshot = true;
                 }
-                bool now_up = (event->flags_after & IFF_UP) != 0;
-                if (!now_up) {
+                if (!now_up_event) {
                     set_state(entry, TERMINAL_STATE_IFACE_INVALID);
                     clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
                     entry->tx_ifindex = -1;
@@ -922,4 +1019,16 @@ void terminal_manager_flush_events(struct terminal_manager *mgr) {
         return;
     }
     terminal_manager_maybe_dispatch_events(mgr);
+}
+
+void terminal_manager_get_stats(struct terminal_manager *mgr,
+                                struct terminal_manager_stats *out) {
+    if (!mgr || !out) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->stats.current_terminals = mgr->terminal_count;
+    *out = mgr->stats;
+    pthread_mutex_unlock(&mgr->lock);
 }
