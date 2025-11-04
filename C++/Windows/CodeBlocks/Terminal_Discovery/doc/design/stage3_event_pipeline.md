@@ -26,7 +26,7 @@
      - 条目过期或探测失败超过阈值时入队 `DEL` 事件。
      - 仍存活的条目仅当端口变化时才入队 `MOD` 事件。
    - `terminal_manager_on_iface_event`
-     - 接口状态变更导致端口变化时入队 `MOD` 事件。
+     - 仅更新终端状态与接口缓存，不入队事件（接口状态变化不会改变对外端口语义）。
    - 未配置事件接收器 (`event_cb == NULL`) 时跳过节点分配，避免无意义开销。
 
 2. **批量分发** – `terminal_manager_maybe_dispatch_events`

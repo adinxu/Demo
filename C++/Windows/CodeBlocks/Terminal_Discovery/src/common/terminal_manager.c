@@ -936,7 +936,6 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
     }
 
     pthread_mutex_lock(&mgr->lock);
-    bool track_events = mgr->event_cb != NULL;
     bool now_up_event = (event->flags_after & IFF_UP) != 0;
     if (now_up_event) {
         mgr->stats.iface_up_events += 1;
@@ -947,12 +946,6 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
             if (strncmp(entry->tx_iface, event->ifname, sizeof(entry->tx_iface)) == 0) {
-                terminal_snapshot_t before_snapshot;
-                bool have_before_snapshot = false;
-                if (track_events) {
-                    snapshot_from_entry(entry, &before_snapshot);
-                    have_before_snapshot = true;
-                }
                 if (!now_up_event) {
                     set_state(entry, TERMINAL_STATE_IFACE_INVALID);
                     monotonic_now(&entry->last_seen);
@@ -966,9 +959,6 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                     if (ifindex > 0) {
                         entry->tx_ifindex = ifindex;
                     }
-                }
-                if (have_before_snapshot) {
-                    queue_modify_event_if_port_changed(mgr, &before_snapshot, entry);
                 }
             }
         }
