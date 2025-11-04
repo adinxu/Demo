@@ -21,6 +21,7 @@
   - 记录最近一次报文时间 `last_seen`、最近一次保活探测时间 `last_probe` 以及失败计数。
   - `terminal_metadata` 保留 ARP 报文的 VLAN、入口接口名、入口 ifindex，用作后续接口绑定参考。
   - `tx_iface/tx_ifindex` 保存可用于保活探测的三层接口绑定；解析失败时置空并进入 `IFACE_INVALID`。
+  - 时间戳字段（`last_seen`/`last_probe`）统一使用 `CLOCK_MONOTONIC` 采集，避免系统时间跳变对状态机造成干扰。
 
 - `struct terminal_manager`
   - 全局互斥锁 `lock` 保护哈希桶及状态更新。
@@ -59,6 +60,7 @@
 ## 并发与线程模型
 - 终端表所有读写均受 `lock` 保护，避免报文线程与定时线程产生竞态。
 - 定时线程内部在持锁期间仅构建最小化 `probe_task` 链表，随后释放锁执行回调，保证报文学习延迟最小化。
+- `worker_cond` 采用基于单调时钟的超时唤醒，避免系统时间回拨导致的提前/延迟扫描。
 - 销毁流程先标记 `worker_stop` 并唤醒线程，待其退出后才释放哈希表和互斥量，避免悬挂访问。
 
 ## 对外契约

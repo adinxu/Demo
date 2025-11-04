@@ -32,6 +32,7 @@
 
 - `terminal_manager_get_stats` 提供线程安全的快照接口，持有管理器互斥锁后拷贝统计结构体，调用方只需传入预分配的 `struct terminal_manager_stats`。
 - 统计字段全部在持有 `terminal_manager.lock` 时更新，避免与报文/定时线程互相踩踏；读取时同样在持锁状态下完成拷贝。
+- 与时间相关的指标（如保活间隔、接口 holdoff）全部依赖单调时钟采样，确保系统时间调整不会影响统计口径。
 
 ## 验证
 - 通过 `make cross-generic`（`src/` 目录）使用 `mips-linux-gnu-` 前缀编译，确认新增逻辑不会破坏 MIPS 交叉构建。

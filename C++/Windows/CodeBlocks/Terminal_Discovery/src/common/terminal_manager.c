@@ -113,6 +113,39 @@ static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
 static void free_event_queue(struct terminal_event_queue *queue);
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr);
 
+static void monotonic_now(struct timespec *ts) {
+    if (!ts) {
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
+static uint64_t timespec_diff_ms(const struct timespec *start,
+                                 const struct timespec *end) {
+    if (!start || !end) {
+        return 0ULL;
+    }
+
+    time_t sec = end->tv_sec - start->tv_sec;
+    long nsec = end->tv_nsec - start->tv_nsec;
+
+    if (sec < 0) {
+        return 0ULL;
+    }
+
+    if (nsec < 0) {
+        if (sec == 0) {
+            return 0ULL;
+        }
+        sec -= 1;
+        nsec += 1000000000L;
+    }
+
+    uint64_t millis = (uint64_t)sec * 1000ULL;
+    millis += (uint64_t)(nsec / 1000000L);
+    return millis;
+}
+
 static void bind_active_manager(struct terminal_manager *mgr) {
     pthread_mutex_lock(&g_active_manager_mutex);
     if (g_active_manager && g_active_manager != mgr) {
@@ -381,8 +414,8 @@ static void *terminal_manager_worker(void *arg) {
 
     pthread_mutex_lock(&mgr->worker_lock);
     while (!mgr->worker_stop) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+    struct timespec now;
+    monotonic_now(&now);
         struct timespec wake = timespec_add_ms(&now, mgr->cfg.scan_interval_ms);
 
         int rc = 0;
@@ -503,7 +536,7 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
 
     entry->key = *key;
     entry->state = TERMINAL_STATE_ACTIVE;
-    clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+    monotonic_now(&entry->last_seen);
     entry->last_probe.tv_sec = 0;
     entry->last_probe.tv_nsec = 0;
     entry->failed_probes = 0;
@@ -558,7 +591,12 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->probe_ctx = probe_ctx;
     pthread_mutex_init(&mgr->lock, NULL);
     pthread_mutex_init(&mgr->worker_lock, NULL);
-    pthread_cond_init(&mgr->worker_cond, NULL);
+
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&mgr->worker_cond, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
     mgr->worker_stop = false;
     mgr->worker_started = false;
     mgr->event_cb = NULL;
@@ -720,12 +758,12 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
             snapshot_from_entry(entry, &before_snapshot);
             have_before_snapshot = true;
         }
-        clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+    monotonic_now(&entry->last_seen);
         apply_packet_binding(mgr, entry, packet);
     }
 
     entry->failed_probes = 0;
-    clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+    monotonic_now(&entry->last_seen);
 
     if (!is_iface_available(entry)) {
         set_state(entry, TERMINAL_STATE_IFACE_INVALID);
@@ -758,8 +796,9 @@ static bool has_expired(const struct terminal_manager *mgr,
         return false;
     }
 
-    time_t diff = now->tv_sec - entry->last_seen.tv_sec;
-    return diff >= (time_t)mgr->cfg.iface_invalid_holdoff_sec;
+    uint64_t elapsed_ms = timespec_diff_ms(&entry->last_seen, now);
+    uint64_t holdoff_ms = (uint64_t)mgr->cfg.iface_invalid_holdoff_sec * 1000ULL;
+    return elapsed_ms >= holdoff_ms;
 }
 
 void terminal_manager_on_timer(struct terminal_manager *mgr) {
@@ -768,7 +807,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     }
 
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    monotonic_now(&now);
 
     pthread_mutex_lock(&mgr->lock);
 
@@ -916,7 +955,7 @@ void terminal_manager_on_iface_event(struct terminal_manager *mgr,
                 }
                 if (!now_up_event) {
                     set_state(entry, TERMINAL_STATE_IFACE_INVALID);
-                    clock_gettime(CLOCK_MONOTONIC, &entry->last_seen);
+                    monotonic_now(&entry->last_seen);
                     entry->tx_ifindex = -1;
                 } else {
                     set_state(entry, TERMINAL_STATE_PROBING);

@@ -43,6 +43,7 @@
    - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换，接口失效进入 `IFACE_INVALID` 并按 `iface_invalid_holdoff_sec` 保留 30 分钟。
 2. ✅ 调度策略：
    - 专用 `terminal_manager_worker` 线程按 `scan_interval_ms` 周期驱动 `terminal_manager_on_timer`，统一处理过期、保活、删除流程。
+   - 所有超时判断与定时节奏统一依赖单调时钟，避免系统时间跳变导致误判。
    - 后续若需要提高规模弹性，再评估时间轮/小根堆方案，目前观测以 1s 节拍满足需求。
 3. ✅ 保活执行：
    - `terminal_manager_on_timer` 聚合需要探测的终端，生成 `terminal_probe_request_t` 队列，脱离主锁逐个回调 `probe_cb`。
@@ -73,7 +74,7 @@
    - 扩展 `td_config` 支持终端保活间隔、失败阈值、最大终端数量等参数；后续引擎统一从配置文件读取，暂不使用环境变量通道。
 2. 日志与指标：
    - 引入核心模块结构化日志标签（如 `terminal_manager`, `event_queue`）。
-   - 暴露探测计数、失败数、接口波动等指标，预留对接 Prometheus 或 CLI 的采集口。
+   - 暴露探测计数、失败数、接口波动等指标，预留对接 Prometheus 或 CLI 的采集口；指标语义基于单调时钟，需在文档中注明。
 3. 文档：
    - 编写阶段 2+ 核心引擎设计说明、API 参考、构建部署指南，覆盖最新 `MAC_IP_INFO`/`TerminalInfo` 字段约束。
 
