@@ -65,3 +65,4 @@ Release_wx_pch_h_gch
 *.plg
 *.tmp
 .vscode/settings.json
+C++/Windows/CodeBlocks/Terminal_Discovery/src/terminal_discovery
