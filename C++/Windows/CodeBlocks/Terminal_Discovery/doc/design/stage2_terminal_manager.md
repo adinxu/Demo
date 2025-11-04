@@ -62,6 +62,7 @@
   - 对所有关联终端重新校验其 IP 是否仍命中该接口前缀；若不命中则清空绑定并调用 `set_state(...IFACE_INVALID)`，更新仅影响内部状态，不直接排队事件。
   - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 `lport` 发生变化或终端被重新创建时才会触发对外事件。
   - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。
+  - `main/terminal_main.c` 在管理器创建后启动 `terminal_netlink` 监听线程，直接调用该接口完成同步，无需额外的适配层事件桥接。
 
 ## 并发与线程模型
 - 终端表、`iface_address_table` 以及 `iface_binding_index` 的读写均受 `lock` 保护，避免报文线程、地址事件线程与定时线程之间产生竞态。

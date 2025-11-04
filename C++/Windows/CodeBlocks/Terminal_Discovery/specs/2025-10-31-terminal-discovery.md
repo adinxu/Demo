@@ -43,7 +43,7 @@
 ## 架构概览
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
 - **平台适配接口（PAI）**：抽象报文收发、接口事件等平台差异。
-   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`subscribe_iface_events`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
+   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
    - 若后续平台报文携带 CPU tag，则须从中解析交换芯片逻辑口（lport），表征物理口来源；lport 与内核 ifindex 概念不同，仅用于事件的端口变更检测与上报，不参与发包接口选择。
    - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
    - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。

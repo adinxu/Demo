@@ -50,5 +50,5 @@
 
 ## 后续优化方向
 - 接口元数据缓存：当前 `query_iface_details` 每次 override 都执行 ioctl，后续可结合链路事件缓存并失效，降低频繁查询成本。
-- 接口事件订阅：Realtek 适配器现阶段返回 `UNSUPPORTED`，阶段 2 可通过 netlink 或芯片 SDK 暴露 VLANIF 状态。
+- 接口事件订阅：终端发现流程改由公共模块 `terminal_netlink` 统一订阅 netlink IPv4 地址事件并调用管理器接口；适配器 ABI 不再暴露 `subscribe_iface_events` 回调，后续若需要平台特有事件可通过新增专用模块接入。
 - 计时器 API：`td_adapter_ops` 已预留接口，后续可封装 POSIX timer 或平台时钟设施供引擎复用。

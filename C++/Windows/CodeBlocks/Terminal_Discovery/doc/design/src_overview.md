@@ -10,6 +10,7 @@ src/
  │   ├── td_logging.c/.h
  │   ├── td_config.c/.h
  │   ├── terminal_manager.c/.h
+ │   ├── terminal_netlink.c/.h
  │   └── terminal_northbound.cpp / terminal_discovery_api.hpp
  ├── adapter/
  │   ├── adapter_registry.c/.h
@@ -54,7 +55,7 @@ src/
   - `terminal_manager_create/destroy`：初始化线程、绑定全局单例（`terminal_manager_get_active`）。
   - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，先获取 `ifindex`，再验证终端 IP 是否命中 `iface_address_table` 中该接口的前缀；任一环节失败都会清空绑定并立刻将终端转入 `IFACE_INVALID`。
   - `terminal_manager_on_timer`：由后台线程调用，负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
-  - `terminal_manager_on_address_update`：虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
+  - `terminal_manager_on_address_update`：由 netlink 监听器触发的虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。
   - `terminal_manager_get_stats`：返回当前计数器快照。
 - **线程模型**：
@@ -62,18 +63,23 @@ src/
   - 适配器 RX 线程在收到报文后调用 `terminal_manager_on_packet`（持 `lock`）。
   - 北向事件分发在脱锁后执行，避免长时间占用互斥量。
 
-### 5. 北向桥接 `common/terminal_northbound.cpp`
+### 5. Netlink 监听器 `common/terminal_netlink`
+- `terminal_netlink_start/stop`：管理基于 `NETLINK_ROUTE` 的后台线程，订阅 `RTM_NEWADDR/DELADDR` 并调用 `terminal_manager_on_address_update`。
+- 内部线程使用 `poll` 阻塞等待消息，解析 `ifaddrmsg` + `IFA_LOCAL/IFA_ADDRESS` 提取前缀信息，只处理 IPv4 事件。
+- 在 `terminal_main.c` 中随管理器创建启动，销毁流程会优雅退出线程并关闭套接字。
+
+### 6. 北向桥接 `common/terminal_northbound.cpp`
 - 向外导出稳定 ABI：`getAllTerminalInfo`、`setIncrementReport`。
 - `setIncrementReport`：注册 C++ 回调 `IncReportCb`，内部通过 `terminal_manager_set_event_sink` 绑定事件入口。
 - `getAllTerminalInfo`：调用 `terminal_manager_query_all` 生成快照，转换为 `MAC_IP_INFO`。
 - 拥有独立互斥锁 `g_inc_report_mutex` 保证回调注册的线程安全。
 - **依赖**：使用 `terminal_manager_get_active` 获取全局管理器指针（由 `terminal_manager_create` 绑定）。
 
-### 6. 主程序 `main/terminal_main.c`
+### 7. 主程序 `main/terminal_main.c`
 - 负责将上述组件组合成终端发现进程：
   1. `td_config_load_defaults` -> 解析 CLI 参数 -> 设置日志级别。
   2. 查找适配器 (`td_adapter_registry_find`)，初始化 `td_adapter_ops`。
-  3. 创建 `terminal_manager`，注册事件回调 `terminal_event_logger`。
+  3. 创建 `terminal_manager`，启动 netlink 监听器，注册事件回调 `terminal_event_logger`。
   4. 将适配器报文回调绑定至 `terminal_manager_on_packet`。
   5. 启动适配器并进入主循环（等待信号退出）。
   6. 收到 SIGINT/SIGTERM 后依次停止适配器、销毁管理器、输出 shutdown 日志。
@@ -89,6 +95,7 @@ src/
 | 主线程 | `main()` | CLI 解析、初始化、信号监听、最终清理 | 使用信号处理器设置 `g_should_stop` 原子变量 |
 | 适配器 RX 线程 | `realtek_adapter` | `poll` + `recvmsg` 收取 ARP，并调用 `terminal_manager_on_packet` | 访问终端表时依赖 `terminal_manager` 的 `lock` |
 | 终端管理器 Worker | `terminal_manager_worker` | 定期扫描终端表、安排探测、淘汰终端 | `worker_lock` 控制线程休眠，核心操作持 `lock` |
+| Netlink 监听线程 | `terminal_netlink` | 订阅 `RTM_NEWADDR/DELADDR` 并更新地址表 | 调用 `terminal_manager_on_address_update` 时获取管理器互斥锁 |
 | 北向回调（可选） | `terminal_manager_maybe_dispatch_events` | 在脱锁环境调用外部回调 | 事件队列在 `lock` 下构建；回调执行期间不持锁 |
 
 互斥和条件变量主要来源：
@@ -104,9 +111,11 @@ src/
    - Realtek 适配器 (`rx_thread_main`) -> `terminal_manager_on_packet` -> 更新终端状态 -> 入队事件 -> `terminal_manager_maybe_dispatch_events` -> 北向回调/日志。
 2. **保活链路**：
    - Worker 线程 (`terminal_manager_on_timer`) -> 决定是否探测 -> `terminal_probe_handler` -> `realtek_adapter.send_arp` -> 网络。
-3. **查询接口**：
+3. **地址事件链路**：
+  - Netlink 监听线程 (`terminal_netlink`) -> 解析 `RTM_NEWADDR/DELADDR` -> `terminal_manager_on_address_update` -> 更新地址表与反向索引。
+4. **查询接口**：
   - 北向 `getAllTerminalInfo` -> `terminal_manager_query_all` -> C++ 向量结果。
-4. **配置入口**：
+5. **配置入口**：
    - CLI -> `td_runtime_config` -> `td_config_to_manager_config` -> `terminal_manager_create`。
 
 ## 维护建议

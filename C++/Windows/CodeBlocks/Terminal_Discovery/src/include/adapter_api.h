@@ -80,20 +80,6 @@ struct td_adapter_iface_info {
     uint32_t flags; /* platform specific bitmask */
 };
 
-struct td_adapter_iface_event {
-    char ifname[IFNAMSIZ];
-    uint32_t flags_before;
-    uint32_t flags_after;
-};
-
-typedef void (*td_adapter_iface_event_cb)(const struct td_adapter_iface_event *event,
-                                          void *user_ctx);
-
-struct td_adapter_iface_event_subscription {
-    td_adapter_iface_event_cb callback;
-    void *user_ctx;
-};
-
 struct td_adapter_arp_request {
     struct in_addr sender_ip;
     uint8_t sender_mac[ETH_ALEN];
@@ -118,8 +104,6 @@ struct td_adapter_ops {
     td_adapter_result_t (*query_iface)(td_adapter_t *handle,
                                        const char *ifname,
                                        struct td_adapter_iface_info *info_out);
-    td_adapter_result_t (*subscribe_iface_events)(td_adapter_t *handle,
-                                                  const struct td_adapter_iface_event_subscription *sub);
     void (*log_write)(td_adapter_t *handle,
                       td_log_level_t level,
                       const char *component,

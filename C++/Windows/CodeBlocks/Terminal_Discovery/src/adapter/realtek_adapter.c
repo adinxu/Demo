@@ -780,13 +780,6 @@ static td_adapter_result_t realtek_query_iface(td_adapter_t *handle,
     return TD_ADAPTER_OK;
 }
 
-static td_adapter_result_t realtek_subscribe_iface_events(td_adapter_t *handle,
-                                                          const struct td_adapter_iface_event_subscription *sub) {
-    (void)handle;
-    (void)sub;
-    return TD_ADAPTER_ERR_UNSUPPORTED;
-}
-
 static void realtek_log_write(td_adapter_t *handle,
                               td_log_level_t level,
                               const char *component,
@@ -811,7 +804,6 @@ static const struct td_adapter_ops g_realtek_ops = {
     .register_packet_rx = realtek_register_packet_rx,
     .send_arp = realtek_send_arp,
     .query_iface = realtek_query_iface,
-    .subscribe_iface_events = realtek_subscribe_iface_events,
     .log_write = realtek_log_write,
 };
 

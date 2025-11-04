@@ -26,6 +26,7 @@ CSRCS := \
 	common/td_logging.c \
 	common/td_config.c \
 	common/terminal_manager.c \
+	common/terminal_netlink.c \
 	adapter/adapter_registry.c \
 	adapter/realtek_adapter.c \
 	main/terminal_main.c

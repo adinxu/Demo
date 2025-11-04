@@ -15,11 +15,13 @@
 #include "td_config.h"
 #include "td_logging.h"
 #include "terminal_manager.h"
+#include "terminal_netlink.h"
 
 struct app_context {
     struct terminal_manager *manager;
     td_adapter_t *adapter;
     const struct td_adapter_ops *ops;
+    struct terminal_netlink_listener *netlink_listener;
 };
 
 static volatile sig_atomic_t g_should_stop = 0;
@@ -339,6 +341,7 @@ int main(int argc, char **argv) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.adapter = adapter_handle;
     ctx.ops = adapter_desc->ops;
+    ctx.netlink_listener = NULL;
 
     struct terminal_manager *manager = terminal_manager_create(&manager_cfg,
                                                                adapter_handle,
@@ -351,8 +354,19 @@ int main(int argc, char **argv) {
     }
     ctx.manager = manager;
 
+    struct terminal_netlink_listener *netlink_listener = NULL;
+    if (terminal_netlink_start(manager, &netlink_listener) != 0) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to start netlink listener");
+        terminal_manager_destroy(manager);
+        adapter_desc->ops->shutdown(adapter_handle);
+        return EXIT_FAILURE;
+    }
+    ctx.netlink_listener = netlink_listener;
+
     if (terminal_manager_set_event_sink(manager, terminal_event_logger, &ctx) != 0) {
         td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to set event sink");
+        terminal_netlink_stop(ctx.netlink_listener);
+        ctx.netlink_listener = NULL;
         terminal_manager_destroy(manager);
         adapter_desc->ops->shutdown(adapter_handle);
         return EXIT_FAILURE;
@@ -366,6 +380,8 @@ int main(int argc, char **argv) {
     adapter_rc = adapter_desc->ops->register_packet_rx(adapter_handle, &packet_sub);
     if (adapter_rc != TD_ADAPTER_OK) {
         td_log_writef(TD_LOG_ERROR, "terminal_daemon", "register_packet_rx failed: %d", adapter_rc);
+        terminal_netlink_stop(ctx.netlink_listener);
+        ctx.netlink_listener = NULL;
         terminal_manager_set_event_sink(manager, NULL, NULL);
         terminal_manager_destroy(manager);
         adapter_desc->ops->shutdown(adapter_handle);
@@ -375,6 +391,8 @@ int main(int argc, char **argv) {
     adapter_rc = adapter_desc->ops->start(adapter_handle);
     if (adapter_rc != TD_ADAPTER_OK) {
         td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter start failed: %d", adapter_rc);
+        terminal_netlink_stop(ctx.netlink_listener);
+        ctx.netlink_listener = NULL;
         terminal_manager_set_event_sink(manager, NULL, NULL);
         terminal_manager_destroy(manager);
         adapter_desc->ops->shutdown(adapter_handle);
@@ -388,6 +406,8 @@ int main(int argc, char **argv) {
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "signal %d received, shutting down", g_should_stop);
 
     adapter_desc->ops->stop(adapter_handle);
+    terminal_netlink_stop(ctx.netlink_listener);
+    ctx.netlink_listener = NULL;
     terminal_manager_flush_events(manager);
     terminal_manager_set_event_sink(manager, NULL, NULL);
     terminal_manager_destroy(manager);

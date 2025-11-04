@@ -32,7 +32,7 @@
 2. ✅ Realtek 适配器：
    - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带 lport 的能力；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；优先采用请求内 `tx_iface`，缺省回落到配置接口；必要时调用 `SO_BINDTODEVICE`、查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
-   - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；保活节奏在终端引擎线程内统一调度。
+   - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；当前通过公共模块 `terminal_netlink` 在管理器创建后启动监听线程，保活节奏仍在终端引擎线程内统一调度。
    - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
 3. ✅ 公共组件：
    - `td_config_load_defaults` 提供统一的默认运行配置（适配器名称 `realtek`、`eth0`/`vlan1`、100ms 发送间隔、INFO 日志级别）。
