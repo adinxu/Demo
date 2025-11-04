@@ -58,12 +58,6 @@ typedef bool (*terminal_iface_selector_fn)(const struct terminal_metadata *meta,
 typedef struct terminal_snapshot {
     struct terminal_key key;
     struct terminal_metadata meta;
-    terminal_state_t state;
-    char tx_iface[IFNAMSIZ];
-    int tx_ifindex;
-    struct timespec last_seen;
-    struct timespec last_probe;
-    uint32_t failed_probes;
 } terminal_snapshot_t;
 
 typedef enum {

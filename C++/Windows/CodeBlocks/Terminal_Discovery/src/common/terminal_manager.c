@@ -96,13 +96,11 @@ struct terminal_manager {
 
 static bool is_iface_available(const struct terminal_entry *entry);
 static void snapshot_from_entry(const struct terminal_entry *entry, terminal_snapshot_t *snapshot);
-static uint32_t snapshot_port(const terminal_snapshot_t *snapshot);
-static uint32_t entry_port(const struct terminal_entry *entry);
 static void event_queue_push(struct terminal_event_queue *queue, struct terminal_event_node *node);
 static void queue_event(struct terminal_manager *mgr,
                         terminal_event_tag_t tag,
                         const struct terminal_key *key,
-                        uint32_t port);
+                        const struct terminal_metadata *meta);
 static void queue_add_event(struct terminal_manager *mgr,
                             const struct terminal_entry *entry);
 static void queue_remove_event(struct terminal_manager *mgr,
@@ -216,38 +214,6 @@ static void snapshot_from_entry(const struct terminal_entry *entry, terminal_sna
 
     snapshot->key = entry->key;
     snapshot->meta = entry->meta;
-    snapshot->state = entry->state;
-    snprintf(snapshot->tx_iface, sizeof(snapshot->tx_iface), "%s", entry->tx_iface);
-    snapshot->tx_ifindex = entry->tx_ifindex;
-    snapshot->last_seen = entry->last_seen;
-    snapshot->last_probe = entry->last_probe;
-    snapshot->failed_probes = entry->failed_probes;
-}
-
-static uint32_t snapshot_port(const terminal_snapshot_t *snapshot) {
-    if (!snapshot) {
-        return 0U;
-    }
-    if (snapshot->meta.lport > 0U) {
-        return snapshot->meta.lport;
-    }
-    if (snapshot->tx_ifindex > 0) {
-        return (uint32_t)snapshot->tx_ifindex;
-    }
-    return 0U;
-}
-
-static uint32_t entry_port(const struct terminal_entry *entry) {
-    if (!entry) {
-        return 0U;
-    }
-    if (entry->meta.lport > 0U) {
-        return entry->meta.lport;
-    }
-    if (entry->tx_ifindex > 0) {
-        return (uint32_t)entry->tx_ifindex;
-    }
-    return 0U;
 }
 
 static void event_queue_push(struct terminal_event_queue *queue, struct terminal_event_node *node) {
@@ -283,7 +249,7 @@ static void free_event_queue(struct terminal_event_queue *queue) {
 static void queue_event(struct terminal_manager *mgr,
                         terminal_event_tag_t tag,
                         const struct terminal_key *key,
-                        uint32_t port) {
+                        const struct terminal_metadata *meta) {
     if (!mgr || !mgr->event_cb || !key) {
         return;
     }
@@ -294,7 +260,11 @@ static void queue_event(struct terminal_manager *mgr,
     }
     memcpy(node->record.key.mac, key->mac, ETH_ALEN);
     node->record.key.ip = key->ip;
-    node->record.port = port;
+    if (meta) {
+        node->record.port = meta->lport;
+    } else {
+        node->record.port = 0U;
+    }
     node->record.tag = tag;
     event_queue_push(&mgr->events, node);
 }
@@ -304,7 +274,7 @@ static void queue_add_event(struct terminal_manager *mgr,
     if (!mgr || !entry) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, entry_port(entry));
+    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, &entry->meta);
 }
 
 static void queue_remove_event(struct terminal_manager *mgr,
@@ -312,7 +282,7 @@ static void queue_remove_event(struct terminal_manager *mgr,
     if (!mgr || !snapshot) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, snapshot_port(snapshot));
+    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, &snapshot->meta);
 }
 
 static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
@@ -321,12 +291,12 @@ static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
     if (!mgr || !before || !entry || !mgr->event_cb) {
         return;
     }
-    uint32_t before_port = snapshot_port(before);
-    uint32_t after_port = entry_port(entry);
+    uint32_t before_port = before->meta.lport;
+    uint32_t after_port = entry->meta.lport;
     if (before_port == after_port) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, after_port);
+    queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
 }
 
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr) {
@@ -1009,7 +979,7 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
             if (records && idx < count) {
                 memcpy(records[idx].key.mac, entry->key.mac, ETH_ALEN);
                 records[idx].key.ip = entry->key.ip;
-                records[idx].port = entry_port(entry);
+                records[idx].port = entry->meta.lport;
                 records[idx].tag = TERMINAL_EVENT_TAG_ADD;
             }
             ++idx;
