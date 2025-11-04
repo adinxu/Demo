@@ -38,9 +38,8 @@
 2. 命中已有条目则刷新 `last_seen` 并重置 `failed_probes`；未命中创建新节点。
 3. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
   - 优先执行外部自定义 `iface_selector`。
-  - 其次按 `vlan_iface_format` 生成 `vlanX` 等名称并用 `if_nametoindex` 解析 ifindex。
-  - 如仍未解析成功则保持既有 `tx_iface/tx_ifindex` 为空，后续探测时进入 `IFACE_INVALID`。
-4. 根据绑定结果切换状态：成功时进入 `ACTIVE`，失败时置为 `IFACE_INVALID` 并等待后续事件恢复。
+  - 其次按 `vlan_iface_format` 生成 `vlanX` 等名称并用 `if_nametoindex` 解析 ifindex，仅当解析成功时视为已绑定；否则清空绑定记录。
+4. 如果绑定失败，`resolve_tx_interface` 会立即清空 `tx_iface/tx_ifindex` 并触发 `set_state(...IFACE_INVALID)`，确保无虚接口的 VLAN 在报文阶段就进入失效状态；成功时保持/进入 `ACTIVE`。
 
 ### 定时扫描 `terminal_manager_on_timer`
 - 由后台线程或外部手动调用。

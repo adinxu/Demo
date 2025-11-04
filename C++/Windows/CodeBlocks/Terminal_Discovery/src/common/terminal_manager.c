@@ -110,6 +110,7 @@ static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
                                                const struct terminal_entry *entry);
 static void free_event_queue(struct terminal_event_queue *queue);
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr);
+static void set_state(struct terminal_entry *entry, terminal_state_t new_state);
 
 static void monotonic_now(struct timespec *ts) {
     if (!ts) {
@@ -441,9 +442,9 @@ static const char *state_to_string(terminal_state_t state) {
     }
 }
 
-static void resolve_tx_interface(struct terminal_manager *mgr, struct terminal_entry *entry) {
+static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_entry *entry) {
     if (!entry) {
-        return;
+        return false;
     }
     char candidate[IFNAMSIZ] = {0};
     int candidate_ifindex = -1;
@@ -456,18 +457,22 @@ static void resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
     if (!resolved && mgr->cfg.vlan_iface_format && entry->meta.vlan_id >= 0) {
         snprintf(candidate, sizeof(candidate), mgr->cfg.vlan_iface_format, (unsigned int)entry->meta.vlan_id);
         candidate_ifindex = (int)if_nametoindex(candidate);
-        if (candidate_ifindex <= 0) {
+        if (candidate_ifindex > 0) {
+            resolved = true;
+        } else {
             candidate_ifindex = -1;
         }
-        resolved = true;
     }
 
     if (resolved) {
         snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", candidate);
         entry->tx_ifindex = candidate_ifindex > 0 ? candidate_ifindex : -1;
-    } else if (entry->tx_iface[0] == '\0') {
-        entry->tx_ifindex = -1;
+        return true;
     }
+
+    entry->tx_iface[0] = '\0';
+    entry->tx_ifindex = -1;
+    return false;
 }
 
 static void apply_packet_binding(struct terminal_manager *mgr,
@@ -482,7 +487,10 @@ static void apply_packet_binding(struct terminal_manager *mgr,
         entry->meta.lport = packet->lport;
     }
 
-    resolve_tx_interface(mgr, entry);
+    bool iface_resolved = resolve_tx_interface(mgr, entry);
+    if (!iface_resolved) {
+        set_state(entry, TERMINAL_STATE_IFACE_INVALID);
+    }
 }
 
 static struct terminal_entry *create_entry(const struct terminal_key *key,
