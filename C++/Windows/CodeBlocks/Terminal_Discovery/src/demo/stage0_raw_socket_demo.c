@@ -391,6 +391,15 @@ static void *receiver_thread(void *arg) {
         memcpy(&eth_local, buffer, sizeof(eth_local));
         uint16_t ether_type = ntohs(eth_local.h_proto);
         int vlan_id = -1;
+        int ingress_ifindex = addr.sll_ifindex;
+        char ingress_ifname[IFNAMSIZ];
+        if (ingress_ifindex > 0) {
+            if (!if_indextoname((unsigned int)ingress_ifindex, ingress_ifname)) {
+                snprintf(ingress_ifname, sizeof(ingress_ifname), "unknown");
+            }
+        } else {
+            snprintf(ingress_ifname, sizeof(ingress_ifname), "unknown");
+        }
 
         if (msg.msg_controllen >= sizeof(struct cmsghdr)) {
             for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
@@ -432,28 +441,33 @@ static void *receiver_thread(void *arg) {
             continue;
         }
 
-    struct ether_arp arp_local;
-    memcpy(&arp_local, buffer + offset, sizeof(arp_local));
-    uint16_t opcode = ntohs(arp_local.ea_hdr.ar_op);
+        struct ether_arp arp_local;
+        memcpy(&arp_local, buffer + offset, sizeof(arp_local));
+        uint16_t opcode = ntohs(arp_local.ea_hdr.ar_op);
         char sha[18];
         char spa[INET_ADDRSTRLEN];
         char tpa[INET_ADDRSTRLEN];
-    format_mac(arp_local.arp_sha, sha, sizeof(sha));
-    format_ip(arp_local.arp_spa, spa, sizeof(spa));
-    format_ip(arp_local.arp_tpa, tpa, sizeof(tpa));
+        format_mac(arp_local.arp_sha, sha, sizeof(sha));
+        format_ip(arp_local.arp_spa, spa, sizeof(spa));
+        format_ip(arp_local.arp_tpa, tpa, sizeof(tpa));
+        const char *opcode_str =
+            (opcode == ARPOP_REQUEST) ? "REQUEST" :
+            (opcode == ARPOP_REPLY ? "REPLY" : "OTHER");
 
         if (vlan_id >= 0) {
-            printf("[ARP][vlan=%d] opcode=%s sender=%s/%s target=%s\n",
+            printf("[ARP][if=%s(ifindex=%d)][vlan=%d] opcode=%s sender=%s/%s target=%s\n",
+                   ingress_ifname,
+                   ingress_ifindex,
                    vlan_id,
-                   opcode == ARPOP_REQUEST ? "REQUEST" :
-                   (opcode == ARPOP_REPLY ? "REPLY" : "OTHER"),
+                   opcode_str,
                    sha,
                    spa,
                    tpa);
         } else {
-            printf("[ARP] opcode=%s sender=%s/%s target=%s\n",
-                   opcode == ARPOP_REQUEST ? "REQUEST" :
-                   (opcode == ARPOP_REPLY ? "REPLY" : "OTHER"),
+            printf("[ARP][if=%s(ifindex=%d)] opcode=%s sender=%s/%s target=%s\n",
+                   ingress_ifname,
+                   ingress_ifindex,
+                   opcode_str,
                    sha,
                    spa,
                    tpa);
