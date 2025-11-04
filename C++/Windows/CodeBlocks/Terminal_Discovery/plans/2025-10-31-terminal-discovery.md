@@ -64,7 +64,7 @@
    - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/port + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
    - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。
 3. ✅ 北向接口：
-   - 新增 `terminal_manager_set_event_sink`、`terminal_manager_query_all`、`terminal_manager_flush_events`，由本项目导出 `getAllTerminalIpInfo`/`setIncrementReport`，外部团队提供非阻塞的 `IncReportCb`。
+   - 新增 `terminal_manager_set_event_sink`、`terminal_manager_query_all`、`terminal_manager_flush_events`，由本项目导出 `getAllTerminalInfo`/`setIncrementReport`，外部团队提供非阻塞的 `IncReportCb`。
    - 查询阶段生成 `terminal_event_record_t` 数组后脱锁回调；订阅阶段在初始化时注册后即刻推送首批事件，并在桥接层将记录映射为携带 `tag` 字段的 `MAC_IP_INFO` 单向量。
 4. ✅ 文档：
    - `doc/design/stage3_event_pipeline.md` 说明事件链路设计、实时上报策略、关键数据结构与并发模型，便于后续维护与扩展。

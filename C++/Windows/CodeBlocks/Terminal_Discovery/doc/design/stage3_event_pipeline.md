@@ -50,7 +50,7 @@
 
 ## 北向桥接实现
 - 全局激活：`terminal_manager_create`/`terminal_manager_destroy` 通过 `bind_active_manager`/`unbind_active_manager` 维护单例指针，`terminal_manager_get_active` 为 C++ 桥接层提供检索入口，避免调用方直接持有内部句柄。
-- 查询接口：`getAllTerminalIpInfo(MAC_IP_INFO &)` 使用 `terminal_manager_query_all` 生成 `terminal_event_record_t` 序列，并映射为带 `ModifyTag` 的 `TerminalInfo`；北向按需决定展示顺序。
+- 查询接口：`getAllTerminalInfo(MAC_IP_INFO &)` 使用 `terminal_manager_query_all` 生成 `terminal_event_record_t` 序列，并映射为带 `ModifyTag` 的 `TerminalInfo`；北向按需决定展示顺序。
 - 增量回调：`setIncrementReport(IncReportCb)` 在初始化阶段注册一次回调并调用 `terminal_manager_set_event_sink`；重复调用会返回错误码，避免多次注册。
   - 桥接层维护 `g_inc_report_cb` 全局回调指针，使用 `g_inc_report_mutex` 串行化读写保证线程安全。
   - `inc_report_adapter` 在事件分发线程中运行，将 `terminal_event_record_t` 批次转换成单一 `MAC_IP_INFO`，并捕获回调抛出的异常以防影响内部逻辑。

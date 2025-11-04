@@ -145,14 +145,14 @@ void inc_report_adapter(const terminal_event_record_t *records, size_t count, vo
 
 } // namespace
 
-extern "C" int getAllTerminalIpInfo(MAC_IP_INFO &allTerIpInfo) {
+extern "C" int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo) {
     allTerIpInfo.clear();
 
     struct terminal_manager *mgr = terminal_manager_get_active();
     if (!mgr) {
-        td_log_writef(TD_LOG_WARN,
-                      "terminal_northbound",
-                      "getAllTerminalIpInfo called without an active terminal manager");
+    td_log_writef(TD_LOG_WARN,
+              "terminal_northbound",
+              "getAllTerminalInfo called without an active terminal manager");
         return -ENODEV;
     }
 

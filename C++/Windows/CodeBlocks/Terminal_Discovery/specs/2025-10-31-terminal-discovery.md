@@ -58,13 +58,13 @@
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
-   - 本项目提供 `getAllTerminalIpInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
+   - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
     - 需兼容外部团队既定的 C++ 类型定义：
    - `struct TerminalInfo { std::string mac; std::string ip; uint32_t port; ModifyTag tag; };`
    - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
    - `typedef void IncReportCb(const MAC_IP_INFO &info);`
     - 导出函数接口保持如下签名：
-       - `int getAllTerminalIpInfo(MAC_IP_INFO &allTerIpInfo);`
+   - `int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo);`
        - `int setIncrementReport(IncReportCb cb);`
    - 增量回调载荷包含 MAC、IP、端口与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
    - C 入口层通过 `extern "C"` 封装桥接至 C++ 实现，禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
@@ -140,7 +140,7 @@
 - 在参考硬件上进行 1000 终端的 CPU 剖析，满足性能目标，并形成 200/300/500/1000 档位的资源报告。
 - 提供 Realtek 平台 300 终端 Demo 验证报告，包含测试步骤、网络测试仪配置、日志与瓶颈分析结论。
 - 日志为结构化格式，计数器可通过调试接口或日志输出查看。
-- 在 C/C++ 混合编译环境下完成 `getAllTerminalIpInfo` 与 `setIncrementReport` 接口的联调验收，验证全量查询完整性、增量回调实时性与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`port` 字段。
+- 在 C/C++ 混合编译环境下完成 `getAllTerminalInfo` 与 `setIncrementReport` 接口的联调验收，验证全量查询完整性、增量回调实时性与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`port` 字段。
 
 ## 替代方案评估
 - 为每个终端创建线程执行保活（因扩展性差而否决）。

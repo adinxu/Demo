@@ -62,9 +62,9 @@ src/
   - 北向事件分发在脱锁后执行，避免长时间占用互斥量。
 
 ### 5. 北向桥接 `common/terminal_northbound.cpp`
-- 向外导出稳定 ABI：`getAllTerminalIpInfo`、`setIncrementReport`。
+- 向外导出稳定 ABI：`getAllTerminalInfo`、`setIncrementReport`。
 - `setIncrementReport`：注册 C++ 回调 `IncReportCb`，内部通过 `terminal_manager_set_event_sink` 绑定事件入口。
-- `getAllTerminalIpInfo`：调用 `terminal_manager_query_all` 生成快照，转换为 `MAC_IP_INFO`。
+- `getAllTerminalInfo`：调用 `terminal_manager_query_all` 生成快照，转换为 `MAC_IP_INFO`。
 - 拥有独立互斥锁 `g_inc_report_mutex` 保证回调注册的线程安全。
 - **依赖**：使用 `terminal_manager_get_active` 获取全局管理器指针（由 `terminal_manager_create` 绑定）。
 
@@ -77,6 +77,7 @@ src/
   5. 启动适配器并进入主循环（等待信号退出）。
   6. 收到 SIGINT/SIGTERM 后依次停止适配器、销毁管理器、输出 shutdown 日志。
 - `terminal_probe_handler`：实现 `terminal_probe_fn`，将探测请求翻译成 `td_adapter_arp_request` 调用 `send_arp`。
+- `terminal_event_logger`：默认注册的事件回调，将终端的 `ADD/DEL/MOD` 变更写入结构化日志，便于观察流水线行为或在没有北向监听器时进行测试验证。
 - CLI 支持配置适配器名、接口、保活参数、容量阈值、日志级别等。
 - 通过 `adapter_log_bridge` 将适配器内部日志回落至 `td_logging`。
 
@@ -103,7 +104,7 @@ src/
 2. **保活链路**：
    - Worker 线程 (`terminal_manager_on_timer`) -> 决定是否探测 -> `terminal_probe_handler` -> `realtek_adapter.send_arp` -> 网络。
 3. **查询接口**：
-   - 北向 `getAllTerminalIpInfo` -> `terminal_manager_query_all` -> C++ 向量结果。
+  - 北向 `getAllTerminalInfo` -> `terminal_manager_query_all` -> C++ 向量结果。
 4. **配置入口**：
    - CLI -> `td_runtime_config` -> `td_config_to_manager_config` -> `terminal_manager_create`。
 
