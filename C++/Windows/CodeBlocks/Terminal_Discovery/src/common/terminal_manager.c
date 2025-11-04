@@ -228,8 +228,8 @@ static uint32_t snapshot_port(const terminal_snapshot_t *snapshot) {
     if (!snapshot) {
         return 0U;
     }
-    if (snapshot->meta.ingress_ifindex > 0) {
-        return (uint32_t)snapshot->meta.ingress_ifindex;
+    if (snapshot->meta.lport > 0U) {
+        return snapshot->meta.lport;
     }
     if (snapshot->tx_ifindex > 0) {
         return (uint32_t)snapshot->tx_ifindex;
@@ -241,8 +241,8 @@ static uint32_t entry_port(const struct terminal_entry *entry) {
     if (!entry) {
         return 0U;
     }
-    if (entry->meta.ingress_ifindex > 0) {
-        return (uint32_t)entry->meta.ingress_ifindex;
+    if (entry->meta.lport > 0U) {
+        return entry->meta.lport;
     }
     if (entry->tx_ifindex > 0) {
         return (uint32_t)entry->tx_ifindex;
@@ -492,12 +492,6 @@ static void resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
         resolved = true;
     }
 
-    if (!resolved && entry->meta.ingress_ifname[0]) {
-        snprintf(candidate, sizeof(candidate), "%s", entry->meta.ingress_ifname);
-        candidate_ifindex = entry->meta.ingress_ifindex > 0 ? entry->meta.ingress_ifindex : -1;
-        resolved = true;
-    }
-
     if (resolved) {
         snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", candidate);
         entry->tx_ifindex = candidate_ifindex > 0 ? candidate_ifindex : -1;
@@ -513,15 +507,10 @@ static void apply_packet_binding(struct terminal_manager *mgr,
         return;
     }
 
-    if (packet->ifname[0]) {
-        snprintf(entry->meta.ingress_ifname, sizeof(entry->meta.ingress_ifname), "%s", packet->ifname);
-    }
-    if (packet->ifindex > 0) {
-        entry->meta.ingress_ifindex = packet->ifindex;
-    } else if (!entry->meta.ingress_ifname[0]) {
-        entry->meta.ingress_ifindex = -1;
-    }
     entry->meta.vlan_id = packet->vlan_id;
+    if (packet->lport > 0U) {
+        entry->meta.lport = packet->lport;
+    }
 
     resolve_tx_interface(mgr, entry);
 }
@@ -542,7 +531,7 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
     entry->failed_probes = 0;
     memset(&entry->meta, 0, sizeof(entry->meta));
     entry->meta.vlan_id = -1;
-    entry->meta.ingress_ifindex = -1;
+    entry->meta.lport = 0U;
     entry->tx_iface[0] = '\0';
     entry->tx_ifindex = -1;
     entry->next = NULL;
@@ -853,11 +842,9 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                             struct probe_task *task = calloc(1, sizeof(*task));
                             if (task) {
                                 task->request.key = entry->key;
-                                task->request.meta = entry->meta;
                                 snprintf(task->request.tx_iface, sizeof(task->request.tx_iface), "%s", entry->tx_iface);
                                 task->request.tx_ifindex = entry->tx_ifindex;
                                 task->request.state_before_probe = entry->state;
-                                task->request.failed_probes = entry->failed_probes;
                                 if (!tasks_head) {
                                     tasks_head = task;
                                     tasks_tail = task;

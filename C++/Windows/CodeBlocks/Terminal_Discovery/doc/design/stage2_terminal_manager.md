@@ -19,7 +19,7 @@
 - `struct terminal_entry`
   - 按 `struct terminal_key{mac+ip}` 哈希存储于 `table[256]` 链表中。
   - 记录最近一次报文时间 `last_seen`、最近一次保活探测时间 `last_probe` 以及失败计数。
-  - `terminal_metadata` 保留 ARP 报文的 VLAN、入口接口名、入口 ifindex，用作后续接口绑定参考。
+  - `terminal_metadata` 保留 ARP 报文的 VLAN 与可选逻辑端口 `lport`（来自 CPU tag，用于事件上报时标识物理口）。
   - `tx_iface/tx_ifindex` 保存可用于保活探测的三层接口绑定；解析失败时置空并进入 `IFACE_INVALID`。
   - 时间戳字段（`last_seen`/`last_probe`）统一使用 `CLOCK_MONOTONIC` 采集，避免系统时间跳变对状态机造成干扰。
 
@@ -29,7 +29,7 @@
   - `probe_cb`：由外部注入的探测函数，接收 `terminal_probe_request_t` 快照执行 ARP 保活。
 
 - `terminal_probe_request_t`
-  - 在定时扫描阶段生成的快照，包含终端 key、入口元数据、当前 `tx_iface/ifindex`、失败计数等。
+  - 在定时扫描阶段生成的简化快照，仅携带终端 key、当前 `tx_iface/ifindex` 以及探测前状态，供探测回调直接构造 ARP 请求。
   - 保持只读语义，回调层若需要更新状态，应通过引擎公开的接口重新写回。
 
 ## 主要流程
@@ -37,9 +37,9 @@
 1. 解析 ARP 报文中的 `arp_sha` 与 `arp_spa` 作为终端 key。
 2. 命中已有条目则刷新 `last_seen` 并重置 `failed_probes`；未命中创建新节点。
 3. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
-   - 优先执行外部自定义 `iface_selector`。
-   - 其次按 `vlan_iface_format` 生成 `vlanX` 等名称并用 `if_nametoindex` 解析 ifindex。
-   - 若仍失败则回退到入口接口名/ifindex。
+  - 优先执行外部自定义 `iface_selector`。
+  - 其次按 `vlan_iface_format` 生成 `vlanX` 等名称并用 `if_nametoindex` 解析 ifindex。
+  - 如仍未解析成功则保持既有 `tx_iface/tx_ifindex` 为空，后续探测时进入 `IFACE_INVALID`。
 4. 根据绑定结果切换状态：成功时进入 `ACTIVE`，失败时置为 `IFACE_INVALID` 并等待后续事件恢复。
 
 ### 定时扫描 `terminal_manager_on_timer`
@@ -70,6 +70,6 @@
 - `terminal_probe_fn`：由调用方实现，负责根据 `terminal_probe_request_t` 构造 `td_adapter_arp_request` 并发送。
 
 ## 后续扩展点
-- Stage 3 将在当前基础上新增增量事件队列，与 `terminal_probe_request_t` 共享 `terminal_metadata`。
+- Stage 3 将在当前基础上新增增量事件队列，继续消费 `terminal_entry` 中的 VLAN/lport 元数据；探测请求不再重复存储该信息。
 - 若扫描量级增加，可以 `worker_cond` 唤醒机制为基础替换为时间轮或按过期时间排序的容器。
 - 需要跨网段校验、接口元数据缓存等能力时，可复用 `iface_selector` 回调引入额外的拓扑信息。

@@ -26,8 +26,7 @@ struct terminal_key {
 
 struct terminal_metadata {
     int vlan_id;            /* -1 if unknown */
-    char ingress_ifname[IFNAMSIZ];
-    int ingress_ifindex;
+    uint32_t lport;         /* 0 when unavailable */
 };
 
 struct terminal_entry {
@@ -44,11 +43,9 @@ struct terminal_entry {
 
 typedef struct terminal_probe_request {
     struct terminal_key key;
-    struct terminal_metadata meta;
     char tx_iface[IFNAMSIZ];
     int tx_ifindex;
     terminal_state_t state_before_probe;
-    uint32_t failed_probes;
 } terminal_probe_request_t;
 
 typedef void (*terminal_probe_fn)(const terminal_probe_request_t *request, void *user_ctx);

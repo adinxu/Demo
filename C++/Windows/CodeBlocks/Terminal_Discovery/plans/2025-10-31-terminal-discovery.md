@@ -24,12 +24,13 @@
    - 接收端固定监听 `eth0`，加载 BPF 过滤器并启用 `PACKET_AUXDATA` 恢复 VLAN；收到 ARP 时打印 opcode/VLAN/源目标信息，可选择十六进制转储。
    - 发送端允许指定 `--tx-iface`、源/目的 MAC/IP、间隔、次数；默认绑定 `vlan1`，周期性下发 ARP 请求。
 3. ✅ 实机验证（基础）：确认 RX 能恢复 VLAN、忽略本机发送帧；TX 在 `vlan1` 下发 ARP 且保持 100ms 间隔。
-4. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
+4. ✅ Demo 校验：使用 stage0 demo 记录 `recvmsg` 返回的 ifindex/接口名，确认物理口 `eth0` 收到报文后解析出的接口名是否为最终发包 VLAN 口；实测 ifindex 固定等于 `eth0`，不能直接用于选择后续 ARP 发包接口，需继续依据终端绑定的 VLAN 虚接口信息。
+5. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
 
 ### 阶段 1：适配层设计与实现（已完成）
 1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
 2. ✅ Realtek 适配器：
-   - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ifindex、MAC 并回调。
+   - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带 lport 的能力；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；优先采用请求内 `tx_iface`，缺省回落到配置接口；必要时调用 `SO_BINDTODEVICE`、查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
    - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；保活节奏在终端引擎线程内统一调度。
    - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
@@ -39,8 +40,8 @@
 
 ### 阶段 2：核心终端引擎
 1. ✅ 终端表与状态机：
-   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_ifindex`）。
-   - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换，接口失效进入 `IFACE_INVALID` 并按 `iface_invalid_holdoff_sec` 保留 30 分钟。
+   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据（若存在 CPU tag 则包含 lport）、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_ifindex`）。
+   - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换；若运行时检测到绑定接口缺失可用 IPv4（接口 down、IP 被移除或迁移至其他网段导致无法构造 ARP），即判定为不可保活并进入 `IFACE_INVALID`，按 `iface_invalid_holdoff_sec` 保留 30 分钟。
 2. ✅ 调度策略：
    - 专用 `terminal_manager_worker` 线程按 `scan_interval_ms` 周期驱动 `terminal_manager_on_timer`，统一处理过期、保活、删除流程。
    - 所有超时判断与定时节奏统一依赖 Linux 单调时钟相关 API（如 `clock_gettime(CLOCK_MONOTONIC, ...)`），避免系统时间跳变导致误判。
@@ -49,8 +50,8 @@
    - `terminal_manager_on_timer` 聚合需要探测的终端，生成 `terminal_probe_request_t` 队列，脱离主锁逐个回调 `probe_cb`。
    - 超过 `keepalive_miss_threshold` 后清理终端并记录日志，避免 livelock。
 4. ✅ 接口感知：
-   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，但若底层未提供 ingress 接口名或 ifindex，则回落到配置/选择器给出的发包接口。
-   - 接口事件 `terminal_manager_on_iface_event` 及时更新 `tx_ifindex`、重置探测计数，保持 VLANIF 变更后仍可恢复。
+   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层未提供 lport 或入口接口名，则回落到配置/选择器给出的发包接口。
+   - 接口事件 `terminal_manager_on_iface_event` 及时更新 `tx_ifindex`、重置探测计数，并重新校验接口 IPv4；当确认无法再构造 ARP 时立即转入 `IFACE_INVALID`，恢复后重新探测。保活接口选择始终依据终端绑定的 VLAN 虚接口信息，而非收包返回的 ifindex。
    - Trunk 口 VLAN permit 仍依赖底层 ACL 保障，若平台策略改变再跟进。
 5. ✅ 并发与锁：
    - 哈希桶访问由主互斥保护，探测回调在 worker 锁外执行，杜绝回调 re-entry 死锁。
@@ -58,8 +59,8 @@
 
 ### 阶段 3：报文解码与事件上报
 1. ✅ 报文解析：
-   - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；缺失入口口名/ifindex 时回退到 VLAN 模板或选择器结果，保证事件始终携带 VLAN 信息。
-   - 依赖 ACL 提供的 VLAN tag 判定终端归属；若 VLANIF 缺失则进入 `IFACE_INVALID`，恢复后重新探测。
+   - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；缺失 lport 或入口接口信息时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。
+   - 依赖 ACL 提供的 VLAN tag 判定终端归属；若入口信息表明我们无法再为该终端构造有效 ARP（例如 VLANIF 被移除或接口失去 IPv4），即转入 `IFACE_INVALID`，恢复后重新探测。
 2. ✅ 事件队列：
    - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/port + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
    - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。

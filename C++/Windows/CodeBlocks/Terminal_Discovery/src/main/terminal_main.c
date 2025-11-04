@@ -128,13 +128,11 @@ static void terminal_probe_handler(const terminal_probe_request_t *request, void
     if (request->tx_iface[0] != '\0') {
         snprintf(arp_req.tx_iface, sizeof(arp_req.tx_iface), "%s", request->tx_iface);
         arp_req.tx_iface_valid = true;
-    } else if (request->meta.ingress_ifname[0] != '\0') {
-        snprintf(arp_req.tx_iface, sizeof(arp_req.tx_iface), "%s", request->meta.ingress_ifname);
-        arp_req.tx_ifindex = request->meta.ingress_ifindex;
-        arp_req.tx_iface_valid = true;
     } else {
         arp_req.tx_iface_valid = false;
-        arp_req.tx_ifindex = -1;
+        if (arp_req.tx_ifindex <= 0) {
+            arp_req.tx_ifindex = -1;
+        }
     }
 
     td_adapter_result_t rc = ctx->ops->send_arp(ctx->adapter, &arp_req);

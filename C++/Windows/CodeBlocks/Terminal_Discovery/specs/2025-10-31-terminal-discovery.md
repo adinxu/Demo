@@ -19,7 +19,7 @@
 
 ## 功能性需求
 1. **终端发现**：仅处理接收到的 ARP 广播、免费 ARP、单播回复等（本机发送的 ARP 已在适配层过滤），按 VLAN/接口识别终端；后续需可扩展至 DHCP 报文。
-2. **保活机制**：每个终端每 120 秒发送一次单播 ARP request；连续三次无响应则删除终端。终端与其首次或最近一次有效报文对应的三层虚接口/VLAN 建立绑定，保活报文必须从该虚接口发出，确保与发现路径保持一致。
+2. **保活机制**：每个终端每 120 秒发送一次单播 ARP request；连续三次无响应则删除终端。终端与其首次或最近一次有效报文对应的三层虚接口/VLAN 建立绑定，保活报文必须从该虚接口发出，确保与发现路径保持一致；若该接口缺失可用 IPv4（如接口 down、IP 被删除或迁移至不同网段导致无法拼装 ARP），则视为保活通道失效并进入接口无效流程。
 3. **接口感知**：追踪三层 VLAN 接口生命周期（创建/删除/上下线、IP 变更），接口无效时暂停保活。
 4. **Access/Trunk 逻辑**：当前平台 ACL 已保证送达内核的报文携带真实 VLAN tag，且该 VLAN 必然已在本机存在；因此无需额外查询 Access/Trunk 配置数据，仅依据报文内 VLAN 决定终端归属。仍需在缺失对应 VLANIF 时按三层 Down 逻辑处理。
 5. **拓扑边界场景**：当关联的三层接口 down、VLAN 缺少虚接口或出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）时保留 30 分钟，期间不发送保活；恢复后转入探测态。
@@ -44,6 +44,7 @@
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
 - **平台适配接口（PAI）**：抽象报文收发、接口事件等平台差异。
    - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`subscribe_iface_events`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
+   - 若后续平台报文携带 CPU tag，则须从中解析交换芯片逻辑口（lport），表征物理口来源；lport 与内核 ifindex 概念不同，仅用于事件的端口变更检测与上报，不参与发包接口选择。
    - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
    - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
 - **事件总线**：内部队列负责聚合终端变更并立即投递给上报子系统。
@@ -56,6 +57,7 @@
    - 事件循环可按功能设计（如 epoll、poll 或自定义调度），不强制依赖 `loop_protect_epoll_loop` 实现。
    - 报文发送通过 Raw Socket 直接绑定至 VLAN 对应的虚接口（例如 VLAN1 对应 `vlan1`），填充 ARP request 后发出，避免引入 SDK 依赖。
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
+   - 在 Realtek 平台使用 Raw Socket 绑定 `eth0` 收包时，`recvmsg` 返回的 `ifindex` 恒为 `eth0` 的索引；该值仅用于日志或入向定位，不能直接用于选择后续 ARP 发送接口，保活发包仍需依据终端绑定的 VLAN 虚接口信息。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
    - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
@@ -77,10 +79,11 @@
 - **接口管理**：
    1. 仅关心三层虚接口（VLANIF）的上下线、IP 变更；二层 access/trunk 口的物理 up/down 不触发状态变更。
    2. 收到 Access 口报文、且无对应虚接口时终端保持发现状态但不保活；Trunk 口报文无需再次校验 permit 集合（ACL 已确保 VLAN 合法），仅在缺失对应 VLANIF 时按无虚接口逻辑处理。
-   3. 需感知虚接口创建/删除、IP 变更、接口状态变更；接口无效时终端迁移至 `IFACE_INVALID` 状态，30 分钟后淘汰。
+   3. 需感知虚接口创建/删除、IP 变更、接口状态变更；当接口失去可用 IPv4（接口 down、IPv4 删除或迁移至不同网段导致无法生成 ARP）时判定为不可保活，终端迁移至 `IFACE_INVALID` 状态并在 30 分钟后淘汰。
 - **报文路径**：
    1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。
+   3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于事件上报端口检查；保活发包仍基于内核接口信息。
    3. 发送路径依据终端最近一次有效报文关联的三层虚接口构造 ARP request，并沿该虚接口下发；发送阶段需在原始套接字上动态绑定对应接口（如调用 `SO_BINDTODEVICE`）或复用该接口的专属套接字缓存，保证保活报文与发现路径一致。
 - **终端状态机**：
    - `(收到报文) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`。
@@ -101,7 +104,7 @@
 
 ## 数据结构模型
 - `terminal_manager_t`：持有终端链表/堆、互斥锁、定时线程、运行标志等；负责调度保活与对外接口。
-- `terminal_entry_t`：记录 MAC、IP、接口名、状态、上次收到报文时间、上次探测时间、探测失败计数、平台元数据、链表指针。
+- `terminal_entry_t`：记录 MAC、IP、状态、上次收到报文时间、上次探测时间、探测失败计数、平台元数据（含 VLAN、lport 等）、链表指针。
 - `metadata_t`：封装平台相关字段（如 logical_port、vlan 等），便于不同适配器扩展。
 - 支持单链表遍历与时间轮/堆双实现，依据目标平台性能选择。
 

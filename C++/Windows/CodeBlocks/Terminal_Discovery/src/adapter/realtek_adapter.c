@@ -406,10 +406,7 @@ static void *rx_thread_main(void *arg) {
         view.ether_type = ether_type;
         view.vlan_id = vlan_id;
         clock_gettime(CLOCK_REALTIME, &view.ts);
-        view.ifindex = addr.sll_ifindex;
-        if (!if_indextoname(addr.sll_ifindex, view.ifname)) {
-            snprintf(view.ifname, sizeof(view.ifname), "%s", adapter->rx_iface);
-        }
+        view.lport = 0U;
         memcpy(view.src_mac, eth_local.h_source, ETH_ALEN);
         memcpy(view.dst_mac, eth_local.h_dest, ETH_ALEN);
 

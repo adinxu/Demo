@@ -14,7 +14,7 @@
 
 ## 关键数据结构
 - `struct td_adapter_ops`：适配器必须实现的函数表（`init/start/stop`、收包注册、`send_arp`、接口查询、计时器、日志桥接等）。
-- `struct td_adapter_packet_view`：向引擎上报报文时携带的元数据（原始帧指针、VLAN ID、入方向接口名与 ifindex、源/目的 MAC、时间戳）。
+- `struct td_adapter_packet_view`：向引擎上报报文时携带的元数据（原始帧指针、VLAN ID、逻辑端口 lport、源/目的 MAC、时间戳）。Realtek 平台暂无 CPU tag，默认将 lport 设置为 `0`。
 - `struct td_adapter_arp_request`：ARP 保活请求描述，阶段 1 重构后新增 `tx_iface`、`tx_ifindex` 与有效标记，允许外层指定发送所用三层接口。
 - `struct td_adapter`：Realtek 私有状态，记录配置的接口、套接字 FD、默认 TX 接口的 MAC/IP 缓存、订阅回调、工作线程句柄以及互斥锁。
 

@@ -7,7 +7,7 @@
 
 ## 核心数据结构
 - `terminal_snapshot_t`
-  - 终端条目的只读快照，携带 `terminal_key`、`terminal_metadata`、状态、`tx_iface/tx_ifindex` 等内部维护数据。
+  - 终端条目的只读快照，携带 `terminal_key`、`terminal_metadata`（含 VLAN 与可选 lport）、状态、`tx_iface/tx_ifindex` 等内部维护数据。
   - 仅在差异检测阶段使用：例如记录删除前状态、判断端口是否发生变化。
 - `terminal_event_record_t`
   - 北向暴露的最小事件载荷，由 `{terminal_key, port, terminal_event_tag_t}` 组成；当端口未知时 `port` 为 `0`。
@@ -20,7 +20,7 @@
 ## 事件管线
 1. **事件入队**
    - `terminal_manager_on_packet`
-     - 新条目：创建后立即入队 `ADD` 事件，端口来源于 ingress/tx ifindex。
+  - 新条目：创建后立即入队 `ADD` 事件，端口来源于 CPU tag lport，如缺失则回退到 `tx_ifindex`。
      - 存量条目：更新前采集快照，若推导出的端口发生变化则入队 `MOD` 事件。
    - `terminal_manager_on_timer`
      - 条目过期或探测失败超过阈值时入队 `DEL` 事件。
@@ -58,8 +58,8 @@
 
 ## 报文解码注意事项
 - `td_adapter_packet_view` 仍是唯一数据输入：
-  - VLAN ID 来自 `PACKET_AUXDATA`，若缺失入口口名或 ifindex 则保留现状/记为 `-1`，后续交由 `resolve_tx_interface` 与外部选择器兜底。
-  - 端口推导优先级：`ingress_ifindex` > `tx_ifindex`；两者皆未知时返回 `0`。
+  - VLAN ID 来自 `PACKET_AUXDATA`；若平台额外携带 CPU tag，则解析出 lport 用于事件上报。Realtek 平台暂不回传 lport，默认填 `0`，随后依赖 `resolve_tx_interface` 与外部选择器确定发包接口。
+  - 端口推导优先级：`lport` > `tx_ifindex`；两者皆未知时返回 `0`。
   - 端口变化是触发 `MOD` 事件的唯一条件，可避免因时间戳等细节更新导致的噪声。
 
 ## 并发与内存安全

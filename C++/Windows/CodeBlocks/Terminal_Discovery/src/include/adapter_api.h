@@ -60,8 +60,7 @@ struct td_adapter_packet_view {
     uint16_t ether_type;        /* host-byte-order inner EtherType */
     int vlan_id;                /* -1 if no VLAN present */
     struct timespec ts;         /* capture timestamp */
-    char ifname[IFNAMSIZ];      /* ingress interface */
-    int ifindex;                /* ingress ifindex */
+    uint32_t lport;             /* logical port from CPU tag; 0 when unavailable */
     uint8_t src_mac[ETH_ALEN];
     uint8_t dst_mac[ETH_ALEN];
 };
