@@ -13,7 +13,7 @@
 ## 日志强化
 - 当 `max_terminals` 达到上限时，会输出 `terminal_manager` 组件的 WARN 级日志，携带当前数量与被丢弃终端的 MAC/IP，便于观察容量策略触发频次。
 - 新终端分配失败（内存不足）统一记录为 ERROR 日志，快速暴露资源耗尽风险。
-- 接口上下线、探测失败超阈值等仍沿用 INFO/DEBUG 级别的结构化日志，结合统计指标可还原关键时间线。
+- 虚接口前缀变化、探测失败超阈值等仍沿用 INFO/DEBUG 级别的结构化日志，结合统计指标可还原关键时间线。
 
 ## 指标口径
 `struct terminal_manager_stats` 现包含以下指标：
@@ -25,7 +25,7 @@
 | `capacity_drops` | 达到容量上限被拒绝的终端数 | 新终端创建前触发容量检查 |
 | `probes_scheduled` | 已安排的保活探测次数 | 定时扫描生成 `probe_task` |
 | `probe_failures` | 因探测失败被淘汰的终端数 | 超过阈值后删除条目 |
-| `iface_down_events` / `iface_up_events` | 接口状态翻转事件计数 | `terminal_manager_on_iface_event` |
+| `address_update_events` | 虚接口 IPv4 前缀增删次数 | `terminal_manager_on_address_update` |
 | `events_dispatched` | 成功下发给北向回调的事件条目数 | `terminal_manager_maybe_dispatch_events` |
 | `event_dispatch_failures` | 事件批次因内存不足或回调缺失被丢弃次数 | `terminal_manager_maybe_dispatch_events` |
 | `current_terminals` | 当前终端表内条目数量 | 新建/删除条目、或通过 `terminal_manager_get_stats` 读取时同步 |

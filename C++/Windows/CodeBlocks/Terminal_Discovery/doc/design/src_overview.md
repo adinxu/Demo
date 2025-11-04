@@ -36,6 +36,7 @@ src/
     - 主线程执行 `init/start` 等生命周期回调。
     - `rx_thread_main` 独立线程轮询 AF_PACKET 套接字，解析 VLAN/ARP，并通过注册的回调上送 `td_adapter_packet_view`。
     - 发送路径在 `send_arp` 内部串行化（互斥锁 + 节流）。
+    - `send_lock` 用于保证发送节流 (`last_send`) 与 `sendto` 操作在未来可能的多线程场景下保持串行；当前探测仅来自管理器单线程，即便争用极低，也保留该锁以免后续扩展引入竞态。
   - 所有平台 I/O 均通过原生 Raw Socket 完成，避免依赖平台 SDK。
 
 ### 4. 核心引擎 `common/terminal_manager`
@@ -51,9 +52,9 @@ src/
     - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。
 - **关键函数**：
   - `terminal_manager_create/destroy`：初始化线程、绑定全局单例（`terminal_manager_get_active`）。
-  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；若是新终端则执行业务校验、入表、触发事件。
+  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，先获取 `ifindex`，再验证终端 IP 是否命中 `iface_address_table` 中该接口的前缀；任一环节失败都会清空绑定并立刻将终端转入 `IFACE_INVALID`。
   - `terminal_manager_on_timer`：由后台线程调用，负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
-  - `terminal_manager_on_iface_event`：接口状态更新（目前适配层未实现，上层预留）。
+  - `terminal_manager_on_address_update`：虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。
   - `terminal_manager_get_stats`：返回当前计数器快照。
 - **线程模型**：
@@ -91,7 +92,7 @@ src/
 | 北向回调（可选） | `terminal_manager_maybe_dispatch_events` | 在脱锁环境调用外部回调 | 事件队列在 `lock` 下构建；回调执行期间不持锁 |
 
 互斥和条件变量主要来源：
-- `terminal_manager.lock`：保护终端哈希表、事件队列、统计数据。
+- `terminal_manager.lock`：保护终端哈希表、事件队列、统计数据以及 `iface_address_table` / `iface_binding_index`。
 - `terminal_manager.worker_lock/cond`：唤醒/停止后台线程。
 - `realtek_adapter.state_lock`：保护数据流回调注册。
 - `realtek_adapter.send_lock`：串行化 ARP 发送、实现节流。

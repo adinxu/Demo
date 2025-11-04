@@ -79,12 +79,15 @@
 - **接口管理**：
    1. 仅关心三层虚接口（VLANIF）的上下线、IP 变更；二层 access/trunk 口的物理 up/down 不触发状态变更。
    2. 收到 Access 口报文、且无对应虚接口时终端保持发现状态但不保活；Trunk 口报文无需再次校验 permit 集合（ACL 已确保 VLAN 合法），仅在缺失对应 VLANIF 时按无虚接口逻辑处理。
-   3. 需感知虚接口创建/删除、IP 变更、接口状态变更；当接口失去可用 IPv4（接口 down、IPv4 删除或迁移至不同网段导致无法生成 ARP）时判定为不可保活，终端迁移至 `IFACE_INVALID` 状态并在 30 分钟后淘汰。
+   3. 需监测虚接口 IP 的增删改（可通过 Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调）；核心引擎维护“可用接口地址表”（`ifindex -> {prefix}`）。该表实现为哈希表或动态数组，元素保存接口索引、前缀长度、网络地址（CIDR 表示）。
+   4. 为避免 IP 事件触发全量扫描，按 `ifindex` 维护反向索引（`ifindex -> terminal_entry list`）。索引可采用链表头数组或哈希表，节点即 `terminal_entry` 指针，维护时确保多重注册去重。`resolve_tx_interface` 成功后在索引中登记；若接口当前尚未出现在地址表或终端 IP 未命中前缀，则判定绑定失败，不会写入索引。接口地址集变化时仅遍历该 `ifindex` 对应终端并设为 `IFACE_INVALID`。
+   5. 地址表与反向索引的读写均在持有 `terminal_manager.lock` 时进行；外部事件处理（Netlink 回调）进入核心引擎后需先获取此锁，保证与 `resolve_tx_interface`、终端状态机操作不存在竞态。为降低更新阻塞，可在锁内完成结构更新后再脱锁触发终端状态变更/事件队列。
 - **报文路径**：
    1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。
    3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于事件上报端口检查；保活发包仍基于内核接口信息。
    3. 发送路径依据终端最近一次有效报文关联的三层虚接口构造 ARP request，并沿该虚接口下发；发送阶段需在原始套接字上动态绑定对应接口（如调用 `SO_BINDTODEVICE`）或复用该接口的专属套接字缓存，保证保活报文与发现路径一致。
+   4. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
 - **终端状态机**：
    - `(收到报文) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`。
          - `ACTIVE → IFACE_INVALID`：接口 down、出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）或 VLAN 无虚接口；`IFACE_INVALID` 保留 30 分钟后删除。
@@ -106,6 +109,8 @@
 - `terminal_manager_t`：持有终端链表/堆、互斥锁、定时线程、运行标志等；负责调度保活与对外接口。
 - `terminal_entry_t`：记录 MAC、IP、状态、上次收到报文时间、上次探测时间、探测失败计数、平台元数据（含 VLAN、lport 等）、链表指针。
 - `metadata_t`：封装平台相关字段（如 logical_port、vlan 等），便于不同适配器扩展。
+- `iface_address_table`：哈希表 `ifindex -> prefix_list`，每个元素包含 IPv4 网络地址与掩码长度；所有修改在 `terminal_manager.lock` 下完成。
+- `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，用于在接口前缀变更时快速定位受影响终端。
 - 支持单链表遍历与时间轮/堆双实现，依据目标平台性能选择。
 
 ## 任务拆解

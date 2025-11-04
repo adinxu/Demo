@@ -51,8 +51,9 @@
    - 超过 `keepalive_miss_threshold` 后清理终端并记录日志，避免 livelock。
 4. ✅ 接口感知：
    - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层未提供 lport 或入口接口名，则回落到配置/选择器给出的发包接口。
-   - 接口事件 `terminal_manager_on_iface_event` 及时更新 `tx_ifindex`、重置探测计数，并重新校验接口 IPv4；当确认无法再构造 ARP 时立即转入 `IFACE_INVALID`，恢复后重新探测。保活接口选择始终依据终端绑定的 VLAN 虚接口信息，而非收包返回的 ifindex。
-   - Trunk 口 VLAN permit 仍依赖底层 ACL 保障，若平台策略改变再跟进。
+   - 仅监测虚接口 IPv4 地址的新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调），在 `terminal_manager` 内维护 `iface_address_table`（`ifindex -> prefix_list`）和反向索引 `iface_binding_index`（`ifindex -> terminal_entry*` 列表）。
+   - `resolve_tx_interface` 先确认 `if_nametoindex` 或 selector 返回的 `ifindex > 0`，再校验终端 IP 是否命中地址表中的任意前缀；否则清空绑定并立即置为 `IFACE_INVALID`。
+   - 地址表变更时仅遍历该 `ifindex` 对应的终端，将其设为 `IFACE_INVALID` 并等待后续报文或地址恢复重新探测。保活接口选择始终依据终端绑定的 VLAN 虚接口信息，而非收包返回的 ifindex。
 5. ✅ 并发与锁：
    - 哈希桶访问由主互斥保护，探测回调在 worker 锁外执行，杜绝回调 re-entry 死锁。
 6. ✅ 文档：`doc/design/stage2_terminal_manager.md` 描述线程模型、接口解析策略与配置参数取值。
@@ -60,7 +61,7 @@
 ### 阶段 3：报文解码与事件上报
 1. ✅ 报文解析：
    - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；缺失 lport 或入口接口信息时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。
-   - 依赖 ACL 提供的 VLAN tag 判定终端归属；若入口信息表明我们无法再为该终端构造有效 ARP（例如 VLANIF 被移除或接口失去 IPv4），即转入 `IFACE_INVALID`，恢复后重新探测。
+   - 依赖 ACL 提供的 VLAN tag 判定终端归属；若地址表查不到对应前缀或无法再构造有效 ARP（例如 VLANIF 被移除 IPv4 或迁移网段），即转入 `IFACE_INVALID`，后续在地址恢复或报文再次到达时重新探测。
 2. ✅ 事件队列：
    - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/port + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
    - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。

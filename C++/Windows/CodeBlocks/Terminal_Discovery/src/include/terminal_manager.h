@@ -84,14 +84,20 @@ struct terminal_manager_stats {
     uint64_t capacity_drops;
     uint64_t probes_scheduled;
     uint64_t probe_failures;
-    uint64_t iface_down_events;
-    uint64_t iface_up_events;
+    uint64_t address_update_events;
     uint64_t events_dispatched;
     uint64_t event_dispatch_failures;
     uint64_t current_terminals;
 };
 
 struct terminal_manager;
+
+typedef struct terminal_address_update {
+    int ifindex;
+    struct in_addr address;
+    uint8_t prefix_len; /* 0-32 */
+    bool is_add;        /* true = add/update, false = remove */
+} terminal_address_update_t;
 
 struct terminal_manager_config {
     unsigned int keepalive_interval_sec;
@@ -116,8 +122,8 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 
 void terminal_manager_on_timer(struct terminal_manager *mgr);
 
-void terminal_manager_on_iface_event(struct terminal_manager *mgr,
-                                     const struct td_adapter_iface_event *event);
+void terminal_manager_on_address_update(struct terminal_manager *mgr,
+                                        const terminal_address_update_t *update);
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
                                     terminal_event_callback_fn callback,

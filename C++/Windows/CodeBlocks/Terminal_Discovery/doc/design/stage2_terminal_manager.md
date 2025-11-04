@@ -27,9 +27,12 @@
   - 全局互斥锁 `lock` 保护哈希桶及状态更新。
   - 定时线程相关：`worker_thread` + `worker_lock` + `worker_cond`。线程按 `scan_interval_ms` 周期触发全量扫描。
   - `probe_cb`：由外部注入的探测函数，接收 `terminal_probe_request_t` 快照执行 ARP 保活。
+  - `iface_address_table`：哈希表维护 `ifindex -> prefix_list`，每项包含网络地址与掩码长度；仅在持有 `lock` 时更新。
+  - `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，`resolve_tx_interface` 成功后登记，便于地址变化时精准定位受影响终端。
 
 - `terminal_probe_request_t`
   - 在定时扫描阶段生成的简化快照，仅携带终端 key、当前 `tx_iface/ifindex` 以及探测前状态，供探测回调直接构造 ARP 请求。
+  - 只有当 `tx_ifindex > 0` 时才视为已知可用接口；接口名本身（例如按 VLAN 模板拼接出的 `vlanX`）不会单独启用发包。
   - 保持只读语义，回调层若需要更新状态，应通过引擎公开的接口重新写回。
 
 ## 主要流程
@@ -38,8 +41,9 @@
 2. 命中已有条目则刷新 `last_seen` 并重置 `failed_probes`；未命中创建新节点。
 3. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
   - 优先执行外部自定义 `iface_selector`。
-  - 其次按 `vlan_iface_format` 生成 `vlanX` 等名称并用 `if_nametoindex` 解析 ifindex，仅当解析成功时视为已绑定；否则清空绑定记录。
-4. 如果绑定失败，`resolve_tx_interface` 会立即清空 `tx_iface/tx_ifindex` 并触发 `set_state(...IFACE_INVALID)`，确保无虚接口的 VLAN 在报文阶段就进入失效状态；成功时保持/进入 `ACTIVE`。
+  - 其次按 `vlan_iface_format` 生成 `vlanX` 等名称并用 `if_nametoindex` 解析 ifindex。
+  - 当获得 `ifindex > 0` 时，再检查 `iface_address_table`，确认终端 IP 落入该接口的任一前缀后才视为可用；若接口尚未在地址表中登记任何前缀，同样视为绑定失败。
+4. 如果绑定失败，`resolve_tx_interface` 会立即清空 `tx_iface/tx_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`。
 
 ### 定时扫描 `terminal_manager_on_timer`
 - 由后台线程或外部手动调用。
@@ -49,23 +53,26 @@
      - 无可用接口时转入 `IFACE_INVALID`。
      - 有接口时切换到 `PROBING`，更新 `last_probe/failed_probes`，生成 `probe_task`。
      - 当失败计数达到阈值则标记删除。
+- 条目被删除前会先从 `iface_binding_index` 移除，避免后续地址事件仍引用已释放终端。
 - 探测任务在释放全局锁后顺序执行，避免回调长时间占用关键锁。
 
-### 接口事件 `terminal_manager_on_iface_event`
-- 接收到 Netlink/SDK 事件后遍历所有终端：
-  - `flags_after` 不含 `IFF_UP` 时将终端转入 `IFACE_INVALID`，重置 ifindex。
-  - 接口恢复 `UP` 时清零失败计数、重置探测时间，并尝试通过 `if_nametoindex` 刷新 ifindex。
+### 地址更新 `terminal_manager_on_address_update`
+- 通过 Netlink `RTM_NEWADDR/DELADDR`（或平台等效回调）更新 `iface_address_table`：
+  - 在持有 `lock` 的前提下增删前缀，并根据 `ifindex` 查询 `iface_binding_index`。
+  - 对所有关联终端重新校验其 IP 是否仍命中该接口前缀；若不命中则清空绑定并调用 `set_state(...IFACE_INVALID)`，更新仅影响内部状态，不直接排队事件。
+  - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 `lport` 发生变化或终端被重新创建时才会触发对外事件。
+  - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。
 
 ## 并发与线程模型
-- 终端表所有读写均受 `lock` 保护，避免报文线程与定时线程产生竞态。
+- 终端表、`iface_address_table` 以及 `iface_binding_index` 的读写均受 `lock` 保护，避免报文线程、地址事件线程与定时线程之间产生竞态。
 - 定时线程内部在持锁期间仅构建最小化 `probe_task` 链表，随后释放锁执行回调，保证报文学习延迟最小化。
 - `worker_cond` 采用基于单调时钟的超时唤醒，避免系统时间回拨导致的提前/延迟扫描。
-- 销毁流程先标记 `worker_stop` 并唤醒线程，待其退出后才释放哈希表和互斥量，避免悬挂访问。
+- 销毁流程先标记 `worker_stop` 并唤醒线程，待其退出后才释放哈希表、地址表、反向索引和互斥量，避免悬挂访问。
 
 ## 对外契约
 - `terminal_manager_create/destroy`：构造与清理终端管理器，销毁时会同步等待定时线程退出。
 - `terminal_manager_on_packet`：供适配器报文回调调用，线程安全。
-- `terminal_manager_on_iface_event`：供接口事件订阅回调调用，线程安全。
+- `terminal_manager_on_address_update`：供地址事件订阅回调调用，线程安全。
 - `terminal_probe_fn`：由调用方实现，负责根据 `terminal_probe_request_t` 构造 `td_adapter_arp_request` 并发送。
 
 ## 后续扩展点

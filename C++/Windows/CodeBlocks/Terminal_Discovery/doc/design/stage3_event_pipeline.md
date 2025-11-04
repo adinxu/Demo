@@ -25,8 +25,8 @@
    - `terminal_manager_on_timer`
      - 条目过期或探测失败超过阈值时入队 `DEL` 事件。
      - 仍存活的条目仅当端口变化时才入队 `MOD` 事件。
-   - `terminal_manager_on_iface_event`
-     - 仅更新终端状态与接口缓存，不入队事件（接口状态变化不会改变对外端口语义）。
+   - `terminal_manager_on_address_update`
+     - 更新地址表并针对受影响终端清空绑定，必要时触发 `IFACE_INVALID` 状态；操作仅调整内部状态，不直接入队事件，除非后续报文导致终端 `lport` 变化或条目被重新建表。
    - 未配置事件接收器 (`event_cb == NULL`) 时跳过节点分配，避免无意义开销。
 
 2. **批量分发** – `terminal_manager_maybe_dispatch_events`
@@ -60,6 +60,7 @@
 - `td_adapter_packet_view` 仍是唯一数据输入：
   - VLAN ID 来自 `PACKET_AUXDATA`；若平台额外携带 CPU tag，则解析出 lport 用于事件上报。Realtek 平台暂不回传 lport，默认填 `0` 并仅作为未知端口上报。
   - 端口变化是触发 `MOD` 事件的唯一条件，可避免因时间戳等细节更新导致的噪声。
+  - 报文学习阶段若 `resolve_tx_interface` 在地址表中找不到匹配前缀，会立即清空绑定并将终端标记为 `IFACE_INVALID`，因此事件侧仍以最近一次成功绑定的端口为准；无绑定时端口上报为 `0`。
 
 ## 并发与内存安全
 - 所有终端表与事件队列的修改都在主互斥锁 `lock` 内完成，确保状态一致。

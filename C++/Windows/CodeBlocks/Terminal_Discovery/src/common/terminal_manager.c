@@ -58,6 +58,24 @@ struct probe_task {
     struct probe_task *next;
 };
 
+struct iface_prefix_entry {
+    struct in_addr network;
+    uint8_t prefix_len;
+    struct iface_prefix_entry *next;
+};
+
+struct iface_binding_entry {
+    struct terminal_entry *terminal;
+    struct iface_binding_entry *next;
+};
+
+struct iface_record {
+    int ifindex;
+    struct iface_prefix_entry *prefixes;
+    struct iface_binding_entry *bindings;
+    struct iface_record *next;
+};
+
 static pthread_mutex_t g_active_manager_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct terminal_manager *g_active_manager = NULL;
 
@@ -92,6 +110,7 @@ struct terminal_manager {
     size_t terminal_count;
     size_t max_terminals;
     struct terminal_manager_stats stats;
+    struct iface_record *iface_records;
 };
 
 static bool is_iface_available(const struct terminal_entry *entry);
@@ -111,6 +130,28 @@ static void queue_modify_event_if_port_changed(struct terminal_manager *mgr,
 static void free_event_queue(struct terminal_event_queue *queue);
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr);
 static void set_state(struct terminal_entry *entry, terminal_state_t new_state);
+static struct iface_record **find_iface_record_slot(struct terminal_manager *mgr, int ifindex);
+static struct iface_record *get_iface_record(struct terminal_manager *mgr, int ifindex);
+static bool iface_record_matches_ip(const struct iface_record *record, struct in_addr ip);
+static bool iface_binding_attach(struct terminal_manager *mgr,
+                                 int ifindex,
+                                 struct terminal_entry *entry);
+static void iface_binding_detach(struct terminal_manager *mgr,
+                                 int ifindex,
+                                 struct terminal_entry *entry);
+static void iface_record_prune_if_empty(struct iface_record **slot_ref);
+static struct in_addr prefix_network(struct in_addr address, uint8_t prefix_len);
+static bool ip_matches_prefix(struct in_addr ip,
+                              struct in_addr network,
+                              uint8_t prefix_len);
+static bool iface_prefix_add(struct terminal_manager *mgr,
+                             int ifindex,
+                             struct in_addr network,
+                             uint8_t prefix_len);
+static bool iface_prefix_remove(struct terminal_manager *mgr,
+                                int ifindex,
+                                struct in_addr network,
+                                uint8_t prefix_len);
 
 static void monotonic_now(struct timespec *ts) {
     if (!ts) {
@@ -369,6 +410,222 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr)
     }
 }
 
+static uint32_t prefix_mask_host(uint8_t prefix_len) {
+    if (prefix_len == 0U) {
+        return 0U;
+    }
+    if (prefix_len >= 32U) {
+        return 0xFFFFFFFFU;
+    }
+    return 0xFFFFFFFFU << (32U - prefix_len);
+}
+
+static struct in_addr prefix_network(struct in_addr address, uint8_t prefix_len) {
+    struct in_addr result;
+    uint32_t addr_host = ntohl(address.s_addr);
+    uint32_t mask_host = prefix_mask_host(prefix_len);
+    result.s_addr = htonl(addr_host & mask_host);
+    return result;
+}
+
+static bool ip_matches_prefix(struct in_addr ip,
+                              struct in_addr network,
+                              uint8_t prefix_len) {
+    if (prefix_len > 32U) {
+        return false;
+    }
+    if (prefix_len == 0U) {
+        return true;
+    }
+    uint32_t mask_host = prefix_mask_host(prefix_len);
+    uint32_t ip_host = ntohl(ip.s_addr);
+    uint32_t network_host = ntohl(network.s_addr);
+    return (ip_host & mask_host) == network_host;
+}
+
+static struct iface_record **find_iface_record_slot(struct terminal_manager *mgr, int ifindex) {
+    struct iface_record **slot = &mgr->iface_records;
+    while (*slot) {
+        if ((*slot)->ifindex == ifindex) {
+            break;
+        }
+        slot = &(*slot)->next;
+    }
+    return slot;
+}
+
+static struct iface_record *get_iface_record(struct terminal_manager *mgr, int ifindex) {
+    struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
+    return slot ? *slot : NULL;
+}
+
+static bool iface_record_matches_ip(const struct iface_record *record, struct in_addr ip) {
+    if (!record) {
+        return false;
+    }
+    for (struct iface_prefix_entry *node = record->prefixes; node; node = node->next) {
+        if (ip_matches_prefix(ip, node->network, node->prefix_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool iface_binding_contains(const struct iface_binding_entry *head,
+                                   const struct terminal_entry *entry) {
+    for (const struct iface_binding_entry *node = head; node; node = node->next) {
+        if (node->terminal == entry) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool iface_binding_attach(struct terminal_manager *mgr,
+                                 int ifindex,
+                                 struct terminal_entry *entry) {
+    if (!mgr || ifindex <= 0 || !entry) {
+        return false;
+    }
+
+    struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
+    struct iface_record *record = slot ? *slot : NULL;
+    if (!record) {
+        td_log_writef(TD_LOG_DEBUG,
+                      "terminal_manager",
+                      "skip binding terminal to ifindex %d without address record",
+                      ifindex);
+        return false;
+    }
+
+    if (iface_binding_contains(record->bindings, entry)) {
+        return true;
+    }
+
+    struct iface_binding_entry *node = calloc(1, sizeof(*node));
+    if (!node) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "failed to allocate iface binding for ifindex %d",
+                      ifindex);
+        return false;
+    }
+    node->terminal = entry;
+    node->next = record->bindings;
+    record->bindings = node;
+    return true;
+}
+
+static void iface_binding_detach(struct terminal_manager *mgr,
+                                 int ifindex,
+                                 struct terminal_entry *entry) {
+    if (!mgr || ifindex <= 0 || !entry) {
+        return;
+    }
+
+    struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
+    struct iface_record *record = slot ? *slot : NULL;
+    if (!record) {
+        return;
+    }
+
+    struct iface_binding_entry **pp = &record->bindings;
+    while (*pp) {
+        if ((*pp)->terminal == entry) {
+            struct iface_binding_entry *node = *pp;
+            *pp = node->next;
+            free(node);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+
+    iface_record_prune_if_empty(slot);
+}
+
+static void iface_record_prune_if_empty(struct iface_record **slot_ref) {
+    if (!slot_ref || !*slot_ref) {
+        return;
+    }
+    struct iface_record *record = *slot_ref;
+    if (!record->prefixes && !record->bindings) {
+        *slot_ref = record->next;
+        free(record);
+    }
+}
+
+static bool iface_prefix_add(struct terminal_manager *mgr,
+                             int ifindex,
+                             struct in_addr network,
+                             uint8_t prefix_len) {
+    if (ifindex <= 0) {
+        return false;
+    }
+
+    struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
+    struct iface_record *record = *slot;
+    if (!record) {
+        record = calloc(1, sizeof(*record));
+        if (!record) {
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_manager",
+                          "failed to allocate iface record for ifindex %d",
+                          ifindex);
+            return false;
+        }
+        record->ifindex = ifindex;
+        record->next = NULL;
+        record->prefixes = NULL;
+        record->bindings = NULL;
+        *slot = record;
+    }
+
+    for (struct iface_prefix_entry *node = record->prefixes; node; node = node->next) {
+        if (node->prefix_len == prefix_len && node->network.s_addr == network.s_addr) {
+            return true;
+        }
+    }
+
+    struct iface_prefix_entry *entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "failed to allocate prefix entry for ifindex %d",
+                      ifindex);
+        return false;
+    }
+    entry->network = network;
+    entry->prefix_len = prefix_len;
+    entry->next = record->prefixes;
+    record->prefixes = entry;
+    return true;
+}
+
+static bool iface_prefix_remove(struct terminal_manager *mgr,
+                                int ifindex,
+                                struct in_addr network,
+                                uint8_t prefix_len) {
+    struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
+    struct iface_record *record = slot ? *slot : NULL;
+    if (!record) {
+        return true;
+    }
+
+    struct iface_prefix_entry **pp = &record->prefixes;
+    while (*pp) {
+        if ((*pp)->prefix_len == prefix_len && (*pp)->network.s_addr == network.s_addr) {
+            struct iface_prefix_entry *node = *pp;
+            *pp = node->next;
+            free(node);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+
+    iface_record_prune_if_empty(slot);
+    return true;
+}
+
 static struct timespec timespec_add_ms(const struct timespec *base, unsigned int ms) {
     struct timespec result = *base;
     result.tv_sec += ms / 1000U;
@@ -443,36 +700,80 @@ static const char *state_to_string(terminal_state_t state) {
 }
 
 static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_entry *entry) {
-    if (!entry) {
+    if (!mgr || !entry) {
         return false;
     }
+
+    const bool had_previous_iface = entry->tx_iface[0] != '\0' && entry->tx_ifindex > 0;
+    int previous_ifindex = entry->tx_ifindex;
+    char previous_iface[IFNAMSIZ] = {0};
+    if (had_previous_iface) {
+        snprintf(previous_iface, sizeof(previous_iface), "%s", entry->tx_iface);
+    }
+
     char candidate[IFNAMSIZ] = {0};
     int candidate_ifindex = -1;
     bool resolved = false;
 
     if (mgr->cfg.iface_selector) {
-        resolved = mgr->cfg.iface_selector(&entry->meta, candidate, &candidate_ifindex, mgr->cfg.iface_selector_ctx);
+        resolved = mgr->cfg.iface_selector(&entry->meta,
+                                           candidate,
+                                           &candidate_ifindex,
+                                           mgr->cfg.iface_selector_ctx);
     }
 
     if (!resolved && mgr->cfg.vlan_iface_format && entry->meta.vlan_id >= 0) {
-        snprintf(candidate, sizeof(candidate), mgr->cfg.vlan_iface_format, (unsigned int)entry->meta.vlan_id);
+        snprintf(candidate,
+                 sizeof(candidate),
+                 mgr->cfg.vlan_iface_format,
+                 (unsigned int)entry->meta.vlan_id);
         candidate_ifindex = (int)if_nametoindex(candidate);
-        if (candidate_ifindex > 0) {
-            resolved = true;
-        } else {
-            candidate_ifindex = -1;
-        }
+        resolved = candidate_ifindex > 0;
+    }
+
+    if (resolved && candidate_ifindex <= 0 && candidate[0] != '\0') {
+        candidate_ifindex = (int)if_nametoindex(candidate);
+        resolved = candidate_ifindex > 0;
     }
 
     if (resolved) {
-        snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", candidate);
-        entry->tx_ifindex = candidate_ifindex > 0 ? candidate_ifindex : -1;
-        return true;
+        struct iface_record *record = get_iface_record(mgr, candidate_ifindex);
+        if (!record || !iface_record_matches_ip(record, entry->key.ip)) {
+            td_log_writef(TD_LOG_DEBUG,
+                          "terminal_manager",
+                          "iface %s(index=%d) lacks matching prefix for terminal",
+                          candidate[0] ? candidate : "<unnamed>",
+                          candidate_ifindex);
+            resolved = false;
+        }
     }
 
-    entry->tx_iface[0] = '\0';
-    entry->tx_ifindex = -1;
-    return false;
+    if (!resolved) {
+        if (had_previous_iface) {
+            iface_binding_detach(mgr, previous_ifindex, entry);
+        }
+        entry->tx_iface[0] = '\0';
+        entry->tx_ifindex = -1;
+        return false;
+    }
+
+    bool binding_changed = !had_previous_iface || previous_ifindex != candidate_ifindex ||
+                           strncmp(previous_iface, candidate, sizeof(previous_iface)) != 0;
+
+    if (binding_changed && had_previous_iface) {
+        iface_binding_detach(mgr, previous_ifindex, entry);
+    }
+
+    snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", candidate);
+    entry->tx_ifindex = candidate_ifindex;
+
+    if (!iface_binding_attach(mgr, candidate_ifindex, entry)) {
+        entry->tx_iface[0] = '\0';
+        entry->tx_ifindex = -1;
+        return false;
+    }
+
+    return true;
 }
 
 static void apply_packet_binding(struct terminal_manager *mgr,
@@ -617,6 +918,25 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
         }
         mgr->table[i] = NULL;
     }
+    struct iface_record *record = mgr->iface_records;
+    while (record) {
+        struct iface_record *next_record = record->next;
+        struct iface_prefix_entry *prefix = record->prefixes;
+        while (prefix) {
+            struct iface_prefix_entry *next_prefix = prefix->next;
+            free(prefix);
+            prefix = next_prefix;
+        }
+        struct iface_binding_entry *binding = record->bindings;
+        while (binding) {
+            struct iface_binding_entry *next_binding = binding->next;
+            free(binding);
+            binding = next_binding;
+        }
+        free(record);
+        record = next_record;
+    }
+    mgr->iface_records = NULL;
     free_event_queue(&mgr->events);
     pthread_mutex_unlock(&mgr->lock);
 
@@ -752,7 +1072,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 }
 
 static bool is_iface_available(const struct terminal_entry *entry) {
-    return entry->tx_iface[0] != '\0';
+    return entry && entry->tx_ifindex > 0;
 }
 
 static bool has_expired(const struct terminal_manager *mgr,
@@ -852,6 +1172,9 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
 
             if (remove) {
                 struct terminal_entry *to_free = entry;
+                if (to_free->tx_ifindex > 0) {
+                    iface_binding_detach(mgr, to_free->tx_ifindex, to_free);
+                }
                 if (track_events) {
                     terminal_snapshot_t remove_snapshot;
                     snapshot_from_entry(entry, &remove_snapshot);
@@ -894,44 +1217,59 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     terminal_manager_maybe_dispatch_events(mgr);
 }
 
-void terminal_manager_on_iface_event(struct terminal_manager *mgr,
-                                     const struct td_adapter_iface_event *event) {
-    if (!mgr || !event) {
+void terminal_manager_on_address_update(struct terminal_manager *mgr,
+                                        const terminal_address_update_t *update) {
+    if (!mgr || !update || update->ifindex <= 0) {
+        return;
+    }
+
+    if (update->prefix_len > 32U) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "ignore address update with invalid prefix len %u",
+                      update->prefix_len);
         return;
     }
 
     pthread_mutex_lock(&mgr->lock);
-    bool now_up_event = (event->flags_after & IFF_UP) != 0;
-    if (now_up_event) {
-        mgr->stats.iface_up_events += 1;
+    mgr->stats.address_update_events += 1;
+
+    struct in_addr network = prefix_network(update->address, update->prefix_len);
+    if (update->is_add) {
+        if (!iface_prefix_add(mgr, update->ifindex, network, update->prefix_len)) {
+            pthread_mutex_unlock(&mgr->lock);
+            return;
+        }
     } else {
-        mgr->stats.iface_down_events += 1;
+        iface_prefix_remove(mgr, update->ifindex, network, update->prefix_len);
     }
 
-    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
-        for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
-            if (strncmp(entry->tx_iface, event->ifname, sizeof(entry->tx_iface)) == 0) {
-                if (!now_up_event) {
-                    set_state(entry, TERMINAL_STATE_IFACE_INVALID);
-                    monotonic_now(&entry->last_seen);
-                    entry->tx_ifindex = -1;
-                } else {
-                    set_state(entry, TERMINAL_STATE_PROBING);
-                    entry->failed_probes = 0;
-                    entry->last_probe.tv_sec = 0;
-                    entry->last_probe.tv_nsec = 0;
-                    int ifindex = (int)if_nametoindex(event->ifname);
-                    if (ifindex > 0) {
-                        entry->tx_ifindex = ifindex;
-                    }
-                }
-            }
+    struct iface_record **slot = find_iface_record_slot(mgr, update->ifindex);
+    struct iface_record *record = slot ? *slot : NULL;
+    if (!record) {
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+
+    struct iface_binding_entry **binding_ref = &record->bindings;
+    while (*binding_ref) {
+        struct iface_binding_entry *binding = *binding_ref;
+        struct terminal_entry *terminal = binding->terminal;
+        if (!iface_record_matches_ip(record, terminal->key.ip)) {
+            *binding_ref = binding->next;
+            free(binding);
+            terminal->tx_iface[0] = '\0';
+            terminal->tx_ifindex = -1;
+            monotonic_now(&terminal->last_seen);
+            set_state(terminal, TERMINAL_STATE_IFACE_INVALID);
+        } else {
+            binding_ref = &(*binding_ref)->next;
         }
     }
 
-    pthread_mutex_unlock(&mgr->lock);
+    iface_record_prune_if_empty(slot);
 
-    terminal_manager_maybe_dispatch_events(mgr);
+    pthread_mutex_unlock(&mgr->lock);
 }
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,

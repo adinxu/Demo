@@ -123,16 +123,13 @@ static void terminal_probe_handler(const terminal_probe_request_t *request, void
 
     arp_req.target_ip = request->key.ip;
     memcpy(arp_req.target_mac, request->key.mac, ETH_ALEN);
-    arp_req.tx_ifindex = request->tx_ifindex;
+    arp_req.tx_ifindex = request->tx_ifindex > 0 ? request->tx_ifindex : -1;
 
-    if (request->tx_iface[0] != '\0') {
+    if (request->tx_ifindex > 0 && request->tx_iface[0] != '\0') {
         snprintf(arp_req.tx_iface, sizeof(arp_req.tx_iface), "%s", request->tx_iface);
         arp_req.tx_iface_valid = true;
     } else {
         arp_req.tx_iface_valid = false;
-        if (arp_req.tx_ifindex <= 0) {
-            arp_req.tx_ifindex = -1;
-        }
     }
 
     td_adapter_result_t rc = ctx->ops->send_arp(ctx->adapter, &arp_req);
