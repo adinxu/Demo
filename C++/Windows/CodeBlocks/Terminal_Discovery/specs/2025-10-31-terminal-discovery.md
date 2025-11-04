@@ -42,8 +42,8 @@
 
 ## 架构概览
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
-- **平台适配接口（PAI）**：抽象报文收发、接口事件、时钟/定时器等平台差异。
-   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`subscribe_iface_events`、`schedule_timer`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
+- **平台适配接口（PAI）**：抽象报文收发、接口事件等平台差异。
+   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`subscribe_iface_events`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
    - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
    - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
 - **事件总线**：内部队列负责聚合终端变更并立即投递给上报子系统。
@@ -88,7 +88,7 @@
    - `IFACE_INVALID → PROBING`：接口 up、IP 改为同网段或新增虚接口时复活。
    - `PROBING → ACTIVE`：收到回应即恢复活跃。
 - **保活循环**：
-   - 独立定时线程通过时间轮或小根堆调度终端；Realtek 适配器需按 100ms 间隔分散发包，防止突发。
+   - 独立定时线程负责保活与过期扫描；Realtek 适配器需按 100ms 间隔分散发包，防止突发。
    - 发送保活前必须确认终端仍绑定可用的三层虚接口/VLAN，并沿着发现报文的接口发送 ARP（若接口失效则转入 `IFACE_INVALID` 处理流程）。
    - 探测失败计数递增；第三次失败后移除条目并发出删除事件。
 - **事件上报**：

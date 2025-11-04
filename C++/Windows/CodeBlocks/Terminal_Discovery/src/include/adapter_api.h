@@ -95,18 +95,6 @@ struct td_adapter_iface_event_subscription {
     void *user_ctx;
 };
 
-typedef void (*td_adapter_timer_cb)(void *user_ctx);
-
-struct td_adapter_timer_request {
-    struct timespec expires_at; /* absolute time */
-    td_adapter_timer_cb callback;
-    void *user_ctx;
-};
-
-struct td_adapter_timer_token {
-    uint64_t token_id;
-};
-
 struct td_adapter_arp_request {
     struct in_addr sender_ip;
     uint8_t sender_mac[ETH_ALEN];
@@ -133,11 +121,6 @@ struct td_adapter_ops {
                                        struct td_adapter_iface_info *info_out);
     td_adapter_result_t (*subscribe_iface_events)(td_adapter_t *handle,
                                                   const struct td_adapter_iface_event_subscription *sub);
-    td_adapter_result_t (*schedule_timer)(td_adapter_t *handle,
-                                          const struct td_adapter_timer_request *req,
-                                          struct td_adapter_timer_token *token_out);
-    td_adapter_result_t (*cancel_timer)(td_adapter_t *handle,
-                                        const struct td_adapter_timer_token *token);
     void (*log_write)(td_adapter_t *handle,
                       td_log_level_t level,
                       const char *component,

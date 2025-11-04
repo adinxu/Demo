@@ -790,22 +790,6 @@ static td_adapter_result_t realtek_subscribe_iface_events(td_adapter_t *handle,
     return TD_ADAPTER_ERR_UNSUPPORTED;
 }
 
-static td_adapter_result_t realtek_schedule_timer(td_adapter_t *handle,
-                                                  const struct td_adapter_timer_request *req,
-                                                  struct td_adapter_timer_token *token_out) {
-    (void)handle;
-    (void)req;
-    (void)token_out;
-    return TD_ADAPTER_ERR_UNSUPPORTED;
-}
-
-static td_adapter_result_t realtek_cancel_timer(td_adapter_t *handle,
-                                                const struct td_adapter_timer_token *token) {
-    (void)handle;
-    (void)token;
-    return TD_ADAPTER_ERR_UNSUPPORTED;
-}
-
 static void realtek_log_write(td_adapter_t *handle,
                               td_log_level_t level,
                               const char *component,
@@ -831,8 +815,6 @@ static const struct td_adapter_ops g_realtek_ops = {
     .send_arp = realtek_send_arp,
     .query_iface = realtek_query_iface,
     .subscribe_iface_events = realtek_subscribe_iface_events,
-    .schedule_timer = realtek_schedule_timer,
-    .cancel_timer = realtek_cancel_timer,
     .log_write = realtek_log_write,
 };
 

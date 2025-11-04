@@ -27,11 +27,11 @@
 4. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
 
 ### 阶段 1：适配层设计与实现（已完成）
-1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、计时器、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
+1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
 2. ✅ Realtek 适配器：
    - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ifindex、MAC 并回调。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；优先采用请求内 `tx_iface`，缺省回落到配置接口；必要时调用 `SO_BINDTODEVICE`、查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
-   - 接口与定时器：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），定时逻辑采用 Linux 单调时钟相关 API，避免系统时间调整对节奏造成影响。
+   - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；保活节奏在终端引擎线程内统一调度。
    - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
 3. ✅ 公共组件：
    - `td_config_load_defaults` 提供统一的默认运行配置（适配器名称 `realtek`、`eth0`/`vlan1`、100ms 发送间隔、INFO 日志级别）。
@@ -43,7 +43,7 @@
    - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换，接口失效进入 `IFACE_INVALID` 并按 `iface_invalid_holdoff_sec` 保留 30 分钟。
 2. ✅ 调度策略：
    - 专用 `terminal_manager_worker` 线程按 `scan_interval_ms` 周期驱动 `terminal_manager_on_timer`，统一处理过期、保活、删除流程。
-   - 所有超时判断与定时节奏统一依赖单调时钟，避免系统时间跳变导致误判。
+   - 所有超时判断与定时节奏统一依赖 Linux 单调时钟相关 API（如 `clock_gettime(CLOCK_MONOTONIC, ...)`），避免系统时间跳变导致误判。
    - 后续若需要提高规模弹性，再评估时间轮/小根堆方案，目前观测以 1s 节拍满足需求。
 3. ✅ 保活执行：
    - `terminal_manager_on_timer` 聚合需要探测的终端，生成 `terminal_probe_request_t` 队列，脱离主锁逐个回调 `probe_cb`。
