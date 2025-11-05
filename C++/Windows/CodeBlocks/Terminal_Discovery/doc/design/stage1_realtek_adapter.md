@@ -20,7 +20,11 @@
 
 ## 收包路径
 1. `realtek_start` 通过 `configure_rx_socket` 打开收包套接字。
-2. `configure_rx_socket` 将 `AF_PACKET` 原始套接字绑定到 `rx_iface`，加载强制 BPF 过滤器，仅放行入方向 ARP/VLAN 报文，并启用 `PACKET_AUXDATA` 以恢复被硬件剥离的 VLAN 标记。
+2. `configure_rx_socket` 将 `AF_PACKET` 原始套接字绑定到 `rx_iface`，加载强制 BPF 过滤器，并启用 `PACKET_AUXDATA` 以恢复被硬件剥离的 VLAN 标记。BPF 规则由 `attach_arp_filter` 安装，具体逻辑如下：
+  - 首先读取 `PKTTYPE`，仅保留 `PACKET_HOST`/`PACKET_BROADCAST`/`PACKET_MULTICAST` 三类帧，丢弃其他来源（如其他网卡回环）。
+  - 随后检查以太网类型：若直接等于 `ETH_P_ARP` 则立即放行；若为 802.1Q/802.1ad 则进入下一步。
+  - 对 VLAN 框架，会再次读取内层以太网类型，只有当 Encapsulated EtherType 为 `ETH_P_ARP` 时才放行，否则拒绝。
+  - 满足上述任一条件后返回 `0xFFFF` 允许整帧递交用户态；未命中时返回 0 将报文丢弃。
 3. `ensure_rx_thread` 在需要收包时启动 `rx_thread_main`。
 4. `rx_thread_main` 轮询套接字、构造 `td_adapter_packet_view`、从辅助数据或内层头恢复 VLAN，最后触发注册的回调。
 
