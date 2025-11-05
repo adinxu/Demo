@@ -27,6 +27,7 @@ int td_config_load_defaults(struct td_runtime_config *cfg) {
     cfg->keepalive_miss_threshold = TD_DEFAULT_KEEPALIVE_MISS_THRESHOLD;
     cfg->iface_invalid_holdoff_sec = TD_DEFAULT_IFACE_INVALID_HOLDOFF_SEC;
     cfg->max_terminals = TD_DEFAULT_MAX_TERMINALS;
+    cfg->stats_log_interval_sec = TD_DEFAULT_STATS_LOG_INTERVAL_SEC;
     cfg->log_level = TD_LOG_INFO;
 
     return 0;

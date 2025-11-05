@@ -6,12 +6,14 @@
 - 补充本阶段的验证动作，方便后续阶段在同一基线上继续扩展。
 
 ## 运行时配置桥接
-- `td_runtime_config` 新增 `keepalive_interval_sec`、`keepalive_miss_threshold`、`iface_invalid_holdoff_sec`、`max_terminals` 与 `log_level` 字段，`td_config_load_defaults` 输出 Realtek Demo 默认值（120s/3 次/1800s/1000/INFO）。
+- `td_runtime_config` 新增 `keepalive_interval_sec`、`keepalive_miss_threshold`、`iface_invalid_holdoff_sec`、`max_terminals`、`stats_log_interval_sec` 与 `log_level` 字段，`td_config_load_defaults` 输出 Realtek Demo 默认值（120s/3 次/1800s/1000/30s/INFO）。
+- `stats_log_interval_sec` 支持通过 `--stats-interval` CLI 参数动态调整，设置为 `0` 时禁用周期性统计日志。
 - `td_config_to_manager_config` 负责将上述字段映射到 `terminal_manager_config`，缺省值依旧在 `terminal_manager_create` 内兜底，避免旧调用栈遗漏配置时出现 0 值。
 - 当前仍沿用 `scan_interval_ms` 默认值，后续若需要从配置文件调优扫描节奏，仅需在 `td_runtime_config` 补充同名字段并透传即可。
 
 ## 日志强化
 - 当 `max_terminals` 达到上限时，会输出 `terminal_manager` 组件的 WARN 级日志，携带当前数量与被丢弃终端的 MAC/IP，便于观察容量策略触发频次。
+- 主程序新增 `terminal_stats` 组件日志，按照 `stats_log_interval_sec` 设定的节奏打印 `terminal_manager_get_stats` 快照（current/discovered/removed/probes/address_updates 等），并在收到退出信号时再输出一次终态，方便在线排障。
 - 新终端分配失败（内存不足）统一记录为 ERROR 日志，快速暴露资源耗尽风险。
 - 虚接口前缀变化、探测失败超阈值等仍沿用 INFO/DEBUG 级别的结构化日志，结合统计指标可还原关键时间线。
 

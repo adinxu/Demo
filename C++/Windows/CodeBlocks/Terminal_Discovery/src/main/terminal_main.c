@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,33 @@ static const char *state_to_string(terminal_state_t state) {
     default:
         return "UNKNOWN";
     }
+}
+
+static void log_manager_stats(struct terminal_manager *manager) {
+    if (!manager) {
+        return;
+    }
+
+    struct terminal_manager_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    terminal_manager_get_stats(manager, &stats);
+
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_stats",
+                  "current=%" PRIu64 " discovered=%" PRIu64 " removed=%" PRIu64
+                  " probes=%" PRIu64 " probe_failures=%" PRIu64
+                  " capacity_drops=%" PRIu64
+                  " events=%" PRIu64 " dispatch_failures=%" PRIu64
+                  " addr_updates=%" PRIu64,
+                  stats.current_terminals,
+                  stats.terminals_discovered,
+                  stats.terminals_removed,
+                  stats.probes_scheduled,
+                  stats.probe_failures,
+                  stats.capacity_drops,
+                  stats.events_dispatched,
+                  stats.event_dispatch_failures,
+                  stats.address_update_events);
 }
 
 static void terminal_event_logger(const terminal_event_record_t *records,
@@ -164,6 +192,7 @@ static void print_usage(FILE *stream) {
             "  --keepalive-miss COUNT    Probe failure threshold (default: 3)\n"
             "  --iface-holdoff SEC       Holdoff after iface invalid (default: 1800)\n"
             "  --max-terminals COUNT     Maximum tracked terminals (default: 1000)\n"
+            "  --stats-interval SEC      Stats log interval seconds, 0 disables (default: 30)\n"
             "  --log-level LEVEL         Log level trace|debug|info|warn|error|none (default: info)\n"
             "  --help                    Show this help message\n",
             g_program_name);
@@ -215,11 +244,12 @@ int main(int argc, char **argv) {
         {"rx-iface", required_argument, NULL, 'r'},
         {"tx-iface", required_argument, NULL, 't'},
         {"tx-interval", required_argument, NULL, 'T'},
-        {"keepalive-interval", required_argument, NULL, 'k'},
-        {"keepalive-miss", required_argument, NULL, 'm'},
-        {"iface-holdoff", required_argument, NULL, 'H'},
-        {"max-terminals", required_argument, NULL, 'M'},
-        {"log-level", required_argument, NULL, 'l'},
+    {"keepalive-interval", required_argument, NULL, 'k'},
+    {"keepalive-miss", required_argument, NULL, 'm'},
+    {"iface-holdoff", required_argument, NULL, 'H'},
+    {"max-terminals", required_argument, NULL, 'M'},
+    {"stats-interval", required_argument, NULL, 'S'},
+    {"log-level", required_argument, NULL, 'l'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
@@ -269,6 +299,11 @@ int main(int argc, char **argv) {
             runtime_cfg.max_terminals = (unsigned int)parsed;
             break;
         }
+        case 'S':
+            if (parse_unsigned_option("--stats-interval", optarg, &runtime_cfg.stats_log_interval_sec) != 0) {
+                return EXIT_FAILURE;
+            }
+            break;
         case 'l':
         {
             bool ok = false;
@@ -292,14 +327,15 @@ int main(int argc, char **argv) {
     td_log_set_level(runtime_cfg.log_level);
     td_log_writef(TD_LOG_INFO,
                   "terminal_daemon",
-                  "starting (adapter=%s rx=%s tx=%s keepalive=%us miss=%u holdoff=%us max=%u)",
+                  "starting (adapter=%s rx=%s tx=%s keepalive=%us miss=%u holdoff=%us max=%u stats=%us)",
                   runtime_cfg.adapter_name,
                   runtime_cfg.rx_iface,
                   runtime_cfg.tx_iface,
                   runtime_cfg.keepalive_interval_sec,
                   runtime_cfg.keepalive_miss_threshold,
                   runtime_cfg.iface_invalid_holdoff_sec,
-                  runtime_cfg.max_terminals);
+                  runtime_cfg.max_terminals,
+                  runtime_cfg.stats_log_interval_sec);
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -399,11 +435,22 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    unsigned int stats_elapsed_sec = 0;
     while (!g_should_stop) {
-        sleep(1);
+        (void)sleep(1);
+        if (g_should_stop) {
+            break;
+        }
+        if (runtime_cfg.stats_log_interval_sec > 0) {
+            if (++stats_elapsed_sec >= runtime_cfg.stats_log_interval_sec) {
+                stats_elapsed_sec = 0;
+                log_manager_stats(manager);
+            }
+        }
     }
 
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "signal %d received, shutting down", g_should_stop);
+    log_manager_stats(manager);
 
     adapter_desc->ops->stop(adapter_handle);
     terminal_netlink_stop(ctx.netlink_listener);
