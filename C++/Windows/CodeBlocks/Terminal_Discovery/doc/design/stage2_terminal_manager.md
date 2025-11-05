@@ -39,11 +39,24 @@
 ### 报文学习 `terminal_manager_on_packet`
 1. 解析 ARP 报文中的 `arp_sha` 与 `arp_spa` 作为终端 key。
 2. 命中已有条目则刷新 `last_seen` 并重置 `failed_probes`；未命中创建新节点。
-3. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
+4. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
   - 优先执行外部自定义 `iface_selector`，允许平台覆盖默认 VLAN -> 接口的推导规则。
   - 默认路径仍按 `vlan_iface_format` 生成 `vlanX` 等接口名，利用 `if_nametoindex` 解析出 VLANIF 以便查询地址资源；这些信息用于确定源 IP 与可用性，即便最终发包走物理口。
   - 只有当 `iface_address_table` 中存在命中的前缀时，才认为该 VLAN 的地址上下文有效；否则视为不可保活并保留 VLAN ID 以待后续报文复活。
-4. 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
+  - 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
+
+#### `resolve_tx_interface` 实现细节
+1. 记录历史绑定：在尝试解析前，先缓存旧的 `tx_iface/tx_ifindex`，用于后续比对及必要时的解绑。
+2. 多级候选选择：
+  - 首先调用可选的 `iface_selector` 回调返回接口名/ifindex；
+  - 若未解析成功且 VLAN ID >= 0，则根据 `vlan_iface_format`（默认 `vlan%u`）拼出接口名并通过 `if_nametoindex` 解析；
+  - 如果只有接口名，函数会再次调用 `if_nametoindex` 兜底，确保 ifindex 有效。
+3. 地址校验：解析出 ifindex 后，会到 `iface_records` 中查找对应地址前缀，并通过 `iface_record_select_ip` 挑选与终端 IP 匹配的源地址；失败时认为候选无效并回退。
+4. 解绑与回退：
+  - 当候选无效或完全无法解析时，会调用 `iface_binding_detach`（若此前存在绑定）并清空 `tx_iface/tx_ifindex/tx_source_ip`，随后返回 `false` 以便上层转入 `IFACE_INVALID`；
+  - 旧绑定与新的候选 ifindex 不一致时，同样先执行解绑以维持反向索引一致性。
+5. 建立新绑定：候选合法时，写入 `tx_iface/tx_ifindex/tx_source_ip` 并调用 `iface_binding_attach` 加入索引；若 attach 失败（内存不足等），会立即回滚到未绑定状态。
+6. 返回值：成功解析且绑定完成时返回 `true`，否则返回 `false`，供调用方控制状态机（`apply_packet_binding` 在失败时将终端标记为 `IFACE_INVALID`）。
 
 ### 定时扫描 `terminal_manager_on_timer`
 - 由后台线程或外部手动调用。
