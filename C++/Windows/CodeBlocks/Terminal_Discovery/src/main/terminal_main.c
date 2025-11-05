@@ -26,10 +26,16 @@ struct app_context {
 };
 
 static volatile sig_atomic_t g_should_stop = 0;
+static volatile sig_atomic_t g_should_dump_stats = 0;
 static const char *g_program_name = "terminal_discovery";
 
 static void handle_signal(int sig) {
     g_should_stop = sig;
+}
+
+static void handle_stats_signal(int sig) {
+    (void)sig;
+    g_should_dump_stats = 1;
 }
 
 static void adapter_log_bridge(void *user_data,
@@ -192,7 +198,7 @@ static void print_usage(FILE *stream) {
             "  --keepalive-miss COUNT    Probe failure threshold (default: 3)\n"
             "  --iface-holdoff SEC       Holdoff after iface invalid (default: 1800)\n"
             "  --max-terminals COUNT     Maximum tracked terminals (default: 1000)\n"
-            "  --stats-interval SEC      Stats log interval seconds, 0 disables (default: 30)\n"
+            "  --stats-interval SEC      Stats log interval seconds, 0 disables (default: 0)\n"
             "  --log-level LEVEL         Log level trace|debug|info|warn|error|none (default: info)\n"
             "  --help                    Show this help message\n",
             g_program_name);
@@ -340,6 +346,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGUSR1, handle_stats_signal);
 
     const struct td_adapter_descriptor *adapter_desc = td_adapter_registry_find(runtime_cfg.adapter_name);
     if (!adapter_desc || !adapter_desc->ops) {
@@ -441,12 +448,21 @@ int main(int argc, char **argv) {
         if (g_should_stop) {
             break;
         }
+        if (g_should_dump_stats) {
+            g_should_dump_stats = 0;
+            log_manager_stats(manager);
+        }
         if (runtime_cfg.stats_log_interval_sec > 0) {
             if (++stats_elapsed_sec >= runtime_cfg.stats_log_interval_sec) {
                 stats_elapsed_sec = 0;
                 log_manager_stats(manager);
             }
         }
+    }
+
+    if (g_should_dump_stats) {
+        g_should_dump_stats = 0;
+        log_manager_stats(manager);
     }
 
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "signal %d received, shutting down", g_should_stop);

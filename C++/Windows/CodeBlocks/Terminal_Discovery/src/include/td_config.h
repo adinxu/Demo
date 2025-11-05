@@ -15,7 +15,7 @@ struct terminal_manager_config;
 #define TD_DEFAULT_KEEPALIVE_MISS_THRESHOLD 3U
 #define TD_DEFAULT_MAX_TERMINALS 1000U
 #define TD_DEFAULT_IFACE_INVALID_HOLDOFF_SEC 1800U
-#define TD_DEFAULT_STATS_LOG_INTERVAL_SEC 30U
+#define TD_DEFAULT_STATS_LOG_INTERVAL_SEC 0U
 
 struct td_runtime_config {
     char adapter_name[TD_ADAPTER_NAME_MAX];
