@@ -29,10 +29,10 @@
 4. `rx_thread_main` 轮询套接字、构造 `td_adapter_packet_view`、从辅助数据或内层头恢复 VLAN，最后触发注册的回调。
 
 ## 发包路径
-1. 启动阶段调用 `configure_tx_socket` 创建 ARP 套接字，并缓存默认 TX 接口的 ifindex、MAC、IPv4 作为兜底。
-2. `realtek_send_arp` 先执行最小间隔节流，再解析实际发包接口：若请求携带 `tx_iface_valid` 则为指定接口重新查询元数据，否则使用默认缓存。
-3. 发送前调用 `SO_BINDTODEVICE` 将原始套接字绑定到目标接口，构造 ARP 以太帧后通过 `sendto` 发出。
-4. 若所选接口缺少 IPv4 地址（默认或 override），按照规范要求跳过此次保活，保持发现与保活路径一致。
+1. 启动阶段调用 `configure_tx_socket` 创建 ARP 套接字，并以物理接口（默认 `eth0`）缓存 ifindex、MAC、IPv4 作为兜底，确保用户态可在同一套接字上插入 VLAN tag。
+2. `realtek_send_arp` 先执行最小间隔节流，再依据探测请求的 VLAN/接口信息构造帧：优先在物理口发送，并在以太头后附加 802.1Q header 写入目标 VLAN；在封装前会将 VLAN ID 归一化为 1–4094 的合法范围，发现非法输入直接报错并跳过发送；仅当平台显式拒绝带 VLAN tag 的物理口发包时，才会根据 `tx_iface_valid` 回退至虚接口重新查询元数据。
+3. 发送前若需要回退至虚接口，会调用 `SO_BINDTODEVICE` 绑定指定接口；常规路径直接复用物理口套接字，通过 `sendto` 发出自封装的 VLAN 帧。
+4. 无论使用哪种接口，若缺少有效 IPv4 地址（默认或 override），按照规范要求跳过此次保活，保持发现与保活路径一致。
 
 ## 线程与同步
 - `state_lock`：保护收包订阅注册，确保 RX 线程只启动一次。
@@ -40,7 +40,7 @@
 - `atomic_bool running`：协调控制面与工作线程的启动/停止。
 
 ## 配置与日志
-- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口 `vlan1`、ARP 节流间隔 100ms、日志级别 INFO。
+- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口默认为物理接口（即将切换至 `eth0`，在旧版本中仍可显式指定 `vlan1` 以兼容）、ARP 节流间隔 100ms、日志级别 INFO。
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
 
 ## 构建产物
@@ -48,7 +48,7 @@
 
 ## 集成建议
 - 阶段 2/3 代码应：
-  - 在调用 `send_arp` 前传入终端管理器记录的最近一次发现接口，填充 `td_adapter_arp_request.tx_iface` 与 `tx_iface_valid`。
+  - 在调用 `send_arp` 前传入终端管理器记录的 VLAN 元数据，并在后续 API 扩展后将其附带到探测请求；仅当平台需要回退时才填充 `tx_iface/tx_iface_valid` 以指示虚接口路径。
   - 在 `start` 之后立即注册收包回调，确保 RX 线程及时运行。
   - 通过 `td_adapter_env` 设置日志回调，使适配器日志并入系统日志。
 

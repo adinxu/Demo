@@ -55,9 +55,9 @@
    - 可参考 `src/ref/realtek/loop_protect.c` 的线程、互斥量等 OSA 抽象，但实现可自行选择 POSIX 线程/锁等通用原语，无需强绑 OSA 框架。
    - 复用 Raw Socket + BPF 过滤模型，确保适配器初始化时设置专用过滤器以截获目标广播报文。
    - 事件循环可按功能设计（如 epoll、poll 或自定义调度），不强制依赖 `loop_protect_epoll_loop` 实现。
-   - 报文发送通过 Raw Socket 直接绑定至 VLAN 对应的虚接口（例如 VLAN1 对应 `vlan1`），填充 ARP request 后发出，避免引入 SDK 依赖。
+   - 报文发送推荐直接在物理口（例如 `eth0`）的 Raw Socket 上封装 802.1Q 头部完成 VLAN tag 后下发，无需为不同 VLAN 反复绑定对应的虚接口；若目标平台不允许用户态插入 VLAN tag，再回退到绑定虚接口（例如 `vlan1`）的模式。
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
-   - 在 Realtek 平台使用 Raw Socket 绑定 `eth0` 收包时，`recvmsg` 返回的 `ifindex` 恒为 `eth0` 的索引；该值仅用于日志或入向定位，不能直接用于选择后续 ARP 发送接口，保活发包仍需依据终端绑定的 VLAN 虚接口信息。
+   - 在 Realtek 平台使用 Raw Socket 绑定 `eth0` 收包时，`recvmsg` 返回的 `ifindex` 恒为 `eth0` 的索引；该值仅用于日志或入向定位，不能直接用于选择后续 ARP 发送接口，保活发包仍需依据终端绑定的 VLAN 信息。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
    - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
@@ -85,9 +85,10 @@
 - **报文路径**：
    1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。
-   3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于事件上报端口检查；保活发包仍基于内核接口信息。
-   3. 发送路径依据终端最近一次有效报文关联的三层虚接口构造 ARP request，并沿该虚接口下发；发送阶段需在原始套接字上动态绑定对应接口（如调用 `SO_BINDTODEVICE`）或复用该接口的专属套接字缓存，保证保活报文与发现路径一致。
-   4. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
+     3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于事件上报端口检查；保活发包仍基于内核接口信息。
+     4. 发送路径依据终端最近一次有效报文关联的三层上下文构造 ARP request，在用户态封装 `ethhdr + vlan_header + ether_arp` 后直接通过物理接口（如 `eth0`）发送；无需为每个 VLAN 重新绑定虚接口，只要写入正确的 VLAN ID 即可保持与发现路径一致。
+        - 若目标平台拒绝用户态插入 VLAN tag，则回退到绑定虚接口（如 `vlan1`）的发送方式。Stage0 Raw Socket demo 已验证 Realtek 平台支持物理口带 VLAN tag 的直出策略，需在 demo 与适配器实现中默认采用该模式并保留回退逻辑。
+     5. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
 - **终端状态机**：
    - `(收到报文) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`。
          - `ACTIVE → IFACE_INVALID`：接口 down、出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）或 VLAN 无虚接口；`IFACE_INVALID` 保留 30 分钟后删除。

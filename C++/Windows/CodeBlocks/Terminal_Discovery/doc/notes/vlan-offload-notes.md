@@ -11,6 +11,7 @@
 ## 解决方案摘要
 1. 在 Raw Socket 初始化阶段调用 `setsockopt(fd, SOL_PACKET, PACKET_AUXDATA, &enable, sizeof(enable))`。
 2. 使用 `recvmsg()` 而非 `recvfrom()`，解析 `msg_control` 中的 `tpacket_auxdata`，恢复 VLAN ID，并与负载中的 VLAN 头互为补充。
-3. 更新阶段 0 demo（`stage0_raw_socket_demo.c`）和文档，使收、发两端对 VLAN 的处理保持一致。
+3. 更新阶段 0 demo（`stage0_raw_socket_demo.c`）和文档，使收、发两端对 VLAN 的处理保持一致，并在用户态统一丢弃所有超出 IEEE 802.1Q 合法范围（1–4094）的 VLAN ID。
+4. 验证在物理接口（如 `eth0`）上由用户态直接封装 802.1Q 头即可正常发包，无需为每个 VLAN 绑定虚接口；该结论已反馈至规范与实施计划，虚接口发送作为回退策略保留。
 
 该经验已纳入阶段 0 演示程序，后续平台适配层实现可直接复用。

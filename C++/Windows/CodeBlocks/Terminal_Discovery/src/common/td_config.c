@@ -9,7 +9,7 @@
 
 #define TD_DEFAULT_ADAPTER "realtek"
 #define TD_DEFAULT_RX_IFACE "eth0"
-#define TD_DEFAULT_TX_IFACE "vlan1"
+#define TD_DEFAULT_TX_IFACE "eth0"
 #define TD_DEFAULT_TX_INTERVAL_MS 100U
 
 int td_config_load_defaults(struct td_runtime_config *cfg) {

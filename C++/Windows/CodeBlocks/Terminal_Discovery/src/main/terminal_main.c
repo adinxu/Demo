@@ -159,16 +159,28 @@ static void terminal_probe_handler(const terminal_probe_request_t *request, void
 
     arp_req.target_ip = request->key.ip;
     memcpy(arp_req.target_mac, request->key.mac, ETH_ALEN);
-    arp_req.tx_ifindex = request->tx_ifindex > 0 ? request->tx_ifindex : -1;
-
-    if (request->tx_ifindex > 0 && request->tx_iface[0] != '\0') {
+    arp_req.sender_ip = request->source_ip;
+    arp_req.vlan_id = request->vlan_id;
+    bool fallback_possible = (request->tx_ifindex > 0 && request->tx_iface[0] != '\0');
+    arp_req.tx_ifindex = fallback_possible ? request->tx_ifindex : -1;
+    if (fallback_possible) {
         snprintf(arp_req.tx_iface, sizeof(arp_req.tx_iface), "%s", request->tx_iface);
-        arp_req.tx_iface_valid = true;
-    } else {
-        arp_req.tx_iface_valid = false;
     }
 
     td_adapter_result_t rc = ctx->ops->send_arp(ctx->adapter, &arp_req);
+    if (rc != TD_ADAPTER_OK && fallback_possible) {
+        struct td_adapter_arp_request fallback_req = arp_req;
+        fallback_req.tx_iface_valid = true;
+        rc = ctx->ops->send_arp(ctx->adapter, &fallback_req);
+        if (rc == TD_ADAPTER_OK) {
+            td_log_writef(TD_LOG_INFO,
+                          "terminal_probe",
+                          "fallback to %s for VLAN %d probes succeeded",
+                          request->tx_iface,
+                          request->vlan_id);
+        }
+    }
+
     if (rc != TD_ADAPTER_OK) {
         char mac_buf[18];
         char ip_buf[INET_ADDRSTRLEN];
@@ -192,7 +204,7 @@ static void print_usage(FILE *stream) {
             "Options:\n"
             "  --adapter NAME            Adapter name (default: realtek)\n"
             "  --rx-iface NAME           Interface to capture ARP (default: eth0)\n"
-            "  --tx-iface NAME           Interface to transmit ARP (default: vlan1)\n"
+            "  --tx-iface NAME           Interface to transmit ARP (default: eth0)\n"
             "  --tx-interval MS          Minimum milliseconds between probes (default: 100)\n"
             "  --keepalive-interval SEC  Keepalive interval seconds (default: 120)\n"
             "  --keepalive-miss COUNT    Probe failure threshold (default: 3)\n"

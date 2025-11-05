@@ -38,6 +38,7 @@ struct terminal_entry {
     struct terminal_metadata meta;
     char tx_iface[IFNAMSIZ];
     int tx_ifindex;
+    struct in_addr tx_source_ip;
     struct terminal_entry *next;
 };
 
@@ -45,6 +46,8 @@ typedef struct terminal_probe_request {
     struct terminal_key key;
     char tx_iface[IFNAMSIZ];
     int tx_ifindex;
+    struct in_addr source_ip;
+    int vlan_id;
     terminal_state_t state_before_probe;
 } terminal_probe_request_t;
 

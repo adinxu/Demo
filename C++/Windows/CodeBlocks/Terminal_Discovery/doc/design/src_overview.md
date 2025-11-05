@@ -74,6 +74,7 @@ flowchart TD
     - `rx_thread_main` 独立线程轮询 AF_PACKET 套接字，解析 VLAN/ARP，并通过注册的回调上送 `td_adapter_packet_view`。
     - 发送路径在 `send_arp` 内部串行化（互斥锁 + 节流）。
     - `send_lock` 用于保证发送节流 (`last_send`) 与 `sendto` 操作在未来可能的多线程场景下保持串行；当前探测仅来自管理器单线程，即便争用极低，也保留该锁以免后续扩展引入竞态。
+  - 默认在物理接口（如 `eth0`）上构造并发送附带 802.1Q 标记的 ARP 帧，封装前先校验 VLAN 是否落在 1–4094 的有效范围，只有在平台拒绝该模式时才回退到绑定 VLAN 虚接口。
   - 所有平台 I/O 均通过原生 Raw Socket 完成，避免依赖平台 SDK。
 
 ### 4. 核心引擎 `common/terminal_manager`
@@ -89,7 +90,7 @@ flowchart TD
     - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。
 - **关键函数**：
   - `terminal_manager_create/destroy`：初始化线程、绑定全局单例（`terminal_manager_get_active`）。
-  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，先获取 `ifindex`，再验证终端 IP 是否命中 `iface_address_table` 中该接口的前缀；任一环节失败都会清空绑定并立刻将终端转入 `IFACE_INVALID`。
+  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，在保留 VLAN ID 以支撑物理口发包的同时，获取可选的 VLANIF `ifindex` 用于校验地址前缀；任一环节失败都会清空回退接口绑定并立刻将终端转入 `IFACE_INVALID`。
   - `terminal_manager_on_timer`：由后台线程调用，负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
   - `terminal_manager_on_address_update`：由 netlink 监听器触发的虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。

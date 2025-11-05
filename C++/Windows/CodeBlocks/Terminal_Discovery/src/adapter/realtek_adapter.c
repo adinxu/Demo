@@ -65,6 +65,13 @@ struct td_adapter {
     struct in_addr tx_ipv4;
 };
 
+static int normalize_vlan_id(int raw_vlan) {
+    if (raw_vlan >= 1 && raw_vlan <= 4094) {
+        return raw_vlan;
+    }
+    return -1;
+}
+
 static void realtek_logf(struct td_adapter *adapter,
                          td_log_level_t level,
                          const char *fmt,
@@ -351,12 +358,12 @@ static void *rx_thread_main(void *arg) {
                     const struct tpacket_auxdata *aux = (const struct tpacket_auxdata *)CMSG_DATA(cmsg);
 #ifdef TP_STATUS_VLAN_VALID
                     if (aux->tp_status & TP_STATUS_VLAN_VALID) {
-                        vlan_id = aux->tp_vlan_tci & 0x0FFF;
+                        vlan_id = normalize_vlan_id((int)(aux->tp_vlan_tci & 0x0FFF));
                         break;
                     }
 #else
                     if (aux->tp_vlan_tci != 0 || aux->tp_vlan_tpid != 0) {
-                        vlan_id = aux->tp_vlan_tci & 0x0FFF;
+                        vlan_id = normalize_vlan_id((int)(aux->tp_vlan_tci & 0x0FFF));
                         break;
                     }
 #endif
@@ -370,10 +377,12 @@ static void *rx_thread_main(void *arg) {
             }
             struct vlan_header vlan_local;
             memcpy(&vlan_local, buffer + sizeof(struct ethhdr), sizeof(vlan_local));
-            vlan_id = ntohs(vlan_local.tci) & 0x0FFF;
+            vlan_id = normalize_vlan_id((int)(ntohs(vlan_local.tci) & 0x0FFF));
             ether_type = ntohs(vlan_local.encapsulated_proto);
             offset += sizeof(vlan_local);
         }
+
+        vlan_id = normalize_vlan_id(vlan_id);
 
         if (ether_type != ETH_P_ARP) {
             continue;
@@ -404,7 +413,7 @@ static void *rx_thread_main(void *arg) {
         view.payload = buffer + offset;
         view.payload_len = payload_len;
         view.ether_type = ether_type;
-        view.vlan_id = vlan_id;
+    view.vlan_id = vlan_id;
         clock_gettime(CLOCK_REALTIME, &view.ts);
         view.lport = 0U;
         memcpy(view.src_mac, eth_local.h_source, ETH_ALEN);
@@ -699,15 +708,28 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
         memcpy(target_mac, req->target_mac, ETH_ALEN);
     }
 
-    uint8_t frame[sizeof(struct ethhdr) + sizeof(struct ether_arp)];
+    int effective_vlan = (req->vlan_id >= 1 && req->vlan_id <= 4094) ? req->vlan_id : -1;
+    bool vlan_tagging = effective_vlan > 0;
+
+    uint8_t frame[sizeof(struct ethhdr) + sizeof(struct vlan_header) + sizeof(struct ether_arp)];
     memset(frame, 0, sizeof(frame));
 
     struct ethhdr *eth = (struct ethhdr *)frame;
     memcpy(eth->h_dest, target_mac, ETH_ALEN);
     memcpy(eth->h_source, sender_mac, ETH_ALEN);
-    eth->h_proto = htons(ETH_P_ARP);
 
-    struct ether_arp *arp = (struct ether_arp *)(frame + sizeof(struct ethhdr));
+    size_t offset = sizeof(struct ethhdr);
+    if (vlan_tagging) {
+        eth->h_proto = htons(ETH_P_8021Q);
+    struct vlan_header *vlan = (struct vlan_header *)(frame + sizeof(struct ethhdr));
+    vlan->tci = htons((uint16_t)(effective_vlan & 0x0FFF));
+        vlan->encapsulated_proto = htons(ETH_P_ARP);
+        offset += sizeof(struct vlan_header);
+    } else {
+        eth->h_proto = htons(ETH_P_ARP);
+    }
+
+    struct ether_arp *arp = (struct ether_arp *)(frame + offset);
     arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
     arp->ea_hdr.ar_pro = htons(ETH_P_IP);
     arp->ea_hdr.ar_hln = ETH_ALEN;
@@ -721,12 +743,14 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
     struct sockaddr_ll addr;
     memset(&addr, 0, sizeof(addr));
     addr.sll_family = AF_PACKET;
-    addr.sll_protocol = htons(ETH_P_ARP);
+    addr.sll_protocol = htons(vlan_tagging ? ETH_P_8021Q : ETH_P_ARP);
     addr.sll_ifindex = tx_ifindex;
     addr.sll_halen = ETH_ALEN;
     memcpy(addr.sll_addr, target_mac, ETH_ALEN);
 
-    ssize_t sent = sendto(adapter->tx_fd, frame, sizeof(frame), 0,
+    size_t frame_len = offset + sizeof(struct ether_arp);
+
+    ssize_t sent = sendto(adapter->tx_fd, frame, frame_len, 0,
                           (struct sockaddr *)&addr, sizeof(addr));
     if (sent < 0) {
         int err = errno;
@@ -740,7 +764,11 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
 
     char ip_buf[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &req->target_ip, ip_buf, sizeof(ip_buf));
-    realtek_logf(adapter, TD_LOG_DEBUG, "ARP probe sent to %s via %s", ip_buf, tx_iface);
+    if (vlan_tagging) {
+        realtek_logf(adapter, TD_LOG_DEBUG, "ARP probe sent to %s via %s vlan=%d", ip_buf, tx_iface, effective_vlan);
+    } else {
+        realtek_logf(adapter, TD_LOG_DEBUG, "ARP probe sent to %s via %s", ip_buf, tx_iface);
+    }
 
     return TD_ADAPTER_OK;
 }

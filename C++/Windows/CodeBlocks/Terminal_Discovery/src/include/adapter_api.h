@@ -39,7 +39,7 @@ typedef struct td_adapter td_adapter_t;
 
 struct td_adapter_config {
     const char *rx_iface;           /* inbound raw socket interface */
-    const char *tx_iface;           /* outbound VLAN interface */
+    const char *tx_iface;           /* outbound physical interface */
     unsigned int tx_interval_ms;    /* minimum gap between ARP probes */
     unsigned int rx_ring_size;      /* optional fan-out / ring size hint */
 };
@@ -85,6 +85,7 @@ struct td_adapter_arp_request {
     uint8_t sender_mac[ETH_ALEN];
     struct in_addr target_ip;
     uint8_t target_mac[ETH_ALEN];
+    int vlan_id;                 /* -1 when no VLAN tag is required, else 1-4094 */
     char tx_iface[IFNAMSIZ];        /* optional override transmit iface */
     int tx_ifindex;                 /* optional, -1 if unknown */
     bool tx_iface_valid;            /* true when tx_iface contains a preference */

@@ -44,6 +44,8 @@ struct options {
     bool verbose;
     bool rx_enabled;
     bool tx_enabled;
+    bool tx_vlan_set;
+    uint16_t tx_vlan;
 };
 
 struct receiver_args {
@@ -62,6 +64,8 @@ struct sender_args {
     struct in_addr dst_ip;
     int interval_ms;
     unsigned long long count;
+    bool vlan_tagging;
+    uint16_t vlan_id;
 };
 
 struct send_context {
@@ -69,6 +73,7 @@ struct send_context {
     int ifindex;
     uint8_t mac[ETH_ALEN];
     struct in_addr ipv4;
+    char iface[IFNAMSIZ];
 };
 
 struct vlan_header {
@@ -119,6 +124,14 @@ static void hex_dump(const uint8_t *data, size_t len) {
     if (count % 16 != 0) {
         printf("\n");
     }
+}
+
+static int sanitize_vlan_id(unsigned int raw_vlan_id) {
+    unsigned int vlan = raw_vlan_id & 0x0FFF;
+    if (vlan < 1 || vlan > 4094) {
+        return -1;
+    }
+    return (int)vlan;
 }
 
 static int attach_arp_filter(int fd) {
@@ -254,12 +267,15 @@ static bool init_send_context(const char *iface,
 
     close(ioctl_fd);
     ctx->fd = fd;
+    snprintf(ctx->iface, IFNAMSIZ, "%s", iface);
     return true;
 }
 
 static bool send_arp_request(const struct send_context *ctx,
                              const uint8_t dst_mac[ETH_ALEN],
-                             const struct in_addr *target_ip) {
+                             const struct in_addr *target_ip,
+                             bool vlan_tagging,
+                             uint16_t vlan_id) {
     if (ctx->fd < 0 || ctx->ifindex <= 0) {
         fprintf(stderr, "[ERROR] invalid send context\n");
         return false;
@@ -270,13 +286,33 @@ static bool send_arp_request(const struct send_context *ctx,
         return false;
     }
 
-    uint8_t frame[sizeof(struct ethhdr) + sizeof(struct ether_arp)] = {0};
+    uint8_t frame[sizeof(struct ethhdr) + sizeof(struct vlan_header) + sizeof(struct ether_arp)] = {0};
     struct ethhdr *eth = (struct ethhdr *)frame;
-    struct ether_arp *arp = (struct ether_arp *)(frame + sizeof(struct ethhdr));
+    size_t offset = sizeof(struct ethhdr);
+
+    uint16_t encoded_vlan_id = 0;
+    if (vlan_tagging) {
+        int sanitized = sanitize_vlan_id(vlan_id);
+        if (sanitized < 0) {
+            fprintf(stderr,
+                    "[ERROR] requested VLAN ID %u is outside 1-4094; drop request\n",
+                    (unsigned int)(vlan_id & 0x0FFF));
+            return false;
+        }
+        encoded_vlan_id = (uint16_t)sanitized;
+        eth->h_proto = htons(ETH_P_8021Q);
+        struct vlan_header *vlan = (struct vlan_header *)(frame + sizeof(struct ethhdr));
+        vlan->tci = htons(encoded_vlan_id);
+        vlan->encapsulated_proto = htons(ETH_P_ARP);
+        offset += sizeof(struct vlan_header);
+    } else {
+        eth->h_proto = htons(ETH_P_ARP);
+    }
+
+    struct ether_arp *arp = (struct ether_arp *)(frame + offset);
 
     memcpy(eth->h_dest, dst_mac, ETH_ALEN);
     memcpy(eth->h_source, ctx->mac, ETH_ALEN);
-    eth->h_proto = htons(ETH_P_ARP);
 
     arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
     arp->ea_hdr.ar_pro = htons(ETH_P_IP);
@@ -292,12 +328,14 @@ static bool send_arp_request(const struct send_context *ctx,
     struct sockaddr_ll addr;
     memset(&addr, 0, sizeof(addr));
     addr.sll_family = AF_PACKET;
-    addr.sll_protocol = htons(ETH_P_ARP);
+    addr.sll_protocol = vlan_tagging ? htons(ETH_P_8021Q) : htons(ETH_P_ARP);
     addr.sll_ifindex = ctx->ifindex;
     addr.sll_halen = ETH_ALEN;
     memcpy(addr.sll_addr, dst_mac, ETH_ALEN);
 
-    ssize_t sent = sendto(ctx->fd, frame, sizeof(frame), 0,
+    size_t frame_length = offset + sizeof(struct ether_arp);
+
+    ssize_t sent = sendto(ctx->fd, frame, frame_length, 0,
                           (struct sockaddr *)&addr, sizeof(addr));
     if (sent < 0) {
         perror("sendto(ARP)");
@@ -306,7 +344,18 @@ static bool send_arp_request(const struct send_context *ctx,
 
     char ip_str[INET_ADDRSTRLEN];
     format_ip((const uint8_t *)&target_ip->s_addr, ip_str, sizeof(ip_str));
-    fprintf(stderr, "[INFO] ARP probe sent to %s\n", ip_str);
+    if (vlan_tagging) {
+        fprintf(stderr,
+                "[INFO] ARP probe sent to %s via %s vlan=%u\n",
+                ip_str,
+                ctx->iface,
+                (unsigned int)encoded_vlan_id);
+    } else {
+        fprintf(stderr,
+                "[INFO] ARP probe sent to %s via %s\n",
+                ip_str,
+                ctx->iface);
+    }
     return true;
 }
 
@@ -409,12 +458,12 @@ static void *receiver_thread(void *arg) {
                     const struct tpacket_auxdata *aux = (const struct tpacket_auxdata *)CMSG_DATA(cmsg);
 #ifdef TP_STATUS_VLAN_VALID
                     if (aux->tp_status & TP_STATUS_VLAN_VALID) {
-                        vlan_id = aux->tp_vlan_tci & 0x0FFF;
+                        vlan_id = sanitize_vlan_id(aux->tp_vlan_tci);
                         break;
                     }
 #else
                     if (aux->tp_vlan_tci != 0 || aux->tp_vlan_tpid != 0) {
-                        vlan_id = aux->tp_vlan_tci & 0x0FFF;
+                        vlan_id = sanitize_vlan_id(aux->tp_vlan_tci);
                         break;
                     }
 #endif
@@ -428,7 +477,7 @@ static void *receiver_thread(void *arg) {
             }
             struct vlan_header vlan_local;
             memcpy(&vlan_local, buffer + sizeof(struct ethhdr), sizeof(vlan_local));
-            vlan_id = ntohs(vlan_local.tci) & 0x0FFF;
+            vlan_id = sanitize_vlan_id(ntohs(vlan_local.tci));
             ether_type = ntohs(vlan_local.encapsulated_proto);
             offset += sizeof(struct vlan_header);
         }
@@ -454,7 +503,7 @@ static void *receiver_thread(void *arg) {
             (opcode == ARPOP_REQUEST) ? "REQUEST" :
             (opcode == ARPOP_REPLY ? "REPLY" : "OTHER");
 
-        if (vlan_id >= 0) {
+        if (vlan_id >= 1) {
             printf("[ARP][if=%s(ifindex=%d)][vlan=%d] opcode=%s sender=%s/%s target=%s\n",
                    ingress_ifname,
                    ingress_ifindex,
@@ -489,6 +538,11 @@ static void *sender_thread(void *arg) {
     struct send_context ctx;
     memset(&ctx, 0, sizeof(ctx));
 
+    if (args->iface[0] == '\0') {
+        fprintf(stderr, "[ERROR] transmit interface not specified; use --tx-iface\n");
+        return NULL;
+    }
+
     if (!init_send_context(args->iface,
                            args->src_mac,
                            args->src_mac_set,
@@ -499,9 +553,21 @@ static void *sender_thread(void *arg) {
         return NULL;
     }
 
+    if (ctx.ipv4.s_addr == 0) {
+        fprintf(stderr,
+                "[ERROR] source IPv4 unavailable; provide --src-ip or configure interface %s\n",
+                args->iface[0] != '\0' ? args->iface : ctx.iface);
+        close(ctx.fd);
+        return NULL;
+    }
+
     unsigned long long remaining = args->count;
     while (g_running) {
-        send_arp_request(&ctx, args->dst_mac, &args->dst_ip);
+        send_arp_request(&ctx,
+                         args->dst_mac,
+                         &args->dst_ip,
+                         args->vlan_tagging,
+                         args->vlan_id);
         if (args->interval_ms > 0) {
             sleep_ms(args->interval_ms);
         }
@@ -527,6 +593,7 @@ static void print_usage(const char *prog) {
             "\n"
             "Transmit options:\n"
             "  --tx-iface <ifname>    Interface to send ARP probes (disabled if absent)\n"
+            "  --tx-vlan <id>         VLAN ID for user-space tagged frames on --tx-iface (0-4095)\n"
             "  --src-mac <mac>        Override source MAC address\n"
             "  --src-ip <ipv4>        Override source IPv4 address\n"
             "  --dst-mac <mac>        Destination MAC (default ff:ff:ff:ff:ff:ff)\n"
@@ -570,6 +637,7 @@ int main(int argc, char *argv[]) {
         {"timeout", required_argument, NULL, 'T'},
         {"verbose", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
+        {"tx-vlan", required_argument, NULL, 1000},
         {NULL, 0, NULL, 0},
     };
 
@@ -634,10 +702,25 @@ int main(int argc, char *argv[]) {
         case 'h':
             print_usage(argv[0]);
             return 0;
+        case 1000: {
+            int vlan = atoi(optarg);
+            if (vlan < 1 || vlan > 4094) {
+                fprintf(stderr, "[ERROR] tx-vlan must be between 1 and 4094\n");
+                return 1;
+            }
+            opts.tx_vlan = (uint16_t)vlan;
+            opts.tx_vlan_set = true;
+            break;
+        }
         default:
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    if (opts.tx_vlan_set && (!opts.tx_enabled || opts.tx_iface[0] == '\0')) {
+        fprintf(stderr, "[ERROR] --tx-vlan requires --tx-iface to be specified\n");
+        return 1;
     }
 
     if (!opts.rx_enabled && !opts.tx_enabled) {
@@ -685,7 +768,7 @@ int main(int argc, char *argv[]) {
     memset(&tx_args, 0, sizeof(tx_args));
 
     if (opts.tx_enabled) {
-    snprintf(tx_args.iface, IFNAMSIZ, "%s", opts.tx_iface);
+        snprintf(tx_args.iface, IFNAMSIZ, "%s", opts.tx_iface);
         if (opts.src_mac_set) {
             memcpy(tx_args.src_mac, opts.src_mac, ETH_ALEN);
             tx_args.src_mac_set = true;
@@ -698,6 +781,10 @@ int main(int argc, char *argv[]) {
         tx_args.dst_ip = opts.dst_ip;
         tx_args.interval_ms = opts.interval_ms;
         tx_args.count = opts.count;
+        if (opts.tx_vlan_set) {
+            tx_args.vlan_tagging = true;
+            tx_args.vlan_id = opts.tx_vlan;
+        }
 
         if (pthread_create(&tx_thread, NULL, sender_thread, &tx_args) != 0) {
             perror("pthread_create(sender)");

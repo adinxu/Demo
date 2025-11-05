@@ -60,6 +60,7 @@ struct probe_task {
 
 struct iface_prefix_entry {
     struct in_addr network;
+    struct in_addr address;
     uint8_t prefix_len;
     struct iface_prefix_entry *next;
 };
@@ -133,6 +134,9 @@ static void set_state(struct terminal_entry *entry, terminal_state_t new_state);
 static struct iface_record **find_iface_record_slot(struct terminal_manager *mgr, int ifindex);
 static struct iface_record *get_iface_record(struct terminal_manager *mgr, int ifindex);
 static bool iface_record_matches_ip(const struct iface_record *record, struct in_addr ip);
+static bool iface_record_select_ip(const struct iface_record *record,
+                                   struct in_addr terminal_ip,
+                                   struct in_addr *out_ip);
 static bool iface_binding_attach(struct terminal_manager *mgr,
                                  int ifindex,
                                  struct terminal_entry *entry);
@@ -147,10 +151,12 @@ static bool ip_matches_prefix(struct in_addr ip,
 static bool iface_prefix_add(struct terminal_manager *mgr,
                              int ifindex,
                              struct in_addr network,
+                                      struct in_addr address,
                              uint8_t prefix_len);
 static bool iface_prefix_remove(struct terminal_manager *mgr,
                                 int ifindex,
                                 struct in_addr network,
+                                          struct in_addr address,
                                 uint8_t prefix_len);
 
 static void monotonic_now(struct timespec *ts) {
@@ -460,11 +466,23 @@ static struct iface_record *get_iface_record(struct terminal_manager *mgr, int i
 }
 
 static bool iface_record_matches_ip(const struct iface_record *record, struct in_addr ip) {
+    return iface_record_select_ip(record, ip, NULL);
+}
+
+static bool iface_record_select_ip(const struct iface_record *record,
+                                   struct in_addr terminal_ip,
+                                   struct in_addr *out_ip) {
     if (!record) {
         return false;
     }
     for (struct iface_prefix_entry *node = record->prefixes; node; node = node->next) {
-        if (ip_matches_prefix(ip, node->network, node->prefix_len)) {
+        if (ip_matches_prefix(terminal_ip, node->network, node->prefix_len)) {
+            if (node->address.s_addr == 0) {
+                continue;
+            }
+            if (out_ip) {
+                *out_ip = node->address;
+            }
             return true;
         }
     }
@@ -523,6 +541,8 @@ static void iface_binding_detach(struct terminal_manager *mgr,
         return;
     }
 
+    entry->tx_source_ip.s_addr = 0;
+
     struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
     struct iface_record *record = slot ? *slot : NULL;
     if (!record) {
@@ -557,6 +577,7 @@ static void iface_record_prune_if_empty(struct iface_record **slot_ref) {
 static bool iface_prefix_add(struct terminal_manager *mgr,
                              int ifindex,
                              struct in_addr network,
+                             struct in_addr address,
                              uint8_t prefix_len) {
     if (ifindex <= 0) {
         return false;
@@ -581,7 +602,9 @@ static bool iface_prefix_add(struct terminal_manager *mgr,
     }
 
     for (struct iface_prefix_entry *node = record->prefixes; node; node = node->next) {
-        if (node->prefix_len == prefix_len && node->network.s_addr == network.s_addr) {
+        if (node->prefix_len == prefix_len &&
+            node->network.s_addr == network.s_addr &&
+            node->address.s_addr == address.s_addr) {
             return true;
         }
     }
@@ -595,6 +618,7 @@ static bool iface_prefix_add(struct terminal_manager *mgr,
         return false;
     }
     entry->network = network;
+    entry->address = address;
     entry->prefix_len = prefix_len;
     entry->next = record->prefixes;
     record->prefixes = entry;
@@ -604,6 +628,7 @@ static bool iface_prefix_add(struct terminal_manager *mgr,
 static bool iface_prefix_remove(struct terminal_manager *mgr,
                                 int ifindex,
                                 struct in_addr network,
+                                struct in_addr address,
                                 uint8_t prefix_len) {
     struct iface_record **slot = find_iface_record_slot(mgr, ifindex);
     struct iface_record *record = slot ? *slot : NULL;
@@ -612,8 +637,10 @@ static bool iface_prefix_remove(struct terminal_manager *mgr,
     }
 
     struct iface_prefix_entry **pp = &record->prefixes;
-    while (*pp) {
-        if ((*pp)->prefix_len == prefix_len && (*pp)->network.s_addr == network.s_addr) {
+        while (*pp) {
+            if ((*pp)->prefix_len == prefix_len &&
+                (*pp)->network.s_addr == network.s_addr &&
+                (*pp)->address.s_addr == address.s_addr) {
             struct iface_prefix_entry *node = *pp;
             *pp = node->next;
             free(node);
@@ -715,6 +742,8 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
     int candidate_ifindex = -1;
     bool resolved = false;
 
+    struct in_addr candidate_source_ip = {0};
+
     if (mgr->cfg.iface_selector) {
         resolved = mgr->cfg.iface_selector(&entry->meta,
                                            candidate,
@@ -738,7 +767,7 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
 
     if (resolved) {
         struct iface_record *record = get_iface_record(mgr, candidate_ifindex);
-        if (!record || !iface_record_matches_ip(record, entry->key.ip)) {
+        if (!record || !iface_record_select_ip(record, entry->key.ip, &candidate_source_ip)) {
             td_log_writef(TD_LOG_DEBUG,
                           "terminal_manager",
                           "iface %s(index=%d) lacks matching prefix for terminal",
@@ -754,6 +783,7 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
         }
         entry->tx_iface[0] = '\0';
         entry->tx_ifindex = -1;
+        entry->tx_source_ip.s_addr = 0;
         return false;
     }
 
@@ -766,10 +796,12 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
 
     snprintf(entry->tx_iface, sizeof(entry->tx_iface), "%s", candidate);
     entry->tx_ifindex = candidate_ifindex;
+    entry->tx_source_ip = candidate_source_ip;
 
     if (!iface_binding_attach(mgr, candidate_ifindex, entry)) {
         entry->tx_iface[0] = '\0';
         entry->tx_ifindex = -1;
+        entry->tx_source_ip.s_addr = 0;
         return false;
     }
 
@@ -813,6 +845,7 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
     entry->meta.lport = 0U;
     entry->tx_iface[0] = '\0';
     entry->tx_ifindex = -1;
+    entry->tx_source_ip.s_addr = 0;
     entry->next = NULL;
 
     if (packet) {
@@ -1072,7 +1105,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 }
 
 static bool is_iface_available(const struct terminal_entry *entry) {
-    return entry && entry->tx_ifindex > 0;
+    return entry && entry->tx_ifindex > 0 && entry->tx_source_ip.s_addr != 0;
 }
 
 static bool has_expired(const struct terminal_manager *mgr,
@@ -1142,6 +1175,8 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                                 task->request.key = entry->key;
                                 snprintf(task->request.tx_iface, sizeof(task->request.tx_iface), "%s", entry->tx_iface);
                                 task->request.tx_ifindex = entry->tx_ifindex;
+                                task->request.source_ip = entry->tx_source_ip;
+                                task->request.vlan_id = entry->meta.vlan_id;
                                 task->request.state_before_probe = entry->state;
                                 if (!tasks_head) {
                                     tasks_head = task;
@@ -1236,12 +1271,12 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
 
     struct in_addr network = prefix_network(update->address, update->prefix_len);
     if (update->is_add) {
-        if (!iface_prefix_add(mgr, update->ifindex, network, update->prefix_len)) {
+        if (!iface_prefix_add(mgr, update->ifindex, network, update->address, update->prefix_len)) {
             pthread_mutex_unlock(&mgr->lock);
             return;
         }
     } else {
-        iface_prefix_remove(mgr, update->ifindex, network, update->prefix_len);
+        iface_prefix_remove(mgr, update->ifindex, network, update->address, update->prefix_len);
     }
 
     struct iface_record **slot = find_iface_record_slot(mgr, update->ifindex);
@@ -1255,11 +1290,21 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
     while (*binding_ref) {
         struct iface_binding_entry *binding = *binding_ref;
         struct terminal_entry *terminal = binding->terminal;
+        if (update->is_add) {
+            struct in_addr refreshed_ip;
+            if (iface_record_select_ip(record, terminal->key.ip, &refreshed_ip)) {
+                terminal->tx_source_ip = refreshed_ip;
+            }
+            binding_ref = &(*binding_ref)->next;
+            continue;
+        }
+
         if (!iface_record_matches_ip(record, terminal->key.ip)) {
             *binding_ref = binding->next;
             free(binding);
             terminal->tx_iface[0] = '\0';
             terminal->tx_ifindex = -1;
+            terminal->tx_source_ip.s_addr = 0;
             monotonic_now(&terminal->last_seen);
             set_state(terminal, TERMINAL_STATE_IFACE_INVALID);
         } else {
