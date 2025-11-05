@@ -1,12 +1,13 @@
 ## Project Structure
 
 - `src/` - 主要源代码目录
+- `doc/` - 过程文档存放
 - `specs/` - 规范文档，见下方Stage-Gated Workflow (spec/plan/do)章节
 - `plans/` - 计划文档，见下方Stage-Gated Workflow (spec/plan/do)章节
 - `src/ref/` - 此文件夹下存放不同操作系统平台的不同交换芯片收发包参考代码，非本项目代码，仅供参考
 - `src/ref/realtek` - 存放睿昱芯片收发包参考代码
 - `src/ref/netforward` - 存放楠菲微芯片收发包参考代码
-- `tests/` - 测试文件存放，demo文件存放
+- `tests/` - 测试文件存放
 
 ## Coding Conventions
 
@@ -16,6 +17,8 @@
 - 程序需具备良好的健壮性，能处理异常情况
 - 程序需具备良好的性能
 - 程序需具备良好的跨平台移植性，支持不同CPU架构(arm64、mips等)
+- 文档使用中文输出，流程图(比如UML的状态机图、通信图、顺序图)优先使用mermaid语法绘制
+- 若生产环境使用的特定平台特定芯片厂商提供的交叉编译链无法安装，则选择使用通用的特定平台交叉编译链进行编译验证
 
 ## Testing Guidelines
 

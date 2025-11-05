@@ -64,3 +64,6 @@ Release_wx_pch_h_gch
 *.htm
 *.plg
 *.tmp
+.vscode/settings.json
+C++/Windows/CodeBlocks/Terminal_Discovery/src/terminal_discovery
+C++/Windows/CodeBlocks/Terminal_Discovery/src/demo/stage0_raw_socket_demo

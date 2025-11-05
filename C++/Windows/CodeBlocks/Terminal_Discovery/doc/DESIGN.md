@@ -11,7 +11,7 @@
 
 
 ## 非功能性需求
-1.	性能需求:1.应对大量报文上cpu(已有arp限速) 2.终端数量规格(根据设备能力有:200,300,500,1000等不同终端数) 
+1.	性能需求:1.应对大量报文上cpu(arp限速已有，本项目无需考虑) 2.终端数量规格(根据设备能力有:200,300,500,1000等不同终端数) 
 2.	可移植性:一定程度上可移植到其他的平台
 3.	可维护性: 保持核心逻辑清晰，易于理解、维护和扩展。
 4.	兼容性:适配不同的交换机平台(收包架构不同导致的方案差异，比如通用收包，内核收包，用户态收包)
@@ -26,32 +26,30 @@
 Access
 Trunk
 ####	接口up/down
-三层口通过netlink
+三层口通过netlink监听变化
 
 ###	Netforward平台
 ###	通用linux平台
 ##	报文收发
 ###	Reltek平台
 #### Arp报文上送
-默认创建虚接口时才下发acl规则，因此新适配代码(已完成)，在设备启动时默认所有二层口都上送arp报文(copy to cpu)。
+默认创建虚接口时才下发acl规则，已适配完代码，目前在设备启动时默认所有二层口都上送arp报文(copy to cpu)。
 
-接口对应vlan无vlan虚接口时:
+接口对应vlan无vlan虚接口时上送报文:
 广播arp(含免费arp):
 单播request(所有)
 单播reply(所有)
 
-有虚接口时:
-还会匹配目的mac和vlan tag是否和虚接口匹配
+有虚接口时上送报文:
+还会匹配目的mac和vlan tag是否和虚接口匹配再上送
 
 待确认:
 Trunk口有的permit vlan无虚接口，有的有虚接口时的收包行为
 ####	收发包架构
 网卡sdk在内核收包，用户态通过raw socket使用bpf过滤收包
 ####	内核报文处理
-收发包时arp不携带cpu tag，但会有vlan tag
-
-在收包时，哪里进行cpu tag剥离的？在抓包钩子点前
-在发包时，组装好报文使用raw socket向三层口发送即可，不需要查二层转发表
+在eth0收包时arp不携带cpu tag，但携带vlan tag
+在发包时，组装好报文使用raw socket向三层口(比如vlan1)发送即可，不需要查二层转发表
 ###	Netforward平台
 ###	通用linux平台
 # 概要设计
@@ -64,11 +62,11 @@ Trunk口有的permit vlan无虚接口，有的有虚接口时的收包行为
 如果是二层trunk口，则permit vlan根据是否存在虚接口决定是否保活。若无vlan tag或为pvid，则查找pvid对应虚接口决定是否保活。
 需感知虚接口创建删除，ip地址变更，接口状态变更
 ##	报文处理
-Switchapp适配所有端口上送arp报文
+Switchapp适配所有端口上送arp报文(已完成)
 支持接收广播arp,免费arp，arp回复等报文进行发现
 支持发送单播request报文进行保活
-收包使用raw socket，结合cpu tag或vlan tag处理
-发包使用raw socket(需三层口信息)或sdk接口(需二层口信息)
+收包使用raw socket，需结合vlan tag处理
+发包使用raw socket绑定三层口发送(需三层口vlan信息)
 ##	终端发现
 目前仅利用arp报文进行终端发现及终端状态切换
 ##	终端维护
@@ -96,7 +94,6 @@ PROBING --(收到回应)--> ACTIVE
 支持增量上报变化的终端信息
 
 ## 数据结构设计
-仅样例:
 terminal_manager_t 结构体，管理全部终端及定时器线程
 成员:
 head 链表,保存所有发现的终端结构体terminal_entry_t
