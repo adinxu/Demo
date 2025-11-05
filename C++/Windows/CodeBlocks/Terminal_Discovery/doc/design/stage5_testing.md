@@ -6,7 +6,7 @@
 - 为后续北向联调与实机压力测试提供可复用的本地快速回归入口。
 
 ## 新增测试
-- `terminal_discovery_tests`（`make test`）
+- `terminal_discovery_tests`
   - `terminal_add_and_event`：模拟地址前缀 + ARP 报文，确认新增事件、查询快照与统计计数器。具体实现：
     1. 构造 `struct terminal_manager_config`，通过 `selector_callback` 固定返回 ifindex=100、VLAN=100。
     2. 将 `terminal_manager_set_event_sink` 回调指向 `capture_callback`，并通过 `apply_address_update` 注册 `192.0.2.0/24` 前缀。
@@ -24,15 +24,18 @@
     1. selector 返回 ifindex=103，注入 `10.10.10.0/24`，首帧 ARP 的 lport=1，确认初始 `ADD` 事件。
     2. 清空事件记录后再次下发同一终端但 lport=2 的报文。
     3. 断言捕获一条 `TERMINAL_EVENT_TAG_MOD`（`port==2`），同时验证探测回调未触发与 `events_dispatched` 计数递增。
+- `terminal_integration_tests`
+  - `test_duplicate_registration`：调用 `setIncrementReport` 后再次注册同一回调，期望返回 `-EALREADY`，验证北向接口重复注册保护逻辑。
+  - `test_increment_add_and_get_all`：使用 stub netlink 与 ARP 报文驱动管理器，确认 `inc_report_adapter` 收到 `ADD` 事件，`getAllTerminalInfo` 至少返回一条记录。
+  - `test_netlink_removal`：通过 `terminal_manager_on_address_update` 注销前缀并等待 holdoff，验证 `DEL` 事件上报与查询快照清空。
+  - `test_stats_tracking`：读取 `terminal_manager_get_stats`，核对发现/删除/地址更新计数随流程更新。
 - 运行时默认将日志等级降至 `ERROR`，避免测试输出噪声。
 
 ## 使用方法
 - 本地运行：
   - `cd src && make test`
-  - 产物：`terminal_discovery_tests`。
-- 预期输出：逐条用例 `[PASS]`/`[FAIL]`，最后给出总计。
+  - 产物：`terminal_discovery_tests`、`terminal_integration_tests`。
+- 预期输出：两个可执行文件依次运行；前者逐条打印 `[PASS]`/`[FAIL]`，后者输出阶段性断言及最终 `integration tests passed/failed`。
 
 ## 后续计划
-1. 扩展集成测试：引入 mock 适配器，重放接口事件、ARP 序列，覆盖多终端并发。
-2. 补齐北向桩测试：构造 C++ 桥接层桩，验证并发查询与回调异常保护。
-3. 实机回归脚本化：整理 Realtek 300/1000 终端回归步骤与性能记录。
+1. 实机回归脚本化：整理 Realtek 300/1000 终端回归步骤与性能记录。

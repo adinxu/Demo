@@ -40,6 +40,10 @@ TEST_TARGET := terminal_discovery_tests
 TEST_SRCS := tests/terminal_manager_tests.c
 TEST_OBJS := $(TEST_SRCS:.c=.o)
 TEST_DEPS := common/terminal_manager.o common/td_logging.o
+INTEGRATION_TEST_TARGET := terminal_integration_tests
+INTEGRATION_TEST_SRCS := tests/terminal_integration_tests.cpp
+INTEGRATION_TEST_OBJS := $(INTEGRATION_TEST_SRCS:.cpp=.o)
+INTEGRATION_TEST_DEPS := common/terminal_manager.o common/td_logging.o common/terminal_northbound.o
 
 all: $(TARGET)
 
@@ -49,6 +53,9 @@ $(TARGET): $(OBJS)
 $(TEST_TARGET): $(TEST_OBJS) $(TEST_DEPS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(INTEGRATION_TEST_TARGET): $(INTEGRATION_TEST_OBJS) $(INTEGRATION_TEST_DEPS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -56,7 +63,7 @@ $(TEST_TARGET): $(TEST_OBJS) $(TEST_DEPS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(OBJS) $(TEST_TARGET) $(TEST_OBJS)
+	rm -f $(TARGET) $(OBJS) $(TEST_TARGET) $(TEST_OBJS) $(INTEGRATION_TEST_TARGET) $(INTEGRATION_TEST_OBJS)
 
 cross:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-rtl83xx-linux- all
@@ -64,7 +71,9 @@ cross:
 cross-generic:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-linux-gnu- all
 
+
 .PHONY: all clean cross cross-generic test
 
-test: $(TEST_TARGET)
+test: $(TEST_TARGET) $(INTEGRATION_TEST_TARGET)
 	./$(TEST_TARGET)
+	./$(INTEGRATION_TEST_TARGET)

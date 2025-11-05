@@ -78,10 +78,15 @@
 
 ### 阶段 5：测试与验收（进行中）
 1. ✅ 单元测试：新增 `terminal_discovery_tests` 覆盖状态机（探测失败淘汰、接口失效保留期、端口变更上报）与事件分发，命令 `make test` 可在 x86 环境快速执行。
-2. 🚧 集成测试：基于模拟适配器重放报文、接口事件；验证保活探测、删除、接口失效恢复、事件聚合。
-3. ⏳ 北向测试：
-   - C/C++ 桥接层回调桩，验证异常捕获、字段完整性、重复注册保护。
-   - 全量查询输出与并发访问。
+2. ✅ 集成测试：新增 `terminal_integration_tests`，基于打桩 netlink/ARP 流程验证 `ADD/DEL` 事件、统计数据和重复注册保护。
+3. ✅ 北向测试：
+   - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性与重复注册告警。
+   - 后续若需并发访问覆盖，可在现有桩环境扩展多线程情景。
+4. ✳️ 打桩测试扩展方向：
+   - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
+   - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
+   - 配置转换：对 `td_config_to_manager_config` 提供边界输入（0、极大值）确保默认兜底与错误码表现正确。
+   - 统计日志：替换日志 sink，驱动 `g_should_dump_stats` 触发，确认 `terminal_stats` 字段完整性与节奏控制。
 4. ⏳ 实机/压力验证：
    - 300 终端 Realtek Demo 回归；1k 终端压力测试记录 CPU/内存/丢包。
 5. ⏳ 验收输出：整理测试报告、回滚策略、性能曲线。
