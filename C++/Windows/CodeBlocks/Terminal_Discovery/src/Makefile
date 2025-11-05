@@ -36,11 +36,18 @@ CPPSRCS := \
 
 OBJS := $(CSRCS:.c=.o) $(CPPSRCS:.cpp=.o)
 TARGET := terminal_discovery
+TEST_TARGET := terminal_discovery_tests
+TEST_SRCS := tests/terminal_manager_tests.c
+TEST_OBJS := $(TEST_SRCS:.c=.o)
+TEST_DEPS := common/terminal_manager.o common/td_logging.o
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(TEST_TARGET): $(TEST_OBJS) $(TEST_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -49,7 +56,7 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) $(TEST_TARGET) $(TEST_OBJS)
 
 cross:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-rtl83xx-linux- all
@@ -57,4 +64,7 @@ cross:
 cross-generic:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-linux-gnu- all
 
-.PHONY: all clean cross cross-generic
+.PHONY: all clean cross cross-generic test
+
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
