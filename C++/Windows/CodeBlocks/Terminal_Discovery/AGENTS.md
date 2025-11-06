@@ -10,7 +10,6 @@
 - `tests/` - 测试文件存放
 
 ## Coding Conventions
-
 - 使用c语言
 - 程序需具备良好的可读性，易于理解
 - 程序需具备良好的可维护性，易于扩展
@@ -36,6 +35,7 @@
 - Mode: Opt-in. The workflow applies only when the user explicitly uses `/spec`, `/plan`, or `/do`. Routine Q&A or trivial edits do not require these stages.
 - Triggers: A message containing one of `/spec`, `/plan`, or `/do` activates or advances the workflow. Once active, stages must proceed in order with explicit user approval to advance.
 - Guardrails:
+  - Prioritize reviewing and utilizing any existing specifications and plans rather than creating new ones.
   - Do not modify source code before `/do`. Documentation/spec files may be edited only in `/spec`.
   - Do not skip stages or proceed without user confirmation once the workflow is active.
   - If scope changes, return to the appropriate prior stage for approval.

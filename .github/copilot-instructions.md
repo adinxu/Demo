@@ -1,53 +1,37 @@
 # Terminal Discovery Copilot Instructions
 
-## Overview
-- Focus on `C++/Windows/CodeBlocks/Terminal_Discovery` unless user states otherwise; other folders are unrelated samples.
-- Core goal: track network terminals via ARP, schedule keepalives, and expose snapshots/incremental events to northbound consumers.
-- Default language is C with POSIX threading; C++ appears only in the northbound bridge and integration tests.
+## Scope & Focus
+- Stay inside `C++/Windows/CodeBlocks/Terminal_Discovery` unless the user explicitly broadens scope; other folders are unrelated samples.
+- Core deliverable is an ARP-based terminal discovery daemon written in C with POSIX threading; C++ is only for the northbound bridge and integration tests.
+- Preserve the existing CLI/log output style; new documentation under this project should remain in Chinese unless the target file already uses another language.
 
-## Architecture Map
-- `src/common/terminal_manager.c` holds the terminal state machine, timers, iface bookkeeping, and event queue.
-- `src/adapter/realtek_adapter.c` is the only production adapter today; it wraps raw sockets, BPF filters, pacing, and VLAN handling.
-- `src/common/terminal_netlink.c` monitors IPv4 address changes and updates `terminal_manager` iface bindings.
-- `src/common/terminal_northbound.cpp` plus `src/include/terminal_discovery_api.hpp` bridge the manager to external C++ code via `getAllTerminalInfo` and `setIncrementReport`.
-- `src/main/terminal_main.c` is the daemon wiring: parses config, instantiates the adapter, wires callbacks, runs until signalled.
-- Specs and plans live under `specs/` and `plans/`; follow the Stage-Gated workflow in `AGENTS.md` when the user issues `/spec`, `/plan`, `/do`.
+## Architecture & Data Flow
+- `src/main/terminal_main.c` drives startup: parses CLI flags, loads defaults via `td_config`, wires adapter/manager/netlink, sets log level, and reacts to SIGINT/SIGTERM (shutdown) plus SIGUSR1 (stats dump).
+- `src/common/terminal_manager.c` is the state machine: FNV-hashed buckets, `mgr->lock` for mutations, `worker_lock`/thread for timers, event batching, and `max_terminals` enforcement.
+- `src/common/terminal_netlink.c` runs a dedicated thread on NETLINK_ROUTE, feeding IPv4 add/del into `terminal_manager_on_address_update` and relying on `iface_prefix_add/remove` and `iface_record_prune_if_empty`.
+- `src/common/terminal_northbound.cpp` plus `src/include/terminal_discovery_api.hpp` expose `getAllTerminalInfo`/`setIncrementReport`, translating `terminal_event_record_t` to `TerminalInfo` and grabbing the active manager with `terminal_manager_get_active`.
+- `src/include/td_config.h` + `src/common/td_config.c` define runtime defaults; extend both runtime and manager configs together when adding knobs.
+
+## Adapter Layer
+- `src/adapter/realtek_adapter.c` is the production adapter: opens AF_PACKET sockets, installs `attach_arp_filter`, enables `PACKET_AUXDATA`, enforces pacing with `td_adapter_config.tx_interval_ms`, and handles VLAN tagging with fallbacks.
+- Adapter descriptors live in `src/adapter/adapter_registry.c`; new adapters must supply a `td_adapter_descriptor`, register it in the static table, and honor the `td_adapter_ops` contract in `src/include/adapter_api.h`.
+- Probe callbacks in `terminal_main` translate `terminal_probe_request_t` to `td_adapter_arp_request`; keep fallback-to-physical-iface logic aligned with the existing branch.
+
+## Runtime Patterns
+- Dispatch events with `terminal_manager_flush_events` or via the background worker; keep event queue mutations under `mgr->lock` and preserve `queue_modify_event_if_port_changed` semantics (only MOD on port change).
+- All timing uses `CLOCK_MONOTONIC`; reuse `monotonic_now`/`timespec_diff_ms` helpers rather than `gettimeofday`.
+- Maintain interface binding invariants: only treat an interface as available when `tx_ifindex > 0` and a matching prefix exists; use `iface_record_select_ip` and related helpers instead of reimplementing selection.
+- `setIncrementReport` is single-shot; return `-EALREADY` on subsequent registrations and ensure the callback remains non-blocking.
+- Update `terminal_manager_stats` alongside lifecycle transitions so CLI stats and tests stay consistent.
 
 ## Build & Test
-- Build everything from `src/` with `make`; binaries land beside the Makefile.
-- Run unit + integration tests via `make test` (executes `terminal_manager_tests` and `terminal_integration_tests`).
-- Cross builds: `make cross` (Realtek `mips-rtl83xx` toolchain) or `make cross-generic` (generic MIPS prefix). Pass `TOOLCHAIN_PREFIX=...` if you need a custom cross compiler.
+- From `src/`, `make` builds the daemon and adapter; outputs land alongside the Makefile.
+- `make test` runs both `terminal_manager_tests` (pure C with stub adapter) and `terminal_integration_tests` (C++ bridge). Tests assume `td_log_level` is ERROR—keep new logs at INFO/DEBUG.
+- Cross builds: `make cross` for the Realtek `mips-rtl83xx` toolchain or `make cross-generic` for other MIPS prefixes; override with `TOOLCHAIN_PREFIX=...` when needed.
+- `src/demo/Makefile` + `stage0_raw_socket_demo.c` are reference-only; avoid coupling production changes to the demo.
 
-## Key Runtime Patterns
-- Terminal capacity defaults to 1000 (`TERMINAL_DEFAULT_MAX_TERMINALS`); honor `terminal_manager_config.max_terminals` when adding features.
-- Event delivery: only emit `MOD` when logical port changes (`queue_modify_event_if_port_changed`); keep batches small and dispatch outside the manager lock.
-- Keep `terminal_manager` mutations under `mgr->lock`; timer thread uses `mgr->worker_lock` to serialize wakeups.
-- Interface availability depends on both `tx_ifindex > 0` and a matching prefix in `iface_records`; use helpers like `iface_record_select_ip` instead of duplicating logic.
-- All timed behavior uses `CLOCK_MONOTONIC`; match that when adding waits or comparisons.
-
-## Adapter Expectations
-- `td_adapter_ops` lives in `src/include/adapter_api.h`; new adapters must implement the same callbacks and respect pacing (`cfg.tx_interval_ms`).
-- Realtek adapter assumes ARP ingress on the physical iface and inserts VLAN tags on egress; reuse `attach_arp_filter`, `PACKET_AUXDATA`, and pacing helpers for consistency.
-- When sending ARP, prefer physical iface tagging; fall back to VLAN if the platform lacks VLAN insertion—mirror the guard clauses already present.
-
-## Netlink & Address Bookkeeping
-- Address updates feed `terminal_manager_on_address_update`; they maintain `iface_records` and detach stale bindings. Reuse `iface_prefix_add/remove` helpers.
-- Removing the last prefix for an iface must trigger `iface_record_prune_if_empty`; this prevents dangling bindings.
-
-## Northbound API Rules
-- `setIncrementReport` may be called once; return `-EALREADY` on duplicates and keep the callback non-blocking.
-- Always transform internal events to `TerminalInfo` via `format_mac`/`format_ip`; catch exceptions and log using `td_log_writef` instead of propagating.
-- Before querying or emitting, fetch the active manager with `terminal_manager_get_active`; return `-ENODEV` if unavailable.
-
-## Logging & Metrics
-- Use `td_log_writef` with appropriate levels (`TD_LOG_*`); tests set log level to `ERROR`, so keep noisy logs at INFO/DEBUG.
-- Update `terminal_manager_stats` counters in tandem with lifecycle changes; tests assert on `probes_scheduled`, `probe_failures`, etc.
-
-## Testing Guidance
-- Extend `tests/terminal_manager_tests.c` for pure C scenarios (use stub adapter/probe capture helpers provided).
-- Use `tests/terminal_integration_tests.cpp` when exercising the C++ API surface and incremental callback path.
-- Re-run `make test` after modifications; tests are fast and gate most regressions.
-
-## Process Notes
-- Honor the `/spec` → `/plan` → `/do` workflow whenever triggered; only code inside `/do`. Specs go in `specs/`, plans in `plans/` with `YYYY-MM-DD-title.md`.
-- Default to `apply_patch` for edits, keep diffs scoped, and prefer ASCII unless a file already uses other encodings.
+## Process & Collaboration
+- Follow the opt-in `/spec` → `/plan` → `/do` flow from `AGENTS.md` when the user issues those commands; specs belong in `specs/`, plans in `plans/YYYY-MM-DD-title.md`.
+- Use `apply_patch` for edits, keep diffs minimal, and respect existing encoding (default to ASCII).
+- Honor existing logging tone by routing adapter logs through `td_log_writef` or the adapter env sink.
+- When updating docs, mirror the surrounding language (Chinese by default) and reuse mermaid for diagrams if the file already does so.
