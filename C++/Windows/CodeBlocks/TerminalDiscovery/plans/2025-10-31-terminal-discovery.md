@@ -28,7 +28,7 @@
 4. ✅ Demo 校验：使用 stage0 demo 记录 `recvmsg` 返回的 ifindex/接口名，确认物理口 `eth0` 收到报文后解析出的接口名恒为 `eth0`，不能直接用于选择后续 ARP 发包接口，仍需依据终端绑定的 VLAN 元数据决定报文内容。
 5. ✅ VLAN tag 直出验证：扩展 stage0 demo 支持 `--tx-iface` + `--tx-vlan` 在用户态封装 802.1Q header 并直接从物理口发包，记录成功/失败条件及平台差异；该模式现已作为主线发包策略输入，虚接口绑定作为回退选项。
 6. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
-7. ⏳ 新增 MAC 表桥接验证 demo：待外部团队交付 C++ 桥接源文件及其 C 接口后，在其独立验证程序中编译本项目提供的 C 辅助模块（仅实现快照调用逻辑，不含 `main`），由外部 demo 的入口函数先调用桥接模块暴露的 `td_switch_mac_get_capacity`（或等效 API）估算最大条目，再由 demo 侧使用该容量分配/复用 `SwUcMacEntry` 数组并传递给 `td_switch_mac_snapshot` 输出 MAC/VLAN/ifindex；桥接内部在装载阶段完成一次性 `createSwitch` 并缓存 `SwitchDev*`，等待调用侧驱动 SDK (`getDevMacMaxSize`、`getDevUcMacAddress`)；不得自行扩容、轮询或转换结构；需重点确认桥接层能够依据容量返回真实条目总数，因为底层 `getDevUcMacAddress` 不会检查缓冲区大小；通过验证后，demo 结果作为生产集成的参考样板。
+7. ⏳ 新增 MAC 表桥接验证 demo：待外部团队交付 C++ 桥接源文件及其 C 接口后，在其独立验证程序中编译本项目提供的 C 辅助模块（仅实现快照调用逻辑，不含 `main`），由外部 demo 的入口函数先调用桥接模块暴露的 `td_switch_mac_get_capacity`（或等效 API）估算最大条目，并在首次查询后缓存该值；demo 侧基于此容量一次性 `calloc` 分配 `SwUcMacEntry` 数组供 `td_switch_mac_snapshot` 复用，调用过程中不再重复申请/扩容；桥接内部在装载阶段完成一次性 `createSwitch` 并缓存 `SwitchDev*`，等待调用侧驱动 SDK (`getDevMacMaxSize`、`getDevUcMacAddress`)；不得自行扩容、轮询或转换结构；需重点确认桥接层能够依据容量返回真实条目总数，因为底层 `getDevUcMacAddress` 不会检查缓冲区大小；通过验证后，demo 结果作为生产集成的参考样板。
 
 ### 阶段 1：适配层设计与实现（已完成）
 1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
