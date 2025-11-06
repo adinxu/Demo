@@ -75,10 +75,12 @@
 ### 阶段 4：配置、日志与文档（已完成）
 1. ✅ 配置体系：扩展 `td_config` 支持终端保活间隔、失败阈值、最大终端数量等参数；引擎统一从配置体系读取，暂不依赖环境变量。
 2. ✅ 日志与指标：引入核心模块结构化日志标签（如 `terminal_manager`, `event_queue`），暴露探测计数、失败数、接口波动等指标，预留对接外部采集的入口，并确保全部基于单调时钟；主程序新增 `--stats-interval`（默认 0，即禁用周期性输出，可指定秒数开启），并支持 `SIGUSR1` 触发即时 `terminal_stats` 快照。
+   - ⏳ 后续迭代需在 `td_log_writef` 默认格式中追加 `YYYY-MM-DD HH:MM:SS` 级别的系统时间戳（wall clock），同时保留自定义 sink 兼容性。
 3. ✅ 文档：补充阶段 2+ 核心引擎设计说明、API 参考与构建部署指南，同步最新 `MAC_IP_INFO`/`TerminalInfo` 字段约束。
 
 ### 阶段 5：测试与验收（进行中）
 1. ✅ 单元测试：新增 `terminal_discovery_tests` 覆盖状态机（探测失败淘汰、接口失效保留期、端口变更上报）与事件分发，命令 `make test` 可在 x86 环境快速执行。
+   - ⏳ 规划新增针对日志时间戳格式的断言或日志 sink 打桩，覆盖秒级时间前缀。
 2. ✅ 集成测试：新增 `terminal_integration_tests`，基于打桩 netlink/ARP 流程验证 `ADD/DEL` 事件、统计数据和重复注册保护。
 3. ✅ 北向测试：
    - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性与重复注册告警。

@@ -4,6 +4,7 @@
 #include "td_logging.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <netinet/if_ether.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 struct td_adapter {
     int placeholder;
@@ -140,6 +142,128 @@ static void build_arp_packet(struct td_adapter_packet_view *packet,
     packet->vlan_id = vlan_id;
     packet->lport = lport;
     memcpy(packet->src_mac, mac, ETH_ALEN);
+}
+
+static bool test_default_log_timestamp(void) {
+    bool ok = true;
+    const char *error_reason = NULL;
+
+    void *prev_ctx = NULL;
+    td_log_sink_fn prev_sink = td_log_get_sink(&prev_ctx);
+    td_log_set_sink(NULL, NULL);
+
+    td_log_level_t prev_level = td_log_get_level();
+    td_log_set_level(TD_LOG_TRACE);
+
+    int pipefd[2] = {-1, -1};
+
+    int stderr_fd = dup(fileno(stderr));
+    if (stderr_fd < 0) {
+        error_reason = "dup stderr failed";
+        ok = false;
+        goto cleanup;
+    }
+
+    if (pipe(pipefd) != 0) {
+        error_reason = "pipe creation failed";
+        ok = false;
+        goto cleanup;
+    }
+
+    if (fflush(stderr) != 0) {
+        error_reason = "stderr flush failed";
+        ok = false;
+        goto cleanup_with_pipe;
+    }
+
+    if (dup2(pipefd[1], fileno(stderr)) < 0) {
+        error_reason = "dup2 redirect failed";
+        ok = false;
+        goto cleanup_with_pipe;
+    }
+
+    close(pipefd[1]);
+    pipefd[1] = -1;
+
+    td_log_writef(TD_LOG_INFO, "logtest", "hello world");
+    fflush(stderr);
+
+    char buffer[256];
+    ssize_t bytes = read(pipefd[0], buffer, sizeof(buffer) - 1);
+    if (bytes <= 0) {
+        error_reason = "failed to capture log output";
+        ok = false;
+        goto cleanup_with_pipe;
+    }
+
+    buffer[bytes] = '\0';
+    close(pipefd[0]);
+    pipefd[0] = -1;
+
+    {
+        char *newline = strchr(buffer, '\n');
+        if (newline) {
+            *newline = '\0';
+        }
+
+        size_t len = strlen(buffer);
+        if (len < 21) {
+            error_reason = "log line too short";
+            ok = false;
+            goto cleanup;
+        }
+
+        const int digit_positions[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
+        for (size_t i = 0; i < sizeof(digit_positions) / sizeof(digit_positions[0]); ++i) {
+            int pos = digit_positions[i];
+            if (!isdigit((unsigned char)buffer[pos])) {
+                error_reason = "timestamp digits missing";
+                ok = false;
+                goto cleanup;
+            }
+        }
+
+        if (buffer[4] != '-' || buffer[7] != '-' || buffer[10] != ' ' || buffer[13] != ':' ||
+            buffer[16] != ':' || buffer[19] != ' ') {
+            error_reason = "timestamp separators mismatch";
+            ok = false;
+            goto cleanup;
+        }
+
+        const char *expected_suffix = " [INFO] logtest: hello world";
+        if (strcmp(buffer + 19, expected_suffix) != 0) {
+            error_reason = "log suffix mismatch";
+            ok = false;
+            goto cleanup;
+        }
+    }
+
+    goto cleanup;
+
+cleanup_with_pipe:
+    if (pipefd[0] >= 0) {
+        close(pipefd[0]);
+        pipefd[0] = -1;
+    }
+    if (pipefd[1] >= 0) {
+        close(pipefd[1]);
+        pipefd[1] = -1;
+    }
+
+cleanup:
+    if (stderr_fd >= 0) {
+        dup2(stderr_fd, fileno(stderr));
+        close(stderr_fd);
+    }
+
+    td_log_set_level(prev_level);
+    td_log_set_sink(prev_sink, prev_ctx);
+
+    if (!ok && error_reason) {
+        fprintf(stderr, "%s\n", error_reason);
+    }
+
+    return ok;
 }
 
 struct query_counter {
@@ -504,6 +628,7 @@ int main(void) {
         const char *name;
         bool (*fn)(void);
     } tests[] = {
+        {"default_log_timestamp", test_default_log_timestamp},
         {"terminal_add_and_event", test_terminal_add_and_event},
         {"probe_failure_removes_terminal", test_probe_failure_removes_terminal},
         {"iface_invalid_holdoff", test_iface_invalid_holdoff},

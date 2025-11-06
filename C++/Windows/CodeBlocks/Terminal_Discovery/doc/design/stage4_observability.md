@@ -15,6 +15,7 @@
 - 当 `max_terminals` 达到上限时，会输出 `terminal_manager` 组件的 WARN 级日志，携带当前数量与被丢弃终端的 MAC/IP，便于观察容量策略触发频次。
 - 主程序新增 `terminal_stats` 组件日志：支持 `kill -USR1 <pid>` 立即打印一次 `terminal_manager_get_stats` 快照，若配置 `stats_log_interval_sec > 0` 则按节奏自动输出，并在收到退出信号时再打印一次终态，方便在线排障。
 - 新终端分配失败（内存不足）统一记录为 ERROR 日志，快速暴露资源耗尽风险。
+- 默认日志 sink（未注入自定义回调时）会在消息前追加 `YYYY-MM-DD HH:MM:SS` 的系统时间戳，便于与外部日志或主机时间同步排查。
 - 虚接口前缀变化、探测失败超阈值等仍沿用 INFO/DEBUG 级别的结构化日志，结合统计指标可还原关键时间线。
 
 ## 指标口径

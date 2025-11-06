@@ -57,7 +57,7 @@ flowchart TD
 
 ### 1. 日志子系统 `common/td_logging`
 - 提供线程安全的日志级别、输出接口（`td_log_writef`）。
-- 默认写 `stderr`，可通过 `td_log_set_sink` 注入外部回调（适配层使用）。
+- 默认写 `stderr`，并在未注入自定义 sink 时为每条日志添加 `YYYY-MM-DD HH:MM:SS` 的系统时间戳；可通过 `td_log_set_sink` 注入外部回调（适配层使用）。
 - `td_log_level_from_string` 支持 CLI 级别解析。
 
 ### 2. 运行时配置 `common/td_config`

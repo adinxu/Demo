@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #ifndef TD_LOG_BUFFER_SIZE
 #define TD_LOG_BUFFER_SIZE 512
@@ -18,7 +19,37 @@ static void *g_log_sink_ctx = NULL;
 static void default_sink(void *ctx, td_log_level_t level, const char *component, const char *message) {
     (void)ctx;
     const char *level_str = td_log_level_to_string(level);
-    fprintf(stderr, "[%s] %s: %s\n", level_str ? level_str : "UNK", component ? component : "core", message);
+
+    char timestamp[20];
+    timestamp[0] = '\0';
+
+    time_t now = time(NULL);
+    if (now != (time_t)-1) {
+        struct tm tm_snapshot;
+        struct tm *tm_result = NULL;
+#if defined(_POSIX_VERSION)
+        tm_result = localtime_r(&now, &tm_snapshot);
+#else
+        struct tm *non_thread_safe = localtime(&now);
+        if (non_thread_safe != NULL) {
+            tm_snapshot = *non_thread_safe;
+            tm_result = &tm_snapshot;
+        }
+#endif
+        if (tm_result != NULL) {
+            if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_result) == 0) {
+                timestamp[0] = '\0';
+            }
+        }
+    }
+
+    const char *ts_display = timestamp[0] != '\0' ? timestamp : "0000-00-00 00:00:00";
+    fprintf(stderr,
+            "%s [%s] %s: %s\n",
+            ts_display,
+            level_str ? level_str : "UNK",
+            component ? component : "core",
+            message);
 }
 
 void td_log_set_level(td_log_level_t level) {
