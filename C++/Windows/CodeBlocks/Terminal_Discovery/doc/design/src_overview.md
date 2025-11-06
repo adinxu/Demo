@@ -86,11 +86,14 @@ flowchart TD
     - 统计字段 `terminal_manager_stats`（Stage 4 新增）。
   - `terminal_entry`
     - 记录 MAC/IP、状态机（`terminal_state_t`）、最近报文时间、探测信息和接口元数据。
+    - 缓存最近一次可用的发包上下文：`tx_iface/tx_ifindex`（仅在需要回退到 VLAN 虚接口时填充）以及 `tx_source_ip`（默认取自可用 VLANIF 的 IPv4，供物理口发包使用）。
   - `terminal_event_record_t`
     - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。
+  - `terminal_probe_request_t`
+    - `terminal_manager_on_timer` 构造的探测快照，包含终端 key、待使用的 VLAN ID、可选的回退接口和 `source_ip`；`terminal_probe_handler` 依据该结构直接生成以物理口为主、虚接口为备的 ARP 请求。
 - **关键函数**：
   - `terminal_manager_create/destroy`：初始化线程、绑定全局单例（`terminal_manager_get_active`）。
-  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，在保留 VLAN ID 以支撑物理口发包的同时，获取可选的 VLANIF `ifindex` 用于校验地址前缀；任一环节失败都会清空回退接口绑定并立刻将终端转入 `IFACE_INVALID`。
+  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，在保留 VLAN ID 以支撑物理口发包的同时，获取可选的 VLANIF `ifindex` 与 `tx_source_ip` 用于构造 ARP；任一环节失败都会清空回退接口绑定并立刻将终端转入 `IFACE_INVALID`。
   - `terminal_manager_on_timer`：由后台线程调用，负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
   - `terminal_manager_on_address_update`：由 netlink 监听器触发的虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。
@@ -120,7 +123,7 @@ flowchart TD
   关键判断逻辑分别位于 `terminal_manager_on_packet`、`terminal_manager_on_timer` 与 `terminal_manager_on_address_update` 中：
   - `terminal_manager_on_packet` 负责刷新 `last_seen`、重置 `failed_probes`，并在 `resolve_tx_interface` 成功时将终端转回 `ACTIVE`。
   - `terminal_manager_on_timer` 在超时后生成 `terminal_probe_request_t`，若探测累计失败则删除条目。
-  - 地址事件清空可用前缀时会调用 `set_state(...IFACE_INVALID)` 并延迟清理。
+  - 地址事件清空可用前缀时会调用 `set_state(...IFACE_INVALID)` 并延迟清理，同时清空 `tx_iface/tx_ifindex/tx_source_ip`，防止后续探测误用过期的 VLANIF。
 
 #### 数据结构关系
 
@@ -151,6 +154,7 @@ classDiagram
     +terminal_metadata meta
     +char tx_iface[IFNAMSIZ]
     +int tx_ifindex
+    +in_addr tx_source_ip
     +terminal_entry* next
   }
   class terminal_key {
@@ -183,6 +187,7 @@ classDiagram
   }
   class iface_prefix_entry {
     +in_addr network
+    +in_addr address
     +uint8_t prefix_len
     +iface_prefix_entry* next
   }
@@ -194,6 +199,14 @@ classDiagram
     +terminal_probe_request_t request
     +probe_task* next
   }
+  class terminal_probe_request_t {
+    +terminal_key key
+    +char tx_iface[IFNAMSIZ]
+    +int tx_ifindex
+    +in_addr source_ip
+    +int vlan_id
+    +terminal_state_t state_before_probe
+  }
   terminal_manager "1" o--> "*" terminal_entry : table
   terminal_manager "1" --> "1" terminal_event_queue
   terminal_event_queue "1" o--> "*" terminal_event_node
@@ -203,6 +216,8 @@ classDiagram
   iface_record "1" o--> "*" iface_binding_entry
   iface_binding_entry "1" --> "1" terminal_entry
   terminal_manager "1" o--> "*" probe_task : pending
+  probe_task "1" --> "1" terminal_probe_request_t
+  terminal_probe_request_t --> terminal_key
   terminal_entry --> terminal_metadata
   terminal_entry --> terminal_key
 ```
@@ -232,7 +247,7 @@ classDiagram
   4. 将适配器报文回调绑定至 `terminal_manager_on_packet`。
   5. 启动适配器并进入主循环（等待信号退出）。
   6. 收到 SIGINT/SIGTERM 后依次停止适配器、销毁管理器、输出 shutdown 日志。
-- `terminal_probe_handler`：实现 `terminal_probe_fn`，将探测请求翻译成 `td_adapter_arp_request` 调用 `send_arp`。
+- `terminal_probe_handler`：实现 `terminal_probe_fn`，按请求中的 VLAN ID 与 `source_ip` 构造物理口 ARP 帧；默认优先走物理接口（例如 `eth0`），仅当 `tx_iface_valid` 标记存在且物理口发送失败时才尝试回退到 VLAN 虚接口。
 - `terminal_event_logger`：默认注册的事件回调，将终端的 `ADD/DEL/MOD` 变更写入结构化日志，便于观察流水线行为或在没有北向监听器时进行测试验证。
 - CLI 支持配置适配器名、接口、保活参数、容量阈值、日志级别等。
 - 通过 `adapter_log_bridge` 将适配器内部日志回落至 `td_logging`。
