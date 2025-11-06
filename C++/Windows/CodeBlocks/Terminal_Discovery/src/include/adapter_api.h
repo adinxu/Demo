@@ -1,6 +1,10 @@
 #ifndef TD_ADAPTER_API_H
 #define TD_ADAPTER_API_H
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <linux/if_ether.h>
 #include <net/if.h>
 #include <netinet/in.h>

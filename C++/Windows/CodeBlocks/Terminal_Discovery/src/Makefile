@@ -17,7 +17,7 @@ CC := $(if $(TOOLCHAIN_PREFIX),$(TOOLCHAIN_PREFIX)gcc,$(CC))
 
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 CFLAGS += -Iinclude -pthread
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
+CXXFLAGS ?= -std=gnu++11 -O2 -Wall -Wextra -Wpedantic
 CXXFLAGS += -Iinclude -pthread
 LDFLAGS ?=
 LDLIBS ?=

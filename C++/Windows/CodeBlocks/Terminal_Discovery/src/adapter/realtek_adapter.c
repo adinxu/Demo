@@ -12,7 +12,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include "td_atomic.h"
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
