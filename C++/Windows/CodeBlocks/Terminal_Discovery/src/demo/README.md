@@ -61,3 +61,9 @@ sudo ./stage0_raw_socket_demo \
 - 仅支持 Linux，需要 Raw Socket 权限；
 - 目前仅解析最外层 802.1Q 标签，更多嵌套标签可通过 `--verbose` 的十六进制输出查看；
 - 按阶段 0 目标，仅关注 ARP 协议。
+
+## MAC 表桥接辅助模块
+
+- `td_switch_mac_demo.c`/`td_switch_mac_demo.h` 提供无入口函数的辅助逻辑，可与外部团队交付的 C++ 桥接模块一同编译；
+- 外部 demo 在完成桥接模块初始化后调用 `td_switch_mac_demo_dump()`，即可打印桥接接口返回的 MAC/VLAN/ifindex 信息；函数会先调用 `td_switch_mac_get_capacity()` 估算缓存需求，再一次性分配缓冲区并触发 `td_switch_mac_snapshot()`，常规输出写入标准输出，错误信息写入标准错误；由于底层 `getDevUcMacAddress` 不检查缓冲区大小，请务必保证桥接层返回的容量与实际条目数一致；
+- 辅助模块依赖 `td_switch_mac_bridge.h` 中声明的 `td_switch_mac_snapshot` 与 `td_switch_mac_entry_t`，若桥接模块接口发生变化需同步调整。

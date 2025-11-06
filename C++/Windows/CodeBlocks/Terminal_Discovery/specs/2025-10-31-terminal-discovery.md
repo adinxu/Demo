@@ -45,7 +45,7 @@
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
 - **平台适配接口（PAI）**：抽象报文收发、接口事件等平台差异。
    - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
-   - 若后续平台报文携带 CPU tag，则须从中解析交换芯片逻辑口（lport），表征物理口来源；lport 与内核 ifindex 概念不同，仅用于事件的端口变更检测与上报，不参与发包接口选择。
+   - 若后续平台报文携带 CPU tag，则可从中解析交换芯片逻辑口（lport）以辅助定位；Realtek 平台事件需上报整机 ifindex（仍使用 32 位无符号整数），该值由 lport 与接口类型换算得到，不再直接上报 lport。
    - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
    - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
 - **事件总线**：内部队列负责聚合终端变更并立即投递给上报子系统。
@@ -59,17 +59,20 @@
    - 报文发送推荐直接在物理口（例如 `eth0`）的 Raw Socket 上封装 802.1Q 头部完成 VLAN tag 后下发，无需为不同 VLAN 反复绑定对应的虚接口；若目标平台不允许用户态插入 VLAN tag，再回退到绑定虚接口（例如 `vlan1`）的模式。
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
    - 在 Realtek 平台使用 Raw Socket 绑定 `eth0` 收包时，`recvmsg` 返回的 `ifindex` 恒为 `eth0` 的索引；该值仅用于日志或入向定位，不能直接用于选择后续 ARP 发送接口，保活发包仍需依据终端绑定的 VLAN 信息。
+   - Realtek 平台无法依赖 CPU tag 直接获得整机 ifindex，需要借助外部团队提供的 C++ 封装拉取整机二层转发表，按终端 MAC 查找逻辑口，再结合接口类型换算出 ifindex 用于事件上报与北向 `TerminalInfo`。
+   - 底层 `libswitchapp.so` 的调用（例如 `createSwitch`、`getDevUcMacAddress`）统一由外部团队提供的桥接模块完成，该模块在装载阶段自行完成一次性 `createSwitch` 初始化并缓存返回的 `SwitchDev*`；对外至少导出两个 C 接口：`int td_switch_mac_snapshot(td_switch_mac_entry_t *buf, uint32_t *inout_count)`（命名可调整）与 `int td_switch_mac_get_capacity(uint32_t *out_capacity)`。后者仅调用缓存的 `SwitchDev*` 上的 `getDevMacMaxSize` 获取设备可容纳的最大 MAC 表项数，前者基于同一 `SwitchDev*` 调用 `getDevUcMacAddress` 获取当前快照；实现可参考 `src/ref/realtek/mgmt_switch_mac.c` 中 `getDevMacMaxSize`/`getDevUcMacAddress` 的使用方式，同时确保外部模块内部负责引用计数与线程安全；需注意 Realtek SDK 的 `getDevUcMacAddress` 不会校验缓冲区长度，因此桥接模块必须自行保证返回的条目数量不超过调用方提供的容量。终端发现进程只需要调用这两个 C 接口并处理返回值。
+   - 桥接模块由外部团队以 C++ 源文件形式交付，与终端发现项目一同编译；其返回的数据结构不直接暴露 SDK 内部的 `SwUcMacEntry`，而是提供对齐需求的 `td_switch_mac_entry_t`：字段包含 `uint8_t mac[6]`、`uint16_t vlan`、`uint32_t ifindex`、`uint32_t attr`（语义对应 `SwUcMacEntry.attr`）；这样可在不依赖 SDK 头文件的情况下保持 ABI 稳定，并避免结构体布局变化引发二进制兼容性问题。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
    - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
     - 需兼容外部团队既定的 C++ 类型定义：
-   - `struct TerminalInfo { std::string mac; std::string ip; uint32_t port; ModifyTag tag; };`
+   - `struct TerminalInfo { std::string mac; std::string ip; uint32_t ifindex; ModifyTag tag; };`
    - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
    - `typedef void IncReportCb(const MAC_IP_INFO &info);`
     - 导出函数接口保持如下签名：
    - `int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo);`
        - `int setIncrementReport(IncReportCb cb);`
-   - 增量回调载荷包含 MAC、IP、端口与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
+   - 增量回调载荷包含 MAC、IP、ifindex 与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
    - C 入口层通过 `extern "C"` 封装桥接至 C++ 实现，禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
    - `MAC_IP_INFO` 中元素的扩展字段若需新增，必须保持向后兼容并在接口文档中声明。
    - `setIncrementReport` 只允许在初始化阶段调用一次，再次调用时必须返回错误码提醒调用方重复注册。
@@ -86,7 +89,7 @@
 - **报文路径**：
    1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。
-     3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于事件上报端口检查；保活发包仍基于内核接口信息。
+   3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于 ifindex 计算与事件变更检测；保活发包仍基于内核接口信息。
      4. 发送路径依据终端最近一次有效报文关联的三层上下文构造 ARP request，在用户态封装 `ethhdr + vlan_header + ether_arp` 后直接通过物理接口（如 `eth0`）发送；无需为每个 VLAN 重新绑定虚接口，只要写入正确的 VLAN ID 即可保持与发现路径一致。
         - 若目标平台拒绝用户态插入 VLAN tag，则回退到绑定虚接口（如 `vlan1`）的发送方式。Stage0 Raw Socket demo 已验证 Realtek 平台支持物理口带 VLAN tag 的直出策略，需在 demo 与适配器实现中默认采用该模式并保留回退逻辑。
      5. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
@@ -100,8 +103,8 @@
    - 发送保活前必须确认终端仍绑定可用的三层虚接口/VLAN，并沿着发现报文的接口发送 ARP（若接口失效则转入 `IFACE_INVALID` 处理流程）。
    - 探测失败计数递增；第三次失败后移除条目并发出删除事件。
 - **事件上报**：
-   - 增量事件在内部队列中形成批次后立即分发；终端新增、删除、属性变更（仅端口发生变化时产生 `MOD`）分别入队。
-   - 事件载荷使用 `terminal_event_record_t`（MAC/IP/port + ModifyTag），供外层转换为 `MAC_IP_INFO`。
+   - 增量事件在内部队列中形成批次后立即分发；终端新增、删除、属性变更（仅 ifindex 发生变化时产生 `MOD`）分别入队。
+   - 事件载荷使用 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag），供外层转换为 `MAC_IP_INFO`。
    - 全量查询返回当前快照，原始顺序由内部遍历决定；需要排序的上层可自行处理。
 - **并发模型**：
    - 终端核心数据使用读写锁保护；定时线程与报文线程的写操作通过串行化任务队列执行。
@@ -131,7 +134,7 @@
 4. **上报与 API 层**
    - 实现实时的变更通知队列。
    - 提供同步查询接口，返回的快照保持遍历顺序。
-   - 定义输出载荷契约：内部 `terminal_event_record_t`（MAC/IP/port + ModifyTag）转换为携带 `tag` 字段的 `MAC_IP_INFO` 单向量，并撰写桥接文档。
+   - 定义输出载荷契约：内部 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag）转换为携带 `tag` 字段的 `MAC_IP_INFO` 单向量，并撰写桥接文档。
 5. **配置与 CLI 钩子**
    - 提供配置结构体/环境加载器，用于适配器选择、探测间隔、终端阈值。
 6. **日志与遥测**
@@ -150,7 +153,7 @@
 - 在参考硬件上进行 1000 终端的 CPU 剖析，满足性能目标，并形成 200/300/500/1000 档位的资源报告。
 - 提供 Realtek 平台 300 终端 Demo 验证报告，包含测试步骤、网络测试仪配置、日志与瓶颈分析结论。
 - 日志为结构化格式，计数器可通过调试接口或日志输出查看。
-- 在 C/C++ 混合编译环境下完成 `getAllTerminalInfo` 与 `setIncrementReport` 接口的联调验收，验证全量查询完整性、增量回调实时性与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`port` 字段。
+- 在 C/C++ 混合编译环境下完成 `getAllTerminalInfo` 与 `setIncrementReport` 接口的联调验收，验证全量查询完整性、增量回调实时性与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`ifindex` 字段。
 
 ## 替代方案评估
 - 为每个终端创建线程执行保活（因扩展性差而否决）。
