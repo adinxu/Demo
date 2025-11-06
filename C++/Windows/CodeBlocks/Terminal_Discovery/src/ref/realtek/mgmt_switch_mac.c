@@ -36,6 +36,8 @@ ret_code_t ret = m_switchDevPtr->getDevUcMacAddress(m_switchDevPtr, &mac_entry, 
 int createSwitch(SwitchDesc *pDesc, SwitchDev **switchDev);
 
 #define GLB_MAC_ADDR_LEN  6
+typedef unsigned char			uint8;
+typedef unsigned short			uint16;
 
 typedef uint8 mac_addr_t[GLB_MAC_ADDR_LEN];
 

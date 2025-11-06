@@ -9,13 +9,13 @@
 #define TD_SWITCH_MAC_DEFAULT_CAPACITY 1024U
 #define TD_SWITCH_MAC_MAX_CAPACITY 131072U
 
-static const char *td_switch_mac_attr_to_string(uint32_t attr) {
+static const char *td_switch_mac_attr_to_string(td_switch_mac_state_t attr) {
     switch (attr) {
-        case 0:
+        case TD_SWITCH_MAC_STATE_DYNAMIC:
             return "dynamic";
-        case 1:
+        case TD_SWITCH_MAC_STATE_STATIC:
             return "static";
-        case 2:
+        case TD_SWITCH_MAC_STATE_DELETE:
             return "deleted";
         default:
             return "unknown";
@@ -31,10 +31,13 @@ static void td_switch_mac_print_entry(FILE *out, const td_switch_mac_entry_t *en
             entry->vlan,
             entry->ifindex,
             td_switch_mac_attr_to_string(entry->attr),
-            entry->attr);
+            (uint32_t)entry->attr);
 }
 
 int td_switch_mac_demo_dump(void) {
+    static td_switch_mac_entry_t *entries = NULL;  /* 静态复用缓冲区 */
+    static uint32_t entries_capacity = 0;
+
     uint32_t capacity_hint = 0;
     int rc_capacity = td_switch_mac_get_capacity(&capacity_hint);
     if (rc_capacity != 0) {
@@ -63,17 +66,34 @@ int td_switch_mac_demo_dump(void) {
         capacity = TD_SWITCH_MAC_DEFAULT_CAPACITY;
     }
 
-    td_switch_mac_entry_t *entries = calloc(capacity, sizeof(*entries));
-    if (entries == NULL) {
-        fprintf(stderr, "[switch-mac-demo] 分配 %u 项缓存失败: %s\n", capacity, strerror(errno));
-        return -ENOMEM;
+    if (capacity > entries_capacity) {
+        size_t old_capacity = entries_capacity;
+        td_switch_mac_entry_t *tmp = realloc(entries, capacity * sizeof(*entries));
+        if (tmp == NULL) {
+            fprintf(stderr, "[switch-mac-demo] 分配 %u 项缓存失败: %s\n", capacity, strerror(errno));
+            return -ENOMEM;
+        }
+        if (capacity > old_capacity) {
+            size_t new_bytes = (capacity - old_capacity) * sizeof(*entries);
+            memset(tmp + old_capacity, 0, new_bytes);
+        }
+        entries = tmp;
+        entries_capacity = capacity;
+    } else if (entries == NULL) {
+        /* 兼容 capacity==0 情况，确保缓冲区存在 */
+        entries = malloc(capacity * sizeof(*entries));
+        if (entries == NULL) {
+            fprintf(stderr, "[switch-mac-demo] 分配 %u 项缓存失败: %s\n", capacity, strerror(errno));
+            return -ENOMEM;
+        }
+        memset(entries, 0, capacity * sizeof(*entries));
+        entries_capacity = capacity;
     }
 
     uint32_t count = capacity;
     int rc = td_switch_mac_snapshot(entries, &count);
     if (rc != 0) {
         fprintf(stderr, "[switch-mac-demo] 调用 td_switch_mac_snapshot 失败: rc=%d\n", rc);
-        free(entries);
         return rc;
     }
 
@@ -98,6 +118,5 @@ int td_switch_mac_demo_dump(void) {
         td_switch_mac_print_entry(stdout, &entries[i], i);
     }
 
-    free(entries);
     return 0;
 }

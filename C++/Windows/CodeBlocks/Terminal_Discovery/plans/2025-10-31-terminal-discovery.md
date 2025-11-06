@@ -11,7 +11,7 @@
 - 设备上存在网络测试仪或等效工具，可模拟 ≥300 个终端。
 - 暂不考虑软件层面的 ARP 限速策略；若后续平台启用，需要重新评估。
 - 外部团队提供的 C++ API（`MAC_IP_INFO` 及相关回调）按约定稳定，且允许我们在构建链中启用 C/C++ 混合编译。
-- Realtek 二层表访问将依赖外部团队交付的 C++ 桥接模块（提供 C 接口，如 `td_switch_mac_snapshot`），桥接模块在内部可先调用 `getDevMacMaxSize` 估算容量后再调用 `getDevUcMacAddress`，本项目不会直接 `dlopen` 或操作 `SwitchDev`。
+- Realtek 二层表访问将依赖外部团队交付的 C++ 桥接模块（提供 C 接口，如 `td_switch_mac_snapshot`），桥接负责封装 `SwitchDev*` 创建与 SDK 函数入口，但不会主动调用 `getDevMacMaxSize` 或 `getDevUcMacAddress`；容量查询与快照均由本项目（含 demo）发起，并向桥接传递调用侧准备的 `SwUcMacEntry` 缓冲区。本项目不会直接 `dlopen` 或操作 `SwitchDev`。
 - 项目默认采用 C 语言实现；仅在对接外部 C++ ABI 时引入必要的桥接代码。
 - 当前回调/查询要求输出 `mac`、`ip`、`ifindex` 与变更标签四个字段，并以字符串/整型形式携带；未来扩展将另行评估，回调在初始化阶段注册后保持实时推送。
 - 开发环境为 x86，而目标 Realtek 平台为 MIPS；与硬件相关的测试需在目标平台上手动运行与验证。
@@ -28,14 +28,14 @@
 4. ✅ Demo 校验：使用 stage0 demo 记录 `recvmsg` 返回的 ifindex/接口名，确认物理口 `eth0` 收到报文后解析出的接口名恒为 `eth0`，不能直接用于选择后续 ARP 发包接口，仍需依据终端绑定的 VLAN 元数据决定报文内容。
 5. ✅ VLAN tag 直出验证：扩展 stage0 demo 支持 `--tx-iface` + `--tx-vlan` 在用户态封装 802.1Q header 并直接从物理口发包，记录成功/失败条件及平台差异；该模式现已作为主线发包策略输入，虚接口绑定作为回退选项。
 6. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
-7. ⏳ 新增 MAC 表桥接验证 demo：待外部团队交付 C++ 桥接源文件及其 C 接口后，在其独立验证程序中编译本项目提供的 C 辅助模块（仅实现快照调用逻辑，不含 `main`），由外部 demo 的入口函数先调用桥接模块暴露的 `td_switch_mac_get_capacity`（或等效 API）估算最大条目，再调用 `td_switch_mac_snapshot` 输出 MAC/VLAN/ifindex；桥接内部在装载阶段完成一次性 `createSwitch` 并缓存 `SwitchDev*`，后续容量与快照调用分别转发至 `getDevMacMaxSize`/`getDevUcMacAddress`；需重点确认桥接层能够依据容量返回真实条目总数，因为底层 `getDevUcMacAddress` 不会检查缓冲区大小；通过验证后，demo 结果作为生产集成的参考样板。
+7. ⏳ 新增 MAC 表桥接验证 demo：待外部团队交付 C++ 桥接源文件及其 C 接口后，在其独立验证程序中编译本项目提供的 C 辅助模块（仅实现快照调用逻辑，不含 `main`），由外部 demo 的入口函数先调用桥接模块暴露的 `td_switch_mac_get_capacity`（或等效 API）估算最大条目，再由 demo 侧使用该容量分配/复用 `SwUcMacEntry` 数组并传递给 `td_switch_mac_snapshot` 输出 MAC/VLAN/ifindex；桥接内部在装载阶段完成一次性 `createSwitch` 并缓存 `SwitchDev*`，等待调用侧驱动 SDK (`getDevMacMaxSize`、`getDevUcMacAddress`)；不得自行扩容、轮询或转换结构；需重点确认桥接层能够依据容量返回真实条目总数，因为底层 `getDevUcMacAddress` 不会检查缓冲区大小；通过验证后，demo 结果作为生产集成的参考样板。
 
 ### 阶段 1：适配层设计与实现（已完成）
 1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
 2. ✅ Realtek 适配器：
    - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带 lport 的能力；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；默认在物理接口 `eth0` 的原始套接字中封装 802.1Q 头直接发包，优先采用请求内的 VLAN/接口信息生成帧；若驱动拒绝用户态 VLAN tag，则回退到绑定虚接口（如 `vlan1`），发送前仍会查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
-   - MAC 表拉取：在 demo 验证通过的基础上集成外部桥接模块提供的 C 接口（如 `td_switch_mac_snapshot`），周期性/按需拉取 `td_switch_mac_entry_t` 缓存，转换为内部 `ifindex/vlan` 映射供终端管理器检索；需要定义缓冲区容量、重试回退与错误日志，并确保桥接模块初始化失败时不会阻塞主线程。
+   - MAC 表拉取：在 demo 验证通过的基础上集成外部桥接模块提供的 C 接口（如 `td_switch_mac_snapshot`），由适配层显式触发容量查询与快照，周期性/按需复用调用侧维护的 `SwUcMacEntry` 数组，拉取并解析为内部 `ifindex/vlan` 映射供终端管理器检索；需要在适配层自行管理缓冲区容量、重试回退与错误日志，并确保桥接模块初始化失败时不会阻塞主线程。
    - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；当前通过公共模块 `terminal_netlink` 在管理器创建后启动监听线程，保活节奏仍在终端引擎线程内统一调度。
    - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
 3. ✅ 公共组件：
@@ -92,7 +92,7 @@
 4. ✳️ 打桩测试扩展方向：
    - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
    - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
-   - Realtek MAC 表桥接：使用打桩接口模拟桥接 C API（如 `td_switch_mac_snapshot`）成功与失败，验证 ifindex 解析缓存、重试节奏与错误日志。
+   - Realtek MAC 表桥接：使用打桩接口模拟桥接 C API（如 `td_switch_mac_snapshot`）成功与失败，验证 ifindex 解析缓存、重试节奏与错误日志；同时确认调用侧缓冲区复用路径在容量不足、溢出提示等场景下的健壮性。
    - 配置转换：对 `td_config_to_manager_config` 提供边界输入（0、极大值）确保默认兜底与错误码表现正确。
    - 统计日志：替换日志 sink，驱动 `g_should_dump_stats` 触发，确认 `terminal_stats` 字段完整性与节奏控制。
 4. ⏳ 实机/压力验证：
