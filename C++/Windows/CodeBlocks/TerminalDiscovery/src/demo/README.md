@@ -65,5 +65,5 @@ sudo ./stage0_raw_socket_demo \
 ## MAC 表桥接辅助模块
 
 - `td_switch_mac_demo.c`/`td_switch_mac_demo.h` 提供无入口函数的辅助逻辑，可与外部团队交付的 C++ 桥接模块一同编译；
-- 外部 demo 在完成桥接模块初始化后调用 `td_switch_mac_demo_dump()`，即可打印桥接接口返回的 MAC/VLAN/ifindex 信息；函数首次运行时调用一次 `td_switch_mac_get_capacity()` 缓存最大条目数，并基于该值一次性 `calloc` 分配 `SwUcMacEntry` 缓冲区，后续快照均复用同一块内存；`td_switch_mac_snapshot()` 仅通过输出参数返回实际条目数，调用前无需为 `count` 填充初值；常规输出写入标准输出，错误信息写入标准错误；由于底层 `getDevUcMacAddress` 不检查缓冲区大小，请务必保证桥接层返回的容量与实际条目数一致，并在桥接内部复用调用侧传入的 `SwUcMacEntry` 缓冲区；
+- 外部 demo 在完成桥接模块初始化后调用 `td_switch_mac_demo_dump()`，即可打印桥接接口返回的 MAC/VLAN/ifindex 信息；函数首次运行时调用一次 `td_switch_mac_get_capacity()` 缓存最大条目数，并基于该值一次性 `calloc` 分配 `SwUcMacEntry` 缓冲区，后续快照均复用同一块内存；`td_switch_mac_snapshot()` 仅通过输出参数返回实际条目数，调用前无需为 `count` 填充初值；所有日志与表格均写入标准输出，便于统一采集；由于底层 `getDevUcMacAddress` 不检查缓冲区大小，请务必保证桥接层返回的容量与实际条目数一致，并在桥接内部复用调用侧传入的 `SwUcMacEntry` 缓冲区；
 - 辅助模块依赖 `td_switch_mac_bridge.h` 中声明的 `td_switch_mac_snapshot` 与 `SwUcMacEntry` 类型，该头默认完全复用 `src/ref/realtek/mgmt_switch_mac.c`中的定义; 接口调整时需同步更新此辅助模块。

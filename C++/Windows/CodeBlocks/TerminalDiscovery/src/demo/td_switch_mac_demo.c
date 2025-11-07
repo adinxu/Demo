@@ -46,20 +46,20 @@ int td_switch_mac_demo_dump(void) {
         uint32_t queried_capacity = 0;
         int rc_capacity = td_switch_mac_get_capacity(&queried_capacity);
         if (rc_capacity != 0) {
-            fprintf(stderr,
+        fprintf(stdout,
                     "[switch-mac-demo] 调用 td_switch_mac_get_capacity 失败: rc=%d, 使用默认容量 %u\n",
                     rc_capacity,
                     TD_SWITCH_MAC_DEFAULT_CAPACITY);
             queried_capacity = TD_SWITCH_MAC_DEFAULT_CAPACITY;
         } else if (queried_capacity == 0) {
-            fprintf(stderr,
+        fprintf(stdout,
                     "[switch-mac-demo] td_switch_mac_get_capacity 返回 0, 回退到默认容量 %u\n",
                     TD_SWITCH_MAC_DEFAULT_CAPACITY);
             queried_capacity = TD_SWITCH_MAC_DEFAULT_CAPACITY;
         }
 
         if (queried_capacity > TD_SWITCH_MAC_MAX_CAPACITY) {
-            fprintf(stderr,
+        fprintf(stdout,
                     "[switch-mac-demo] td_switch_mac_get_capacity 返回 %u, 超出上限 %u, 取上限值\n",
                     queried_capacity,
                     TD_SWITCH_MAC_MAX_CAPACITY);
@@ -75,7 +75,7 @@ int td_switch_mac_demo_dump(void) {
     if (entries == NULL) {
         entries = calloc(capacity, sizeof(*entries));
         if (entries == NULL) {
-            fprintf(stderr, "[switch-mac-demo] 分配 %u 项缓存失败: %s\n", capacity, strerror(errno));
+            fprintf(stdout, "[switch-mac-demo] 分配 %u 项缓存失败: %s\n", capacity, strerror(errno));
             return -ENOMEM;
         }
     }
@@ -83,19 +83,19 @@ int td_switch_mac_demo_dump(void) {
     uint32_t count = 0;
     int rc_snapshot = td_switch_mac_snapshot(entries, &count);
     if (rc_snapshot != 0) {
-        fprintf(stderr, "[switch-mac-demo] 调用 td_switch_mac_snapshot 失败: rc=%d\n", rc_snapshot);
+    fprintf(stdout, "[switch-mac-demo] 调用 td_switch_mac_snapshot 失败: rc=%d\n", rc_snapshot);
         return rc_snapshot;
     }
 
     if (count > capacity) {
-        fprintf(stderr,
+    fprintf(stdout,
                 "[switch-mac-demo] 警告: 桥接返回条目数 %u 超过缓冲区容量 %u，输出结果可能不完整\n",
                 count,
                 capacity);
         count = capacity;
     }
 
-    fprintf(stderr,
+    fprintf(stdout,
         "[switch-mac-demo] 快照成功: 容量提示=%u, 使用缓存=%u, 条目数=%u\n",
         g_cached_capacity_hint,
             capacity,
