@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include "td_atomic.h"
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -141,7 +142,11 @@ static void mac_cache_init(struct realtek_mac_cache *cache) {
     cache->ttl_ms = TD_REALTEK_MAC_CACHE_TTL_MS;
     pthread_rwlock_init(&cache->map_lock, NULL);
     pthread_mutex_init(&cache->worker_lock, NULL);
-    pthread_cond_init(&cache->worker_cond, NULL);
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&cache->worker_cond, &attr);
+    pthread_condattr_destroy(&attr);
 }
 
 static void *mac_cache_worker_main(void *arg);
@@ -199,6 +204,7 @@ static void mac_cache_stop_worker(struct td_adapter *adapter) {
     cache->worker_started = false;
     cache->worker_stop = false;
     cache->refresh_requested = false;
+    cache->worker_thread = (pthread_t)0;
     pthread_mutex_unlock(&cache->worker_lock);
 }
 
@@ -443,6 +449,7 @@ static void mac_cache_clear_buckets(struct realtek_mac_cache *cache) {
     if (!cache) {
         return;
     }
+    cache->used = 0;
     for (size_t i = 0; i < TD_REALTEK_MAC_BUCKET_COUNT; ++i) {
         struct mac_bucket_entry *node = cache->buckets[i];
         while (node) {
@@ -550,35 +557,47 @@ static bool mac_cache_refresh(struct td_adapter *adapter, bool force) {
         return false;
     }
 
-    struct realtek_mac_cache *cache = &adapter->mac_cache;
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    if (!force && !mac_cache_should_refresh(cache, &now)) {
-        return true;
-    }
-
     if (!mac_cache_ensure_capacity(adapter)) {
         return false;
     }
 
-    cache->last_attempt = now;
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    pthread_rwlock_wrlock(&cache->map_lock);
+
+    if (!force && cache->version != 0ULL && !mac_cache_should_refresh(cache, &start)) {
+        pthread_rwlock_unlock(&cache->map_lock);
+        return true;
+    }
+
+    cache->last_attempt = start;
 
     uint32_t count = 0;
     int rc = td_switch_mac_snapshot(cache->entries, &count);
     if (rc != 0) {
+        pthread_rwlock_unlock(&cache->map_lock);
         realtek_logf(adapter, TD_LOG_WARN, "td_switch_mac_snapshot failed: %d", rc);
+        pthread_mutex_lock(&cache->worker_lock);
+        td_adapter_mac_locator_refresh_cb cb = cache->refresh_cb;
+        void *ctx = cache->refresh_ctx;
+        pthread_mutex_unlock(&cache->worker_lock);
+        if (cb) {
+            cb(0ULL, ctx);
+        }
         return false;
     }
-    if (count > cache->capacity) {
-        realtek_logf(adapter, TD_LOG_WARN, "snapshot count %u exceeds capacity %u, truncating", count, cache->capacity);
+
+    uint32_t snapshot_count = count;
+    if (snapshot_count > cache->capacity) {
+        realtek_logf(adapter, TD_LOG_WARN, "snapshot count %u exceeds capacity %u, truncating", snapshot_count, cache->capacity);
         count = cache->capacity;
     }
 
-    uint32_t inserted = 0;
-    pthread_rwlock_wrlock(&cache->map_lock);
     mac_cache_clear_buckets(cache);
+
+    uint32_t inserted = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const SwUcMacEntry *entry = &cache->entries[i];
         struct mac_bucket_entry *node = calloc(1, sizeof(*node));
@@ -594,14 +613,36 @@ static bool mac_cache_refresh(struct td_adapter *adapter, bool force) {
         cache->buckets[bucket] = node;
         inserted += 1U;
     }
+
     cache->used = inserted;
     cache->version += 1ULL;
-    cache->last_refresh = now;
+
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    cache->last_refresh = end;
+
+    uint64_t elapsed_ms = timespec_diff_ms(&start, &end);
     uint64_t version = cache->version;
+    bool truncated = inserted < snapshot_count;
+
     pthread_rwlock_unlock(&cache->map_lock);
 
-    if (cache->refresh_cb) {
-        cache->refresh_cb(version, cache->refresh_ctx);
+    pthread_mutex_lock(&cache->worker_lock);
+    td_adapter_mac_locator_refresh_cb cb = cache->refresh_cb;
+    void *ctx = cache->refresh_ctx;
+    pthread_mutex_unlock(&cache->worker_lock);
+
+    if (truncated) {
+        realtek_logf(adapter, TD_LOG_WARN, "MAC cache truncated: inserted=%u snapshot=%u", inserted, snapshot_count);
+    }
+
+    realtek_logf(adapter, TD_LOG_DEBUG, "MAC cache refresh done: version=%" PRIu64 " entries=%u elapsed=%" PRIu64 "ms",
+                 version,
+                 inserted,
+                 elapsed_ms);
+
+    if (cb) {
+        cb(version, ctx);
     }
 
     return true;
@@ -619,7 +660,12 @@ static void *mac_cache_worker_main(void *arg) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
 
-        bool should_refresh = cache->refresh_requested || mac_cache_should_refresh(cache, &now);
+        bool stale = false;
+        pthread_rwlock_rdlock(&cache->map_lock);
+        stale = mac_cache_should_refresh(cache, &now);
+        pthread_rwlock_unlock(&cache->map_lock);
+
+        bool should_refresh = cache->refresh_requested || stale;
         if (!should_refresh) {
             struct timespec wake = timespec_add_ms(&now, cache->ttl_ms);
             (void)pthread_cond_timedwait(&cache->worker_cond, &cache->worker_lock, &wake);
@@ -840,6 +886,14 @@ static td_adapter_result_t realtek_init(const struct td_adapter_config *cfg,
     pthread_mutex_init(&adapter->send_lock, NULL);
 
     mac_cache_init(&adapter->mac_cache);
+
+    if (!mac_cache_ensure_capacity(adapter)) {
+        mac_cache_destroy(adapter);
+        pthread_mutex_destroy(&adapter->state_lock);
+        pthread_mutex_destroy(&adapter->send_lock);
+        free(adapter);
+        return TD_ADAPTER_ERR_NOT_READY;
+    }
 
     *handle_out = adapter;
     realtek_logf(adapter, TD_LOG_INFO, "adapter initialized (rx=%s tx=%s interval=%ums)",
@@ -1250,7 +1304,7 @@ static td_adapter_result_t realtek_mac_locator_subscribe(td_adapter_t *handle,
     pthread_mutex_lock(&cache->worker_lock);
     if (cache->refresh_cb) {
         pthread_mutex_unlock(&cache->worker_lock);
-        return TD_ADAPTER_ERR_INVALID_ARG;
+        return TD_ADAPTER_ERR_ALREADY;
     }
     cache->refresh_cb = cb;
     cache->refresh_ctx = ctx;
