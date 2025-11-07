@@ -275,6 +275,7 @@ int main() {
 
     terminal_manager *mgr = terminal_manager_create(&cfg,
                                                     &g_stub_adapter,
+                                                    nullptr,
                                                     probe_callback,
                                                     &probes);
     if (!mgr) {

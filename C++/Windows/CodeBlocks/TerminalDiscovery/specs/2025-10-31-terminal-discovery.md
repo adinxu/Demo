@@ -65,7 +65,7 @@
        - 打桩逻辑将所有日志写入标准输出，并允许通过环境变量（例如 `TD_SWITCH_MAC_STUB_COUNT`）调整返回条目的数量；调用方传入的缓冲区不足或参数非法时会返回负错误码并打印提示，便于本地调试。
        - 当 SDK 真正接入生产环境时，需在构建脚本中确保真实桥接对象或静态库排在链接顺序前端（或直接禁用打桩文件编译），以便覆盖弱符号并恢复与外部模块一致的行为。
    - `td_switch_mac_demo_dump` 已通过上述桥接接口完成端到端验证，后续 ifindex 获取策略与同步流程应以该 demo 的数据流为基准：终端发现模块通过 demo 辅助逻辑解析 MAC→ifindex 映射，并在核心实现中复用相同的缓冲区及容量缓存策略，确保与外部桥接模块的调用约定一致。
-   - 桥接模块由外部团队以 C++ 源文件形式交付，与终端发现项目一同编译；其返回的数据结构不直接暴露 SDK 内部的 `SwUcMacEntry`，而是提供对齐需求的 `td_switch_mac_entry_t`：字段包含 `uint8_t mac[6]`、`uint16_t vlan`、`uint32_t ifindex`、`uint32_t attr`（语义对应 `SwUcMacEntry.attr`）；这样可在不依赖 SDK 头文件的情况下保持 ABI 稳定，并避免结构体布局变化引发二进制兼容性问题。
+   - 桥接模块由外部团队以 C++ 源文件形式交付，与终端发现项目一同编译；为降低额外拷贝与内存占用，`td_switch_mac_snapshot` 直接返回 SDK 定义的 `SwUcMacEntry` 缓冲区，由调用方按照 `td_switch_mac_get_capacity` 预留的条目上限复用该结构；终端发现进程直接依赖 `SwUcMacEntry` 布局，在编译期包含必要的对齐定义，并通过文档约定补充字段语义。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
    - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。

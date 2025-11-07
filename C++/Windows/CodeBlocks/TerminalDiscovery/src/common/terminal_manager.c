@@ -58,6 +58,13 @@ struct probe_task {
     struct probe_task *next;
 };
 
+struct mac_lookup_task {
+    struct terminal_key key;
+    int vlan_id;
+    bool verify;
+    struct mac_lookup_task *next;
+};
+
 struct iface_prefix_entry {
     struct in_addr network;
     struct in_addr address;
@@ -82,6 +89,7 @@ static struct terminal_manager *g_active_manager = NULL;
 
 static void bind_active_manager(struct terminal_manager *mgr);
 static void unbind_active_manager(struct terminal_manager *mgr);
+static void mac_locator_on_refresh(uint64_t version, void *ctx);
 
 struct terminal_manager *terminal_manager_get_active(void) {
     pthread_mutex_lock(&g_active_manager_mutex);
@@ -93,6 +101,8 @@ struct terminal_manager *terminal_manager_get_active(void) {
 struct terminal_manager {
     struct terminal_manager_config cfg;
     td_adapter_t *adapter;
+    const struct td_adapter_ops *adapter_ops;
+    const struct td_adapter_mac_locator_ops *mac_locator_ops;
     terminal_probe_fn probe_cb;
     void *probe_ctx;
 
@@ -112,6 +122,13 @@ struct terminal_manager {
     size_t max_terminals;
     struct terminal_manager_stats stats;
     struct iface_record *iface_records;
+    struct mac_lookup_task *mac_need_refresh_head;
+    struct mac_lookup_task *mac_need_refresh_tail;
+    struct mac_lookup_task *mac_pending_verify_head;
+    struct mac_lookup_task *mac_pending_verify_tail;
+    uint64_t mac_locator_version;
+    bool mac_locator_subscribed;
+    bool destroying;
 };
 
 static bool is_iface_available(const struct terminal_entry *entry);
@@ -223,6 +240,70 @@ static size_t hash_key(const struct terminal_key *key) {
         hash *= 1099511628211ULL;
     }
     return (size_t)hash;
+}
+
+static struct mac_lookup_task *mac_lookup_task_create(const struct terminal_key *key,
+                                                     int vlan_id,
+                                                     bool verify) {
+    if (!key) {
+        return NULL;
+    }
+    struct mac_lookup_task *task = calloc(1, sizeof(*task));
+    if (!task) {
+        return NULL;
+    }
+    task->key = *key;
+    task->vlan_id = vlan_id;
+    task->verify = verify;
+    task->next = NULL;
+    return task;
+}
+
+static void mac_lookup_task_append_node(struct mac_lookup_task **head,
+                                        struct mac_lookup_task **tail,
+                                        struct mac_lookup_task *node) {
+    if (!head || !tail || !node) {
+        return;
+    }
+    node->next = NULL;
+    if (!*head) {
+        *head = node;
+        *tail = node;
+    } else {
+        (*tail)->next = node;
+        *tail = node;
+    }
+}
+
+static void mac_lookup_task_list_free(struct mac_lookup_task *head) {
+    while (head) {
+        struct mac_lookup_task *next = head->next;
+        free(head);
+        head = next;
+    }
+}
+
+static void enqueue_need_refresh(struct terminal_manager *mgr, struct terminal_entry *entry) {
+    if (!mgr || !entry) {
+        return;
+    }
+    if (entry->mac_refresh_enqueued) {
+        return;
+    }
+    if (entry->meta.vlan_id < 0) {
+        return;
+    }
+    struct mac_lookup_task *task = mac_lookup_task_create(&entry->key, entry->meta.vlan_id, false);
+    if (!task) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "failed to allocate mac refresh task for queue");
+        return;
+    }
+    mac_lookup_task_append_node(&mgr->mac_need_refresh_head,
+                                &mgr->mac_need_refresh_tail,
+                                task);
+    entry->mac_refresh_enqueued = true;
 }
 
 static void format_terminal_identity(const struct terminal_key *key,
@@ -844,9 +925,12 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
     memset(&entry->meta, 0, sizeof(entry->meta));
     entry->meta.vlan_id = -1;
     entry->meta.ifindex = 0U;
+    entry->meta.mac_view_version = 0ULL;
     entry->tx_iface[0] = '\0';
     entry->tx_kernel_ifindex = -1;
     entry->tx_source_ip.s_addr = 0;
+    entry->mac_refresh_enqueued = false;
+    entry->mac_verify_enqueued = false;
     entry->next = NULL;
 
     if (packet) {
@@ -858,6 +942,7 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
                                                   td_adapter_t *adapter,
+                                                  const struct td_adapter_ops *adapter_ops,
                                                   terminal_probe_fn probe_cb,
                                                   void *probe_ctx) {
     if (!cfg || !adapter) {
@@ -889,6 +974,8 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
         mgr->cfg.max_terminals = TERMINAL_DEFAULT_MAX_TERMINALS;
     }
     mgr->adapter = adapter;
+    mgr->adapter_ops = adapter_ops;
+    mgr->mac_locator_ops = adapter_ops ? adapter_ops->mac_locator_ops : NULL;
     mgr->probe_cb = probe_cb;
     mgr->probe_ctx = probe_ctx;
     pthread_mutex_init(&mgr->lock, NULL);
@@ -909,6 +996,13 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->terminal_count = 0;
     mgr->max_terminals = mgr->cfg.max_terminals;
     memset(&mgr->stats, 0, sizeof(mgr->stats));
+    mgr->mac_need_refresh_head = NULL;
+    mgr->mac_need_refresh_tail = NULL;
+    mgr->mac_pending_verify_head = NULL;
+    mgr->mac_pending_verify_tail = NULL;
+    mgr->mac_locator_version = 0ULL;
+    mgr->mac_locator_subscribed = false;
+    mgr->destroying = false;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         mgr->table[i] = NULL;
@@ -918,6 +1012,30 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
         mgr->worker_started = true;
     } else {
         td_log_writef(TD_LOG_ERROR, "terminal_manager", "failed to start timer worker thread");
+    }
+
+    if (mgr->mac_locator_ops && mgr->mac_locator_ops->lookup && mgr->mac_locator_ops->subscribe) {
+        uint64_t version = 0ULL;
+        if (mgr->mac_locator_ops->get_version &&
+            mgr->mac_locator_ops->get_version(mgr->adapter, &version) == TD_ADAPTER_OK) {
+            mgr->mac_locator_version = version;
+        }
+
+        td_adapter_result_t sub_rc = mgr->mac_locator_ops->subscribe(mgr->adapter,
+                                                                      mac_locator_on_refresh,
+                                                                      mgr);
+        if (sub_rc == TD_ADAPTER_OK) {
+            mgr->mac_locator_subscribed = true;
+        } else if (sub_rc == TD_ADAPTER_ERR_ALREADY) {
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_manager",
+                          "mac locator already has a subscriber; refresh callbacks disabled");
+        } else {
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_manager",
+                          "mac locator subscribe failed: %d",
+                          sub_rc);
+        }
     }
 
     bind_active_manager(mgr);
@@ -930,6 +1048,7 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
         return;
     }
 
+    mgr->destroying = true;
     unbind_active_manager(mgr);
 
     pthread_mutex_lock(&mgr->worker_lock);
@@ -943,6 +1062,12 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
     }
 
     pthread_mutex_lock(&mgr->lock);
+    mac_lookup_task_list_free(mgr->mac_need_refresh_head);
+    mac_lookup_task_list_free(mgr->mac_pending_verify_head);
+    mgr->mac_need_refresh_head = NULL;
+    mgr->mac_need_refresh_tail = NULL;
+    mgr->mac_pending_verify_head = NULL;
+    mgr->mac_pending_verify_tail = NULL;
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         struct terminal_entry *node = mgr->table[i];
         while (node) {
@@ -1008,6 +1133,100 @@ static void set_state(struct terminal_entry *entry, terminal_state_t new_state) 
     entry->state = new_state;
 }
 
+static void mac_lookup_apply_result(struct terminal_manager *mgr,
+                                    const struct mac_lookup_task *task,
+                                    td_adapter_result_t rc,
+                                    uint32_t ifindex,
+                                    uint64_t version) {
+    if (!mgr || !task) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    if (mgr->destroying) {
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+
+    if (version > mgr->mac_locator_version) {
+        mgr->mac_locator_version = version;
+    }
+
+    size_t bucket = hash_key(&task->key) % TERMINAL_BUCKET_COUNT;
+    struct terminal_entry *entry = find_entry(mgr, &task->key, bucket, NULL);
+    if (!entry) {
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+
+    if (task->verify) {
+        entry->mac_verify_enqueued = false;
+    } else {
+        entry->mac_refresh_enqueued = false;
+    }
+
+    if (rc == TD_ADAPTER_OK) {
+        uint32_t before_ifindex = entry->meta.ifindex;
+        entry->meta.ifindex = ifindex;
+        entry->meta.mac_view_version = version;
+        if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
+            queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+        }
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+
+    if (task->verify) {
+        uint32_t before_ifindex = entry->meta.ifindex;
+        if (rc == TD_ADAPTER_ERR_NOT_READY) {
+            entry->meta.ifindex = 0;
+            if (version > 0 && version >= entry->meta.mac_view_version) {
+                entry->meta.mac_view_version = version;
+            }
+        }
+        if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
+            queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+        }
+    } else {
+        if (rc == TD_ADAPTER_ERR_NOT_READY) {
+            enqueue_need_refresh(mgr, entry);
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+static void mac_lookup_execute(struct terminal_manager *mgr,
+                               struct mac_lookup_task *tasks) {
+    if (!mgr) {
+        mac_lookup_task_list_free(tasks);
+        return;
+    }
+
+    struct mac_lookup_task *node = tasks;
+    while (node) {
+        struct mac_lookup_task *next = node->next;
+        td_adapter_result_t rc = TD_ADAPTER_ERR_UNSUPPORTED;
+        uint32_t ifindex = 0;
+        uint64_t version = 0;
+
+        if (mgr->mac_locator_ops && !mgr->destroying && node->vlan_id >= 0) {
+            rc = mgr->mac_locator_ops->lookup(mgr->adapter,
+                                              node->key.mac,
+                                              (uint16_t)node->vlan_id,
+                                              &ifindex,
+                                              &version);
+        }
+
+        mac_lookup_apply_result(mgr, node, rc, ifindex, version);
+        free(node);
+        node = next;
+    }
+
+    terminal_manager_maybe_dispatch_events(mgr);
+}
+
 void terminal_manager_on_packet(struct terminal_manager *mgr,
                                 const struct td_adapter_packet_view *packet) {
     if (!mgr || !packet) {
@@ -1017,6 +1236,9 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     if (packet->payload_len < sizeof(struct ether_arp)) {
         return;
     }
+
+    struct mac_lookup_task *lookup_head = NULL;
+    struct mac_lookup_task *lookup_tail = NULL;
 
     const struct ether_arp *arp = (const struct ether_arp *)packet->payload;
     struct terminal_key key;
@@ -1094,6 +1316,36 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
         set_state(entry, TERMINAL_STATE_ACTIVE);
     }
 
+    if (mgr->mac_locator_ops && entry->meta.vlan_id >= 0) {
+        bool version_ready = mgr->mac_locator_version > 0;
+        bool wants_lookup = false;
+
+        if (entry->meta.ifindex == 0) {
+            wants_lookup = true;
+        } else if (entry->meta.mac_view_version < mgr->mac_locator_version) {
+            wants_lookup = true;
+        } else if (entry->meta.mac_view_version == 0 && !version_ready) {
+            wants_lookup = true;
+        }
+
+        if (wants_lookup) {
+            if (version_ready) {
+                struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
+                                                                      entry->meta.vlan_id,
+                                                                      false);
+                if (task) {
+                    mac_lookup_task_append_node(&lookup_head, &lookup_tail, task);
+                } else {
+                    td_log_writef(TD_LOG_WARN,
+                                  "terminal_manager",
+                                  "failed to allocate immediate mac lookup task");
+                }
+            } else {
+                enqueue_need_refresh(mgr, entry);
+            }
+        }
+    }
+
     if (newly_created) {
         queue_add_event(mgr, entry);
     } else if (have_before_snapshot) {
@@ -1102,7 +1354,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 
     pthread_mutex_unlock(&mgr->lock);
 
-    terminal_manager_maybe_dispatch_events(mgr);
+    mac_lookup_execute(mgr, lookup_head);
 }
 
 static bool is_iface_available(const struct terminal_entry *entry) {
@@ -1135,6 +1387,8 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     struct probe_task *tasks_head = NULL;
     struct probe_task *tasks_tail = NULL;
     bool track_events = mgr->event_cb != NULL;
+    struct mac_lookup_task *lookup_head = NULL;
+    struct mac_lookup_task *lookup_tail = NULL;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         struct terminal_entry **prev_next = &mgr->table[i];
@@ -1148,6 +1402,26 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
             if (track_events) {
                 snapshot_from_entry(entry, &before_snapshot);
                 have_before_snapshot = true;
+            }
+
+            if (mgr->mac_locator_ops && entry->meta.vlan_id >= 0) {
+                if (entry->state == TERMINAL_STATE_IFACE_INVALID) {
+                    if (mgr->mac_locator_version > 0 &&
+                        entry->meta.mac_view_version < mgr->mac_locator_version) {
+                        struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
+                                                                              entry->meta.vlan_id,
+                                                                              false);
+                        if (task) {
+                            mac_lookup_task_append_node(&lookup_head, &lookup_tail, task);
+                        } else {
+                            td_log_writef(TD_LOG_WARN,
+                                          "terminal_manager",
+                                          "failed to allocate timer mac lookup task");
+                        }
+                    } else if (mgr->mac_locator_version == 0 && entry->meta.ifindex == 0) {
+                        enqueue_need_refresh(mgr, entry);
+                    }
+                }
             }
 
             if (has_expired(mgr, entry, &now)) {
@@ -1239,6 +1513,8 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
 
     pthread_mutex_unlock(&mgr->lock);
 
+    mac_lookup_execute(mgr, lookup_head);
+
     /* Execute probe callbacks outside the manager lock to avoid deadlocks. */
     struct probe_task *task = tasks_head;
     while (task) {
@@ -1251,6 +1527,90 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     }
 
     terminal_manager_maybe_dispatch_events(mgr);
+}
+
+static void mac_locator_on_refresh(uint64_t version, void *ctx) {
+    struct terminal_manager *mgr = (struct terminal_manager *)ctx;
+    if (!mgr || mgr->destroying) {
+        return;
+    }
+
+    struct mac_lookup_task *refresh_head = NULL;
+    struct mac_lookup_task *refresh_tail = NULL;
+    struct mac_lookup_task *verify_head = NULL;
+    struct mac_lookup_task *verify_tail = NULL;
+
+    pthread_mutex_lock(&mgr->lock);
+
+    if (mgr->destroying) {
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+
+    if (version == 0ULL) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "mac locator refresh reported failure (version=0)");
+        pthread_mutex_unlock(&mgr->lock);
+        return;
+    }
+
+    if (version > mgr->mac_locator_version) {
+        mgr->mac_locator_version = version;
+    }
+
+    refresh_head = mgr->mac_need_refresh_head;
+    refresh_tail = mgr->mac_need_refresh_tail;
+    mgr->mac_need_refresh_head = NULL;
+    mgr->mac_need_refresh_tail = NULL;
+
+    verify_head = mgr->mac_pending_verify_head;
+    verify_tail = mgr->mac_pending_verify_tail;
+    mgr->mac_pending_verify_head = NULL;
+    mgr->mac_pending_verify_tail = NULL;
+
+    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
+        for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
+            if (entry->meta.vlan_id < 0) {
+                continue;
+            }
+
+            if (entry->meta.ifindex == 0) {
+                if (!entry->mac_refresh_enqueued) {
+                    struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
+                                                                          entry->meta.vlan_id,
+                                                                          false);
+                    if (task) {
+                        mac_lookup_task_append_node(&refresh_head, &refresh_tail, task);
+                        entry->mac_refresh_enqueued = true;
+                    } else {
+                        td_log_writef(TD_LOG_WARN,
+                                      "terminal_manager",
+                                      "failed to allocate mac refresh task on callback");
+                    }
+                }
+            } else if (entry->meta.mac_view_version < version) {
+                if (!entry->mac_verify_enqueued) {
+                    struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
+                                                                          entry->meta.vlan_id,
+                                                                          true);
+                    if (task) {
+                        mac_lookup_task_append_node(&verify_head, &verify_tail, task);
+                        entry->mac_verify_enqueued = true;
+                    } else {
+                        td_log_writef(TD_LOG_WARN,
+                                      "terminal_manager",
+                                      "failed to allocate mac verify task on callback");
+                    }
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+
+    mac_lookup_execute(mgr, refresh_head);
+    mac_lookup_execute(mgr, verify_head);
 }
 
 void terminal_manager_on_address_update(struct terminal_manager *mgr,

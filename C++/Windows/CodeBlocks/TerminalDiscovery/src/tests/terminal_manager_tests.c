@@ -304,6 +304,7 @@ static bool test_terminal_add_and_event(void) {
 
     struct terminal_manager *mgr = terminal_manager_create(&cfg,
                                                             &g_stub_adapter,
+                                                            NULL,
                                                             probe_callback,
                                                             &probes);
     if (!mgr) {
@@ -388,6 +389,7 @@ static bool test_probe_failure_removes_terminal(void) {
 
     struct terminal_manager *mgr = terminal_manager_create(&cfg,
                                                             &g_stub_adapter,
+                                                            NULL,
                                                             probe_callback,
                                                             &probes);
     if (!mgr) {
@@ -466,6 +468,7 @@ static bool test_iface_invalid_holdoff(void) {
 
     struct terminal_manager *mgr = terminal_manager_create(&cfg,
                                                             &g_stub_adapter,
+                                                            NULL,
                                                             probe_callback,
                                                             &probes);
     if (!mgr) {
@@ -558,6 +561,7 @@ static bool test_ifindex_change_emits_mod(void) {
 
     struct terminal_manager *mgr = terminal_manager_create(&cfg,
                                                             &g_stub_adapter,
+                                                            NULL,
                                                             probe_callback,
                                                             &probes);
     if (!mgr) {

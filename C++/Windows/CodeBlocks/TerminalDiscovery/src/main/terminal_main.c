@@ -400,6 +400,7 @@ int main(int argc, char **argv) {
 
     struct terminal_manager *manager = terminal_manager_create(&manager_cfg,
                                                                adapter_handle,
+                                                               adapter_desc->ops,
                                                                terminal_probe_handler,
                                                                &ctx);
     if (!manager) {

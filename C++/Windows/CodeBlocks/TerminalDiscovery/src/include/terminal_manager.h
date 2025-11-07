@@ -27,6 +27,7 @@ struct terminal_key {
 struct terminal_metadata {
     int vlan_id;            /* -1 if unknown */
     uint32_t ifindex;       /* 0 when unavailable; logical port identifier (not tx_kernel_ifindex) */
+    uint64_t mac_view_version; /* 0 when unresolved; snapshot version for last bridge lookup */
 };
 
 struct terminal_entry {
@@ -39,6 +40,8 @@ struct terminal_entry {
     char tx_iface[IFNAMSIZ];
     int tx_kernel_ifindex;
     struct in_addr tx_source_ip;
+    bool mac_refresh_enqueued;
+    bool mac_verify_enqueued;
     struct terminal_entry *next;
 };
 
@@ -115,6 +118,7 @@ struct terminal_manager_config {
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
                                                   td_adapter_t *adapter,
+                                                  const struct td_adapter_ops *adapter_ops,
                                                   terminal_probe_fn probe_cb,
                                                   void *probe_ctx);
 
