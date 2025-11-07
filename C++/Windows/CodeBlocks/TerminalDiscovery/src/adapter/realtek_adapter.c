@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "td_logging.h"
+#include "td_switch_mac_bridge.h"
 
 #ifndef TD_REALTEK_RX_BUFFER_SIZE
 #define TD_REALTEK_RX_BUFFER_SIZE 2048
@@ -34,6 +35,41 @@
 #ifndef TD_REALTEK_DEFAULT_TX_INTERVAL_MS
 #define TD_REALTEK_DEFAULT_TX_INTERVAL_MS 100U
 #endif
+
+#ifndef TD_REALTEK_MAC_CACHE_TTL_MS
+#define TD_REALTEK_MAC_CACHE_TTL_MS 30000U
+#endif
+
+#ifndef TD_REALTEK_MAC_BUCKET_COUNT
+#define TD_REALTEK_MAC_BUCKET_COUNT 256U
+#endif
+
+struct mac_bucket_entry {
+    uint8_t mac[ETH_ALEN];
+    uint16_t vlan;
+    uint32_t ifindex;
+    struct mac_bucket_entry *next;
+};
+
+struct realtek_mac_cache {
+    pthread_rwlock_t map_lock;
+    struct mac_bucket_entry *buckets[TD_REALTEK_MAC_BUCKET_COUNT];
+    SwUcMacEntry *entries;
+    uint32_t capacity;
+    uint32_t used;
+    uint64_t version;
+    struct timespec last_refresh;
+    struct timespec last_attempt;
+    uint32_t ttl_ms;
+    pthread_mutex_t worker_lock;
+    pthread_cond_t worker_cond;
+    pthread_t worker_thread;
+    bool worker_started;
+    bool worker_stop;
+    bool refresh_requested;
+    td_adapter_mac_locator_refresh_cb refresh_cb;
+    void *refresh_ctx;
+};
 
 struct vlan_header {
     uint16_t tci;
@@ -63,6 +99,8 @@ struct td_adapter {
 
     uint8_t tx_mac[ETH_ALEN];
     struct in_addr tx_ipv4;
+
+    struct realtek_mac_cache mac_cache;
 };
 
 static int normalize_vlan_id(int raw_vlan) {
@@ -93,6 +131,75 @@ static void realtek_logf(struct td_adapter *adapter,
     } else {
         td_log_writef(level, "realtek", "%s", buffer);
     }
+}
+
+static void mac_cache_init(struct realtek_mac_cache *cache) {
+    if (!cache) {
+        return;
+    }
+    memset(cache, 0, sizeof(*cache));
+    cache->ttl_ms = TD_REALTEK_MAC_CACHE_TTL_MS;
+    pthread_rwlock_init(&cache->map_lock, NULL);
+    pthread_mutex_init(&cache->worker_lock, NULL);
+    pthread_cond_init(&cache->worker_cond, NULL);
+}
+
+static void *mac_cache_worker_main(void *arg);
+
+static bool mac_cache_start_worker(struct td_adapter *adapter) {
+    if (!adapter) {
+        return false;
+    }
+
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    pthread_mutex_lock(&cache->worker_lock);
+    if (cache->worker_started) {
+        pthread_mutex_unlock(&cache->worker_lock);
+        return true;
+    }
+
+    cache->worker_stop = false;
+    cache->refresh_requested = true;
+    int rc = pthread_create(&cache->worker_thread, NULL, mac_cache_worker_main, adapter);
+    if (rc != 0) {
+        cache->refresh_requested = false;
+        pthread_mutex_unlock(&cache->worker_lock);
+        realtek_logf(adapter, TD_LOG_ERROR, "pthread_create for MAC cache worker failed: %s", strerror(rc));
+        return false;
+    }
+
+    cache->worker_started = true;
+    pthread_mutex_unlock(&cache->worker_lock);
+    return true;
+}
+
+static void mac_cache_stop_worker(struct td_adapter *adapter) {
+    if (!adapter) {
+        return;
+    }
+
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    pthread_mutex_lock(&cache->worker_lock);
+    if (!cache->worker_started) {
+        pthread_mutex_unlock(&cache->worker_lock);
+        return;
+    }
+
+    cache->worker_stop = true;
+    pthread_cond_signal(&cache->worker_cond);
+    pthread_t thread = cache->worker_thread;
+    pthread_mutex_unlock(&cache->worker_lock);
+
+    int rc = pthread_join(thread, NULL);
+    if (rc != 0) {
+        realtek_logf(adapter, TD_LOG_WARN, "pthread_join for MAC cache worker failed: %s", strerror(rc));
+    }
+
+    pthread_mutex_lock(&cache->worker_lock);
+    cache->worker_started = false;
+    cache->worker_stop = false;
+    cache->refresh_requested = false;
+    pthread_mutex_unlock(&cache->worker_lock);
 }
 
 static int attach_arp_filter(int fd) {
@@ -288,6 +395,248 @@ static void bind_socket_to_iface(struct td_adapter *adapter, const char *iface) 
     }
 }
 
+static uint64_t timespec_diff_ms(const struct timespec *start, const struct timespec *end) {
+    if (!start || !end) {
+        return 0ULL;
+    }
+
+    time_t sec = end->tv_sec - start->tv_sec;
+    long nsec = end->tv_nsec - start->tv_nsec;
+    if (sec < 0) {
+        return 0ULL;
+    }
+    if (nsec < 0) {
+        sec -= 1;
+        nsec += 1000000000L;
+        if (sec < 0) {
+            return 0ULL;
+        }
+    }
+    uint64_t millis = (uint64_t)sec * 1000ULL;
+    millis += (uint64_t)(nsec / 1000000L);
+    return millis;
+}
+
+static struct timespec timespec_add_ms(const struct timespec *base, uint32_t ms) {
+    struct timespec result = *base;
+    result.tv_sec += ms / 1000U;
+    result.tv_nsec += (long)(ms % 1000U) * 1000000L;
+    if (result.tv_nsec >= 1000000000L) {
+        result.tv_sec += 1;
+        result.tv_nsec -= 1000000000L;
+    }
+    return result;
+}
+
+static uint32_t mac_hash(const uint8_t mac[ETH_ALEN], uint16_t vlan) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < ETH_ALEN; ++i) {
+        hash ^= mac[i];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= (uint64_t)vlan & 0x0FFFU;
+    hash *= 1099511628211ULL;
+    return (uint32_t)(hash % TD_REALTEK_MAC_BUCKET_COUNT);
+}
+
+static void mac_cache_clear_buckets(struct realtek_mac_cache *cache) {
+    if (!cache) {
+        return;
+    }
+    for (size_t i = 0; i < TD_REALTEK_MAC_BUCKET_COUNT; ++i) {
+        struct mac_bucket_entry *node = cache->buckets[i];
+        while (node) {
+            struct mac_bucket_entry *next = node->next;
+            free(node);
+            node = next;
+        }
+        cache->buckets[i] = NULL;
+    }
+}
+
+static void mac_cache_destroy(struct td_adapter *adapter) {
+    if (!adapter) {
+        return;
+    }
+
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    mac_cache_stop_worker(adapter);
+
+    pthread_rwlock_wrlock(&cache->map_lock);
+    mac_cache_clear_buckets(cache);
+    SwUcMacEntry *entries = cache->entries;
+    cache->entries = NULL;
+    cache->capacity = 0;
+    cache->used = 0;
+    cache->version = 0ULL;
+    cache->last_refresh.tv_sec = 0;
+    cache->last_refresh.tv_nsec = 0;
+    cache->last_attempt.tv_sec = 0;
+    cache->last_attempt.tv_nsec = 0;
+    pthread_rwlock_unlock(&cache->map_lock);
+
+    free(entries);
+
+    pthread_rwlock_destroy(&cache->map_lock);
+    pthread_mutex_destroy(&cache->worker_lock);
+    pthread_cond_destroy(&cache->worker_cond);
+    cache->refresh_cb = NULL;
+    cache->refresh_ctx = NULL;
+}
+
+static void mac_cache_request_refresh(struct td_adapter *adapter) {
+    if (!adapter) {
+        return;
+    }
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    pthread_mutex_lock(&cache->worker_lock);
+    cache->refresh_requested = true;
+    pthread_cond_signal(&cache->worker_cond);
+    pthread_mutex_unlock(&cache->worker_lock);
+}
+
+static bool mac_cache_should_refresh(struct realtek_mac_cache *cache, const struct timespec *now) {
+    if (!cache) {
+        return false;
+    }
+    if (cache->version == 0ULL) {
+        return true;
+    }
+    if (!now) {
+        return false;
+    }
+    uint64_t elapsed = timespec_diff_ms(&cache->last_refresh, now);
+    return elapsed >= cache->ttl_ms;
+}
+
+static bool mac_cache_refresh(struct td_adapter *adapter, bool force);
+
+static bool mac_cache_ensure_capacity(struct td_adapter *adapter) {
+    if (!adapter) {
+        return false;
+    }
+
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    if (cache->capacity > 0 && cache->entries) {
+        return true;
+    }
+
+    uint32_t capacity = 0;
+    int rc = td_switch_mac_get_capacity(&capacity);
+    if (rc != 0 || capacity == 0) {
+        realtek_logf(adapter, TD_LOG_WARN, "td_switch_mac_get_capacity failed: %d", rc);
+        return false;
+    }
+
+    SwUcMacEntry *entries = calloc(capacity, sizeof(SwUcMacEntry));
+    if (!entries) {
+        realtek_logf(adapter, TD_LOG_ERROR, "failed to allocate MAC cache buffer for %u entries", capacity);
+        return false;
+    }
+
+    cache->entries = entries;
+    cache->capacity = capacity;
+    cache->used = 0;
+    cache->version = 0ULL;
+    cache->last_refresh.tv_sec = 0;
+    cache->last_refresh.tv_nsec = 0;
+    cache->last_attempt.tv_sec = 0;
+    cache->last_attempt.tv_nsec = 0;
+    return true;
+}
+
+static bool mac_cache_refresh(struct td_adapter *adapter, bool force) {
+    if (!adapter) {
+        return false;
+    }
+
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (!force && !mac_cache_should_refresh(cache, &now)) {
+        return true;
+    }
+
+    if (!mac_cache_ensure_capacity(adapter)) {
+        return false;
+    }
+
+    cache->last_attempt = now;
+
+    uint32_t count = 0;
+    int rc = td_switch_mac_snapshot(cache->entries, &count);
+    if (rc != 0) {
+        realtek_logf(adapter, TD_LOG_WARN, "td_switch_mac_snapshot failed: %d", rc);
+        return false;
+    }
+    if (count > cache->capacity) {
+        realtek_logf(adapter, TD_LOG_WARN, "snapshot count %u exceeds capacity %u, truncating", count, cache->capacity);
+        count = cache->capacity;
+    }
+
+    uint32_t inserted = 0;
+    pthread_rwlock_wrlock(&cache->map_lock);
+    mac_cache_clear_buckets(cache);
+    for (uint32_t i = 0; i < count; ++i) {
+        const SwUcMacEntry *entry = &cache->entries[i];
+        struct mac_bucket_entry *node = calloc(1, sizeof(*node));
+        if (!node) {
+            realtek_logf(adapter, TD_LOG_ERROR, "failed to allocate mac bucket entry");
+            continue;
+        }
+        memcpy(node->mac, entry->mac, ETH_ALEN);
+        node->vlan = entry->vlan;
+        node->ifindex = entry->ifindex;
+        uint32_t bucket = mac_hash(node->mac, node->vlan);
+        node->next = cache->buckets[bucket];
+        cache->buckets[bucket] = node;
+        inserted += 1U;
+    }
+    cache->used = inserted;
+    cache->version += 1ULL;
+    cache->last_refresh = now;
+    uint64_t version = cache->version;
+    pthread_rwlock_unlock(&cache->map_lock);
+
+    if (cache->refresh_cb) {
+        cache->refresh_cb(version, cache->refresh_ctx);
+    }
+
+    return true;
+}
+
+static void *mac_cache_worker_main(void *arg) {
+    struct td_adapter *adapter = (struct td_adapter *)arg;
+    if (!adapter) {
+        return NULL;
+    }
+
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+    pthread_mutex_lock(&cache->worker_lock);
+    while (!cache->worker_stop) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        bool should_refresh = cache->refresh_requested || mac_cache_should_refresh(cache, &now);
+        if (!should_refresh) {
+            struct timespec wake = timespec_add_ms(&now, cache->ttl_ms);
+            (void)pthread_cond_timedwait(&cache->worker_cond, &cache->worker_lock, &wake);
+            continue;
+        }
+
+        cache->refresh_requested = false;
+        pthread_mutex_unlock(&cache->worker_lock);
+
+        (void)mac_cache_refresh(adapter, true);
+
+        pthread_mutex_lock(&cache->worker_lock);
+    }
+    pthread_mutex_unlock(&cache->worker_lock);
+    return NULL;
+}
+
 static void *rx_thread_main(void *arg) {
     struct td_adapter *adapter = (struct td_adapter *)arg;
     uint8_t buffer[TD_REALTEK_RX_BUFFER_SIZE];
@@ -413,9 +762,9 @@ static void *rx_thread_main(void *arg) {
         view.payload = buffer + offset;
         view.payload_len = payload_len;
         view.ether_type = ether_type;
-    view.vlan_id = vlan_id;
+        view.vlan_id = vlan_id;
         clock_gettime(CLOCK_REALTIME, &view.ts);
-    view.ifindex = 0U;
+        view.ifindex = 0U;
         memcpy(view.src_mac, eth_local.h_source, ETH_ALEN);
         memcpy(view.dst_mac, eth_local.h_dest, ETH_ALEN);
 
@@ -490,6 +839,8 @@ static td_adapter_result_t realtek_init(const struct td_adapter_config *cfg,
     pthread_mutex_init(&adapter->state_lock, NULL);
     pthread_mutex_init(&adapter->send_lock, NULL);
 
+    mac_cache_init(&adapter->mac_cache);
+
     *handle_out = adapter;
     realtek_logf(adapter, TD_LOG_INFO, "adapter initialized (rx=%s tx=%s interval=%ums)",
                  adapter->rx_iface,
@@ -523,6 +874,8 @@ static void realtek_shutdown(td_adapter_t *handle) {
         adapter->tx_fd = -1;
     }
 
+    mac_cache_destroy(adapter);
+
     pthread_mutex_destroy(&adapter->state_lock);
     pthread_mutex_destroy(&adapter->send_lock);
 
@@ -552,6 +905,20 @@ static td_adapter_result_t realtek_start(td_adapter_t *handle) {
     }
 
     atomic_store(&adapter->running, true);
+
+    if (!mac_cache_start_worker(adapter)) {
+        atomic_store(&adapter->running, false);
+        if (adapter->rx_fd >= 0) {
+            close(adapter->rx_fd);
+            adapter->rx_fd = -1;
+        }
+        if (adapter->tx_fd >= 0) {
+            close(adapter->tx_fd);
+            adapter->tx_fd = -1;
+        }
+        return TD_ADAPTER_ERR_SYS;
+    }
+    mac_cache_request_refresh(adapter);
 
     pthread_mutex_lock(&adapter->state_lock);
     bool need_thread = adapter->packet_subscribed;
@@ -584,6 +951,8 @@ static void realtek_stop(td_adapter_t *handle) {
     }
 
     atomic_store(&adapter->running, false);
+
+    mac_cache_stop_worker(adapter);
 
     if (adapter->rx_thread_started) {
         pthread_join(adapter->rx_thread, NULL);
@@ -661,8 +1030,8 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
 
     if (req->tx_iface_valid && req->tx_iface[0]) {
         tx_iface = req->tx_iface;
-    tx_kernel_ifindex = req->tx_kernel_ifindex;
-    if (!query_iface_details(tx_iface, &tx_kernel_ifindex, iface_mac, &iface_ip)) {
+        tx_kernel_ifindex = req->tx_kernel_ifindex;
+        if (!query_iface_details(tx_iface, &tx_kernel_ifindex, iface_mac, &iface_ip)) {
             pthread_mutex_unlock(&adapter->send_lock);
             realtek_logf(adapter, TD_LOG_ERROR, "failed to resolve interface %s for ARP send", tx_iface);
             return TD_ADAPTER_ERR_INVALID_ARG;
@@ -721,8 +1090,8 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
     size_t offset = sizeof(struct ethhdr);
     if (vlan_tagging) {
         eth->h_proto = htons(ETH_P_8021Q);
-    struct vlan_header *vlan = (struct vlan_header *)(frame + sizeof(struct ethhdr));
-    vlan->tci = htons((uint16_t)(effective_vlan & 0x0FFF));
+        struct vlan_header *vlan = (struct vlan_header *)(frame + sizeof(struct ethhdr));
+        vlan->tci = htons((uint16_t)(effective_vlan & 0x0FFF));
         vlan->encapsulated_proto = htons(ETH_P_ARP);
         offset += sizeof(struct vlan_header);
     } else {
@@ -808,6 +1177,123 @@ static td_adapter_result_t realtek_query_iface(td_adapter_t *handle,
     return TD_ADAPTER_OK;
 }
 
+static td_adapter_result_t realtek_mac_locator_lookup(td_adapter_t *handle,
+                                                      const uint8_t mac[ETH_ALEN],
+                                                      uint16_t vlan_id,
+                                                      uint32_t *ifindex_out,
+                                                      uint64_t *version_out) {
+    if (!handle || !mac) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+    if (vlan_id > 4094U) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+
+    struct td_adapter *adapter = handle;
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        pthread_rwlock_rdlock(&cache->map_lock);
+        uint64_t version = cache->version;
+        bool need_refresh = (version == 0ULL) || mac_cache_should_refresh(cache, &now);
+        if (need_refresh) {
+            pthread_rwlock_unlock(&cache->map_lock);
+            if (attempt == 0) {
+                if (!mac_cache_refresh(adapter, true)) {
+                    return TD_ADAPTER_ERR_NOT_READY;
+                }
+                continue;
+            }
+            return TD_ADAPTER_ERR_NOT_READY;
+        }
+
+        uint32_t bucket = mac_hash(mac, vlan_id);
+        for (struct mac_bucket_entry *node = cache->buckets[bucket]; node; node = node->next) {
+            if (node->vlan == vlan_id && memcmp(node->mac, mac, ETH_ALEN) == 0) {
+                if (ifindex_out) {
+                    *ifindex_out = node->ifindex;
+                }
+                if (version_out) {
+                    *version_out = version;
+                }
+                pthread_rwlock_unlock(&cache->map_lock);
+                return TD_ADAPTER_OK;
+            }
+        }
+
+        if (ifindex_out) {
+            *ifindex_out = 0U;
+        }
+        if (version_out) {
+            *version_out = version;
+        }
+        pthread_rwlock_unlock(&cache->map_lock);
+        return TD_ADAPTER_ERR_NOT_READY;
+    }
+
+    return TD_ADAPTER_ERR_NOT_READY;
+}
+
+static td_adapter_result_t realtek_mac_locator_subscribe(td_adapter_t *handle,
+                                                         td_adapter_mac_locator_refresh_cb cb,
+                                                         void *ctx) {
+    if (!handle || !cb) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+
+    struct td_adapter *adapter = handle;
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+
+    pthread_mutex_lock(&cache->worker_lock);
+    if (cache->refresh_cb) {
+        pthread_mutex_unlock(&cache->worker_lock);
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+    cache->refresh_cb = cb;
+    cache->refresh_ctx = ctx;
+    pthread_mutex_unlock(&cache->worker_lock);
+
+    if (!mac_cache_start_worker(adapter)) {
+        pthread_mutex_lock(&cache->worker_lock);
+        cache->refresh_cb = NULL;
+        cache->refresh_ctx = NULL;
+        pthread_mutex_unlock(&cache->worker_lock);
+        return TD_ADAPTER_ERR_SYS;
+    }
+
+    mac_cache_request_refresh(adapter);
+    return TD_ADAPTER_OK;
+}
+
+static td_adapter_result_t realtek_mac_locator_get_version(td_adapter_t *handle,
+                                                           uint64_t *version_out) {
+    if (!handle || !version_out) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+
+    struct td_adapter *adapter = handle;
+    struct realtek_mac_cache *cache = &adapter->mac_cache;
+
+    pthread_rwlock_rdlock(&cache->map_lock);
+    uint64_t version = cache->version;
+    pthread_rwlock_unlock(&cache->map_lock);
+
+    *version_out = version;
+    if (version == 0ULL) {
+        return TD_ADAPTER_ERR_NOT_READY;
+    }
+    return TD_ADAPTER_OK;
+}
+
+static const struct td_adapter_mac_locator_ops g_realtek_mac_locator_ops = {
+    .lookup = realtek_mac_locator_lookup,
+    .subscribe = realtek_mac_locator_subscribe,
+    .get_version = realtek_mac_locator_get_version,
+};
+
 static void realtek_log_write(td_adapter_t *handle,
                               td_log_level_t level,
                               const char *component,
@@ -833,6 +1319,7 @@ static const struct td_adapter_ops g_realtek_ops = {
     .send_arp = realtek_send_arp,
     .query_iface = realtek_query_iface,
     .log_write = realtek_log_write,
+    .mac_locator_ops = &g_realtek_mac_locator_ops,
 };
 
 const struct td_adapter_descriptor *td_realtek_adapter_descriptor(void) {

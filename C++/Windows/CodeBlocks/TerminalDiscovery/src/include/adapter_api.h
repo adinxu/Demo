@@ -56,6 +56,8 @@ struct td_adapter_env {
     void *log_user_data;
 };
 
+struct td_adapter_mac_locator_ops;
+
 struct td_adapter_packet_view {
     const uint8_t *frame;       /* pointer to full Ethernet frame */
     size_t frame_len;           /* length of full frame */
@@ -113,6 +115,22 @@ struct td_adapter_ops {
                       td_log_level_t level,
                       const char *component,
                       const char *message);
+    const struct td_adapter_mac_locator_ops *mac_locator_ops;
+};
+
+typedef void (*td_adapter_mac_locator_refresh_cb)(uint64_t version, void *ctx);
+
+struct td_adapter_mac_locator_ops {
+    td_adapter_result_t (*lookup)(td_adapter_t *handle,
+                                  const uint8_t mac[ETH_ALEN],
+                                  uint16_t vlan_id,
+                                  uint32_t *ifindex_out,
+                                  uint64_t *version_out);
+    td_adapter_result_t (*subscribe)(td_adapter_t *handle,
+                                     td_adapter_mac_locator_refresh_cb cb,
+                                     void *ctx);
+    td_adapter_result_t (*get_version)(td_adapter_t *handle,
+                                       uint64_t *version_out);
 };
 
 struct td_adapter_descriptor {
