@@ -28,12 +28,12 @@
 4. ✅ Demo 校验：使用 stage0 demo 记录 `recvmsg` 返回的 ifindex/接口名，确认物理口 `eth0` 收到报文后解析出的接口名恒为 `eth0`，不能直接用于选择后续 ARP 发包接口，仍需依据终端绑定的 VLAN 元数据决定报文内容。
 5. ✅ VLAN tag 直出验证：扩展 stage0 demo 支持 `--tx-iface` + `--tx-vlan` 在用户态封装 802.1Q header 并直接从物理口发包，记录成功/失败条件及平台差异；该模式现已作为主线发包策略输入，虚接口绑定作为回退选项。
 6. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
-7. ⏳ 新增 MAC 表桥接验证 demo：待外部团队交付 C++ 桥接源文件及其 C 接口后，在其独立验证程序中编译本项目提供的 C 辅助模块（仅实现快照调用逻辑，不含 `main`），由外部 demo 的入口函数先调用桥接模块暴露的 `td_switch_mac_get_capacity`（或等效 API）估算最大条目，并在首次查询后缓存该值；demo 侧基于此容量一次性 `calloc` 分配 `SwUcMacEntry` 数组供 `td_switch_mac_snapshot` 复用，调用过程中不再重复申请/扩容；桥接内部在装载阶段完成一次性 `createSwitch` 并缓存 `SwitchDev*`，等待调用侧驱动 SDK (`getDevMacMaxSize`、`getDevUcMacAddress`)；不得自行扩容、轮询或转换结构；需重点确认桥接层能够依据容量返回真实条目总数，因为底层 `getDevUcMacAddress` 不会检查缓冲区大小；通过验证后，demo 结果作为生产集成的参考样板。
+7. ✅ 新增 MAC 表桥接验证 demo：外部团队已交付 C++ 桥接源文件及其 C 接口，并与 `src/demo/td_switch_mac_demo.c` 联调通过。demo 在入口阶段调用 `td_switch_mac_get_capacity` 估算最大条目并缓存容量，后续复用同一 `SwUcMacEntry` 缓冲区驱动 `td_switch_mac_snapshot`；桥接模块在装载期间完成一次性 `createSwitch` 与 `SwitchDev*` 缓存，调用路径严格遵守 SDK 缓冲区约定。该 demo 现作为 ifindex 获取/同步方案的基线实现，后续生产逻辑需复用相同的容量缓存与缓冲区复用模式，确保与桥接模块的数据流一致。
 
 ### 阶段 1：适配层设计与实现（已完成）
 1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
 2. ✅ Realtek 适配器：
-   - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带 lport 的能力；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
+   - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带的 ifindex 线索；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；默认在物理接口 `eth0` 的原始套接字中封装 802.1Q 头直接发包，优先采用请求内的 VLAN/接口信息生成帧；若驱动拒绝用户态 VLAN tag，则回退到绑定虚接口（如 `vlan1`），发送前仍会查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
    - MAC 表拉取：在 demo 验证通过的基础上集成外部桥接模块提供的 C 接口（如 `td_switch_mac_snapshot`），由适配层显式触发容量查询与快照，周期性/按需复用调用侧维护的 `SwUcMacEntry` 数组，拉取并解析为内部 `ifindex/vlan` 映射供终端管理器检索；需要在适配层自行管理缓冲区容量、重试回退与错误日志，并确保桥接模块初始化失败时不会阻塞主线程。
    - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；当前通过公共模块 `terminal_netlink` 在管理器创建后启动监听线程，保活节奏仍在终端引擎线程内统一调度。
@@ -44,7 +44,7 @@
 
 ### 阶段 2：核心终端引擎（已完成）
 1. ✅ 终端表与状态机：
-   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据（CPU tag 提供的 lport 或动态查询得到的 ifindex 共用同一字段存储，仅保留当前有效来源）、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_ifindex`）。
+   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据（CPU tag 或外部桥接获取的 ifindex 共用同一字段存储，ifindex 已编码底层 port 与接口类型，便于区分聚合/子接口等场景）、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_ifindex`）。
    - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换；若运行时检测到绑定接口缺失可用 IPv4（接口 down、IP 被移除或迁移至其他网段导致无法构造 ARP），即判定为不可保活并进入 `IFACE_INVALID`，按 `iface_invalid_holdoff_sec` 保留 30 分钟。
 2. ✅ 调度策略：
    - 专用 `terminal_manager_worker` 线程按 `scan_interval_ms` 周期驱动 `terminal_manager_on_timer`，统一处理过期、保活、删除流程。
@@ -54,7 +54,7 @@
    - `terminal_manager_on_timer` 聚合需要探测的终端，生成 `terminal_probe_request_t` 队列，脱离主锁逐个回调 `probe_cb`。
    - 超过 `keepalive_miss_threshold` 后清理终端并记录日志，避免 livelock。
 4. ✅ 接口感知：
-   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层未提供 lport 或入口接口名，则回落到配置/选择器给出的发包接口，同时触发异步调用桥接 API 尝试补全 ifindex。
+   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层暂未解析出 ifindex，则回落到配置/选择器给出的发包接口，同时触发异步调用桥接 API 尝试补全 ifindex。
    - 仅监测虚接口 IPv4 地址的新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调），在 `terminal_manager` 内维护 `iface_address_table`（`ifindex -> prefix_list`）和反向索引 `iface_binding_index`（`ifindex -> terminal_entry*` 列表）。
    - `resolve_tx_interface` 先确认 `if_nametoindex` 或 selector 返回的 `ifindex > 0`，再校验终端 IP 是否命中地址表中的任意前缀；否则清空绑定并立即置为 `IFACE_INVALID`。
    - 地址表变更时仅遍历该 `ifindex` 对应的终端，将其设为 `IFACE_INVALID` 并等待后续报文或地址恢复重新探测。保活发送上下文仍依据终端绑定的 VLAN 元数据与物理接口配置组合，而非直接复用收包返回的 ifindex。
@@ -64,7 +64,7 @@
 
 ### 阶段 3：报文解码与事件上报（已完成）
 1. ✅ 报文解析：
-   - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；缺失 lport 或入口接口信息时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。
+   - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；若暂未解析到 ifindex 时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。
    - Realtek 平台结合 MAC 表缓存刷新 `terminal_metadata.ifindex`，若缓存命中失败则触发桥接 API 重拉，确保事件与北向查询对齐整机 ifindex。
    - 依赖 ACL 提供的 VLAN tag 判定终端归属；若地址表查不到对应前缀或无法再构造有效 ARP（例如 VLANIF 被移除 IPv4 或迁移网段），即转入 `IFACE_INVALID`，后续在地址恢复或报文再次到达时重新探测。
 2. ✅ 事件队列：

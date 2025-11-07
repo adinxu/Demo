@@ -7,10 +7,10 @@
 
 ## 核心数据结构
 - `terminal_snapshot_t`
-  - 终端条目的轻量快照，仅保留 `terminal_key` 与 `terminal_metadata`（含 VLAN 与可选 lport）。
+  - 终端条目的轻量快照，仅保留 `terminal_key` 与 `terminal_metadata`（含 VLAN 与 ifindex，若暂未解析则字段值为 `0`）。
   - 主要用于对比事件前后的端口归属和在删除时携带终端标识。
 - `terminal_event_record_t`
-  - 北向暴露的最小事件载荷，由 `{terminal_key, port, terminal_event_tag_t}` 组成；当端口未知时 `port` 为 `0`。
+  - 北向暴露的最小事件载荷，由 `{terminal_key, ifindex, terminal_event_tag_t}` 组成；ifindex 取自 CPU tag 或桥接解析，若暂不可用则为 `0`。
   - `terminal_event_tag_t` 与外部的 ModifyTag 语义一一对应（`DEL/ADD/MOD`）。
 - `terminal_event_node`
   - 单个队列节点，持有一条 `terminal_event_record_t` 与 `next` 指针。
@@ -20,13 +20,13 @@
 ## 事件管线
 1. **事件入队**
    - `terminal_manager_on_packet`
-     - 新条目：创建后立即入队 `ADD` 事件，端口取自 CPU tag lport；若平台未携带 lport，则保持 `0`。
-     - 存量条目：更新前采集快照与端口快照，若推导出的端口发生变化则入队 `MOD` 事件。
+      - 新条目：创建后立即入队 `ADD` 事件，ifindex 取自 CPU tag、桥接解析或其他报文元数据；若平台未携带，则保持 `0`。
+      - 存量条目：更新前采集快照与 ifindex 快照，若 ifindex 发生变化则入队 `MOD` 事件。
    - `terminal_manager_on_timer`
      - 条目过期或探测失败超过阈值时入队 `DEL` 事件。
      - 仍存活的条目仅当端口变化时才入队 `MOD` 事件。
    - `terminal_manager_on_address_update`
-     - 更新地址表并针对受影响终端清空绑定，必要时触发 `IFACE_INVALID` 状态；操作仅调整内部状态，不直接入队事件，除非后续报文导致终端 `lport` 变化或条目被重新建表。
+      - 更新地址表并针对受影响终端清空绑定，必要时触发 `IFACE_INVALID` 状态；操作仅调整内部状态，不直接入队事件，除非后续报文导致终端 ifindex 变化或条目被重新建表。
    - 未配置事件接收器 (`event_cb == NULL`) 时跳过节点分配，避免无意义开销。
 
 2. **批量分发** – `terminal_manager_maybe_dispatch_events`
@@ -45,7 +45,7 @@
 
 ## 北向查询
 - `terminal_manager_query_all`
-  - 在互斥锁内统计条目数量并构造 `terminal_event_record_t` 数组，各记录的 `tag` 固定为 `ADD` 表示当前快照。
+  - 在互斥锁内统计条目数量并构造 `terminal_event_record_t` 数组，各记录的 `tag` 固定为 `ADD` 表示当前快照，并填充最新的 ifindex 视图；若尚未解析，则按 `0` 上报。
   - 解锁后依次调用 `terminal_query_callback_fn(const terminal_event_record_t *record, void *ctx)`；回调返回 `false` 时提前终止遍历。
 
 ## 北向桥接实现
@@ -53,13 +53,13 @@
 - 查询接口：`getAllTerminalInfo(MAC_IP_INFO &)` 使用 `terminal_manager_query_all` 生成 `terminal_event_record_t` 序列，并映射为带 `ModifyTag` 的 `TerminalInfo`；北向按需决定展示顺序。
 - 增量回调：`setIncrementReport(IncReportCb)` 在初始化阶段注册一次回调并调用 `terminal_manager_set_event_sink`；重复调用会返回错误码，避免多次注册。
   - 桥接层维护 `g_inc_report_cb` 全局回调指针，使用 `g_inc_report_mutex` 串行化读写保证线程安全。
-  - `inc_report_adapter` 在事件分发线程中运行，将 `terminal_event_record_t` 批次转换成单一 `MAC_IP_INFO`，并捕获回调抛出的异常以防影响内部逻辑。
+  - `inc_report_adapter` 在事件分发线程中运行，将 `terminal_event_record_t` 批次转换成单一 `MAC_IP_INFO`（包含 ifindex），并捕获回调抛出的异常以防影响内部逻辑。
   - 若内存分配失败或回调抛异常，会写入结构化日志并保持内部状态不变。
 
 ## 报文解码注意事项
 - `td_adapter_packet_view` 仍是唯一数据输入：
-  - VLAN ID 来自 `PACKET_AUXDATA`；若平台额外携带 CPU tag，则解析出 lport 用于事件上报。Realtek 平台暂不回传 lport，默认填 `0` 并仅作为未知端口上报。
-  - 端口变化是触发 `MOD` 事件的唯一条件，可避免因时间戳等细节更新导致的噪声。
+  - VLAN ID 来自 `PACKET_AUXDATA`；若平台额外携带 CPU tag，则解析出入口 ifindex 用于事件上报。Realtek 平台暂未提供该信息时，默认填 `0` 并仅作为未知入口上报。
+  - ifindex 变化是触发 `MOD` 事件的条件，可避免因时间戳等细节更新导致的噪声。
   - 报文学习阶段若 `resolve_tx_interface` 在地址表中找不到匹配前缀，会立即清空绑定并将终端标记为 `IFACE_INVALID`，因此事件侧仍以最近一次成功绑定的端口为准；无绑定时端口上报为 `0`。
 
 ## 并发与内存安全

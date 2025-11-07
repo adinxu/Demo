@@ -45,7 +45,7 @@
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
 - **平台适配接口（PAI）**：抽象报文收发、接口事件等平台差异。
    - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
-   - 若后续平台报文携带 CPU tag，则可从中解析交换芯片逻辑口（lport）以辅助定位；Realtek 平台事件需上报整机 ifindex（仍使用 32 位无符号整数），该值由 lport 与接口类型换算得到，不再直接上报 lport。
+   - 若后续平台报文携带 CPU tag，则可从中直接解析整机 ifindex；Realtek 平台事件统一上报 ifindex（仍使用 32 位无符号整数），不再使用 port/lport 表述。
    - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
    - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
 - **事件总线**：内部队列负责聚合终端变更并立即投递给上报子系统。
@@ -60,7 +60,8 @@
    - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
    - 在 Realtek 平台使用 Raw Socket 绑定 `eth0` 收包时，`recvmsg` 返回的 `ifindex` 恒为 `eth0` 的索引；该值仅用于日志或入向定位，不能直接用于选择后续 ARP 发送接口，保活发包仍需依据终端绑定的 VLAN 信息。
    - Realtek 平台无法依赖 CPU tag 直接获得整机 ifindex，需要借助外部团队提供的 C++ 封装拉取整机二层转发表，按终端 MAC 查找逻辑口，再结合接口类型换算出 ifindex 用于事件上报与北向 `TerminalInfo`。
-   - 底层 `libswitchapp.so` 的调用（例如 `createSwitch`、`getDevUcMacAddress`）统一由外部团队提供的桥接模块完成，该模块在装载阶段自行完成一次性 `createSwitch` 初始化并缓存返回的 `SwitchDev*`；对外至少导出两个 C 接口：`int td_switch_mac_snapshot(SwUcMacEntry *buf, uint32_t *inout_count)`（命名可调整）与 `int td_switch_mac_get_capacity(uint32_t *out_capacity)`。后者仅调用缓存的 `SwitchDev*` 上的 `getDevMacMaxSize` 获取设备可容纳的最大 MAC 表项数，前者基于同一 `SwitchDev*` 调用 `getDevUcMacAddress` 获取当前快照；实现可参考 `src/ref/realtek/mgmt_switch_mac.c` 中 `getDevMacMaxSize`/`getDevUcMacAddress` 的使用方式，同时确保外部模块内部负责引用计数与线程安全；需注意 Realtek SDK 的 `getDevUcMacAddress` 不会校验缓冲区长度，因此桥接模块本身不得在 `td_switch_mac_snapshot` 内部分配临时内存，而是依赖调用方先通过 `td_switch_mac_get_capacity` 获得容量后预先准备（并可静态复用）`SwUcMacEntry` 缓冲区；桥接模块仅在该缓冲区内填充数据，并保证返回的条目数量不超过调用方提供的容量。终端发现进程直接复用 SDK 定义的 `SwUcMacEntry` 结构，不再为兼容而进行结构转换，仅对 `attr` 等字段值进行解释。
+   - 底层 `libswitchapp.so` 的调用（例如 `createSwitch`、`getDevUcMacAddress`）统一由外部团队提供的桥接模块完成，现已交付并在 `src/demo/td_switch_mac_demo.c` 中完成联调验证。模块在装载阶段自行完成一次性 `createSwitch` 初始化并缓存返回的 `SwitchDev*`；对外至少导出两个 C 接口：`int td_switch_mac_snapshot(SwUcMacEntry *buf, uint32_t *inout_count)`（命名可调整）与 `int td_switch_mac_get_capacity(uint32_t *out_capacity)`。后者仅调用缓存的 `SwitchDev*` 上的 `getDevMacMaxSize` 获取设备可容纳的最大 MAC 表项数，前者基于同一 `SwitchDev*` 调用 `getDevUcMacAddress` 获取当前快照；实现可参考 `src/ref/realtek/mgmt_switch_mac.c` 中 `getDevMacMaxSize`/`getDevUcMacAddress` 的使用方式，同时确保外部模块内部负责引用计数与线程安全；需注意 Realtek SDK 的 `getDevUcMacAddress` 不会校验缓冲区长度，因此桥接模块本身不得在 `td_switch_mac_snapshot` 内部分配临时内存，而是依赖调用方先通过 `td_switch_mac_get_capacity` 获得容量后预先准备（并可静态复用）`SwUcMacEntry` 缓冲区；桥接模块仅在该缓冲区内填充数据，并保证返回的条目数量不超过调用方提供的容量。终端发现进程直接复用 SDK 定义的 `SwUcMacEntry` 结构，不再为兼容而进行结构转换，仅对 `attr` 等字段值进行解释。
+   - `td_switch_mac_demo_dump` 已通过上述桥接接口完成端到端验证，后续 ifindex 获取策略与同步流程应以该 demo 的数据流为基准：终端发现模块通过 demo 辅助逻辑解析 MAC→ifindex 映射，并在核心实现中复用相同的缓冲区及容量缓存策略，确保与外部桥接模块的调用约定一致。
    - 桥接模块由外部团队以 C++ 源文件形式交付，与终端发现项目一同编译；其返回的数据结构不直接暴露 SDK 内部的 `SwUcMacEntry`，而是提供对齐需求的 `td_switch_mac_entry_t`：字段包含 `uint8_t mac[6]`、`uint16_t vlan`、`uint32_t ifindex`、`uint32_t attr`（语义对应 `SwUcMacEntry.attr`）；这样可在不依赖 SDK 头文件的情况下保持 ABI 稳定，并避免结构体布局变化引发二进制兼容性问题。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
 - **北向 API 约束**：
@@ -89,7 +90,7 @@
 - **报文路径**：
    1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。
-   3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 lport，用于 ifindex 计算与事件变更检测；保活发包仍基于内核接口信息。
+   3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 ifindex（无论来自 CPU tag 还是外部查询），并据此完成事件变更检测；保活发包仍基于内核接口信息。
      4. 发送路径依据终端最近一次有效报文关联的三层上下文构造 ARP request，在用户态封装 `ethhdr + vlan_header + ether_arp` 后直接通过物理接口（如 `eth0`）发送；无需为每个 VLAN 重新绑定虚接口，只要写入正确的 VLAN ID 即可保持与发现路径一致。
         - 若目标平台拒绝用户态插入 VLAN tag，则回退到绑定虚接口（如 `vlan1`）的发送方式。Stage0 Raw Socket demo 已验证 Realtek 平台支持物理口带 VLAN tag 的直出策略，需在 demo 与适配器实现中默认采用该模式并保留回退逻辑。
      5. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
@@ -112,8 +113,8 @@
 
 ## 数据结构模型
 - `terminal_manager_t`：持有终端链表/堆、互斥锁、定时线程、运行标志等；负责调度保活与对外接口。
-- `terminal_entry_t`：记录 MAC、IP、状态、上次收到报文时间、上次探测时间、探测失败计数、平台元数据（含 VLAN、lport 等）、链表指针。
-- `metadata_t`：封装平台相关字段（如 logical_port、vlan 等），便于不同适配器扩展。
+- `terminal_entry_t`：记录 MAC、IP、状态、上次收到报文时间、上次探测时间、探测失败计数、平台元数据（含 VLAN、ifindex 等）、链表指针。
+- `metadata_t`：封装平台相关字段（如 ifindex、vlan 等），便于不同适配器扩展。
 - `iface_address_table`：哈希表 `ifindex -> prefix_list`，每个元素包含 IPv4 网络地址与掩码长度；所有修改在 `terminal_manager.lock` 下完成。
 - `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，用于在接口前缀变更时快速定位受影响终端。
 - 支持单链表遍历与时间轮/堆双实现，依据目标平台性能选择。

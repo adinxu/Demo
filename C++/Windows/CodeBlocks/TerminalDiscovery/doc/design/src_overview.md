@@ -93,7 +93,7 @@ flowchart TD
     - `terminal_manager_on_timer` 构造的探测快照，包含终端 key、待使用的 VLAN ID、可选的回退接口和 `source_ip`；`terminal_probe_handler` 依据该结构直接生成以物理口为主、虚接口为备的 ARP 请求。
 - **关键函数**：
   - `terminal_manager_create/destroy`：初始化线程、绑定全局单例（`terminal_manager_get_active`）。
-  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/lport 元数据并调用 `resolve_tx_interface`，在保留 VLAN ID 以支撑物理口发包的同时，获取可选的 VLANIF `ifindex` 与 `tx_source_ip` 用于构造 ARP；任一环节失败都会清空回退接口绑定并立刻将终端转入 `IFACE_INVALID`。
+  - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/ifindex 元数据并调用 `resolve_tx_interface`，在保留 VLAN ID 以支撑物理口发包的同时，获取可选的 VLANIF `ifindex` 与 `tx_source_ip` 用于构造 ARP；任一环节失败都会清空回退接口绑定并立刻将终端转入 `IFACE_INVALID`。
   - `terminal_manager_on_timer`：由后台线程调用，负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
   - `terminal_manager_on_address_update`：由 netlink 监听器触发的虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。
@@ -163,7 +163,7 @@ classDiagram
   }
   class terminal_metadata {
     +int vlan_id
-    +uint32_t lport
+    +uint32_t ifindex
   }
   class terminal_event_queue {
     +terminal_event_node* head
@@ -176,7 +176,7 @@ classDiagram
   }
   class terminal_event_record_t {
     +terminal_key key
-    +uint32_t port
+    +uint32_t ifindex
     +terminal_event_tag_t tag
   }
   class iface_record {

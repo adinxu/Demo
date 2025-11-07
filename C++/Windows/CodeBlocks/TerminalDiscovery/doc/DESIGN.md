@@ -116,5 +116,5 @@ next 指向下一个terminal_entry_t终端结构体
 
 metadata_t 结构体,保存可能与特定交换芯片收发包相关数据
 成员：
-logical_port(例子)
+ ifindex（示例）
 vlan(例子)

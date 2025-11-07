@@ -19,7 +19,7 @@
 - `struct terminal_entry`
   - 按 `struct terminal_key{mac+ip}` 哈希存储于 `table[256]` 链表中。
   - 记录最近一次报文时间 `last_seen`、最近一次保活探测时间 `last_probe` 以及失败计数。
-  - `terminal_metadata` 保留 ARP 报文的 VLAN 与可选逻辑端口 `lport`（来自 CPU tag，用于事件上报时标识物理口），其中 `vlan_id` 用于在物理口发包时封装 802.1Q 头部。
+  - `terminal_metadata` 保留 ARP 报文的 VLAN 与 ifindex（可来自 CPU tag 或 MAC 表查詢，缺失时写入 `0` 代表未知），其中 `ifindex` 统一表示整机接口标识；`vlan_id` 用于在物理口发包时封装 802.1Q 头部。
   - `tx_iface/tx_ifindex` 仅在需要回退到 VLAN 虚接口的场景下填充；常规情况下置空并依赖 `meta.vlan_id` + 物理口完成发包，解析失败同样置空并进入 `IFACE_INVALID`。
   - 时间戳字段（`last_seen`/`last_probe`）统一使用 `CLOCK_MONOTONIC` 采集，避免系统时间跳变对状态机造成干扰。
 
@@ -29,6 +29,10 @@
   - `probe_cb`：由外部注入的探测函数，接收 `terminal_probe_request_t` 快照执行 ARP 保活。
   - `iface_address_table`：哈希表维护 `ifindex -> prefix_list`，每项包含网络地址与掩码长度；仅在持有 `lock` 时更新。
   - `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，`resolve_tx_interface` 成功后登记，便于地址变化时精准定位受影响终端。
+  - `struct terminal_metadata` 新增字段：
+    - `uint32_t ifindex`：来自 MAC 表桥接的整机 ifindex，默认 `0` 表示未知。
+    - `uint64_t mac_view_version`：记录最近一次成功解析 ifindex 时的 MAC 缓存版本号，便于快速判断是否需要重新查询。
+  - 其余字段（VLAN、入口时间戳）保持不变。
 
 - `terminal_probe_request_t`
   - 在定时扫描阶段生成的简化快照，携带终端 key、最近一次确认的 VLAN ID、可选的 `tx_iface/ifindex` 以及探测前状态，供探测回调直接构造 ARP 请求。
@@ -44,6 +48,10 @@
   - 默认路径仍按 `vlan_iface_format` 生成 `vlanX` 等接口名，利用 `if_nametoindex` 解析出 VLANIF 以便查询地址资源；这些信息用于确定源 IP 与可用性，即便最终发包走物理口。
   - 只有当 `iface_address_table` 中存在命中的前缀时，才认为该 VLAN 的地址上下文有效；否则视为不可保活并保留 VLAN ID 以待后续报文复活。
   - 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
+5. 当报文绑定成功且终端 `meta.ifindex == 0` 或 `meta.mac_view_version < realtek_mac_cache_version()` 时，将通过 `terminal_mac_locator_lookup(mac, vlan, &ifindex, &version)` 尝试解析整机 ifindex：
+   - 函数由 Realtek 适配器提供，内部共享 demo 的容量缓存与静态缓冲区；若当前快照超过 TTL 会在查询前触发一次刷新。
+   - 查询命中时将 `meta.ifindex` 更新为返回值，并将 `meta.mac_view_version` 写为最新 `version`；若 ifindex 发生变化（例如 MAC 漂移），会触发 `terminal_event_record_t` 的 `MOD` 事件。
+   - 查询未命中时保持 `ifindex=0`，同时调用 `terminal_ifindex_tracker_mark_pending(entry)` 将该终端加入待刷新列表，等待后台回调或下一次报文触发重新解析。
 
 #### `resolve_tx_interface` 实现细节
 1. 记录历史绑定：在尝试解析前，先缓存旧的 `tx_iface/tx_ifindex`，用于后续比对及必要时的解绑。
@@ -73,9 +81,18 @@
 - 通过 Netlink `RTM_NEWADDR/DELADDR`（或平台等效回调）更新 `iface_address_table`：
   - 在持有 `lock` 的前提下增删前缀，并根据 `ifindex` 查询 `iface_binding_index`。
   - 对所有关联终端重新校验其 IP 是否仍命中该接口前缀；若不命中则清空回退接口绑定并调用 `set_state(...IFACE_INVALID)`，同时保留 VLAN ID 以便后续报文复活；更新仅影响内部状态，不直接排队事件。
-  - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 `lport` 发生变化或终端被重新创建时才会触发对外事件。
+  - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 ifindex 发生变化或终端被重新创建时才会触发对外事件。
   - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。
   - `main/terminal_main.c` 在管理器创建后启动 `terminal_netlink` 监听线程，直接调用该接口完成同步，无需额外的适配层事件桥接。
+
+## ifindex 同步策略
+- Realtek 适配器提供 `realtek_mac_locator_subscribe(void (*on_refresh)(uint64_t version, void *ctx), void *ctx)` 回调注册点；终端管理器在 `terminal_manager_bind_adapter` 时注册 `ifindex_sync_handler` 以获知 MAC 快照版本更新或刷新失败信息。
+- `ifindex_sync_handler` 执行流程：
+  1. 读取 `need_refresh` 链表中等待解析的终端，并在持锁状态下逐个调用 `terminal_mac_locator_lookup`；若查询成功则更新 `meta.ifindex/meta.mac_view_version` 并根据需要入队 `MOD` 事件。
+  2. 对于 `meta.ifindex != 0` 的存量终端，若其 `mac_view_version < version`，表示 MAC 表存在新快照，需要验证映射是否漂移。处理方式为：将终端临时加入 `pending_verify` 队列，在解锁状态下批量查询；映射变更时触发 `MOD` 并更新反向索引。
+  3. 若桥接刷新失败（回调以 `version == 0` 表示），管理器只记录 WARN 日志并保留 `need_refresh` 队列，等待下一次成功刷新。
+- `terminal_manager_on_timer` 在保活扫描阶段也会尝试用 `terminal_mac_locator_lookup` 更新 `IFACE_INVALID` 状态的终端，以便在收不到新报文时也能通过 MAC 表漂移检测恢复 ifindex。
+- 所有 `mac_locator` 调用都在释放互斥锁后执行，避免桥接刷新过程阻塞报文线程；查询完成后再重新上锁写回终端结构与事件队列。
 
 ## 并发与线程模型
 - 终端表、`iface_address_table` 以及 `iface_binding_index` 的读写均受 `lock` 保护，避免报文线程、地址事件线程与定时线程之间产生竞态。
@@ -90,6 +107,6 @@
 - `terminal_probe_fn`：由调用方实现，负责根据 `terminal_probe_request_t` 构造 `td_adapter_arp_request` 并发送。
 
 ## 后续扩展点
-- Stage 3 将在当前基础上新增增量事件队列，继续消费 `terminal_entry` 中的 VLAN/lport 元数据；探测请求不再重复存储该信息。
+- Stage 3 将在当前基础上新增增量事件队列，继续消费 `terminal_entry` 中的 VLAN/ifindex 元数据；探测请求不再重复存储该信息。
 - 若扫描量级增加，可以 `worker_cond` 唤醒机制为基础替换为时间轮或按过期时间排序的容器。
 - 需要跨网段校验、接口元数据缓存等能力时，可复用 `iface_selector` 回调引入额外的拓扑信息。

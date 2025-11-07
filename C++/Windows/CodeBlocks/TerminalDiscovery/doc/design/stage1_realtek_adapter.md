@@ -14,7 +14,7 @@
 
 ## 关键数据结构
 - `struct td_adapter_ops`：适配器必须实现的函数表（`init/start/stop`、收包注册、`send_arp`、接口查询、计时器、日志桥接等）。
-- `struct td_adapter_packet_view`：向引擎上报报文时携带的元数据（原始帧指针、VLAN ID、逻辑端口 lport、源/目的 MAC、时间戳）。Realtek 平台暂无 CPU tag，默认将 lport 设置为 `0`。
+- `struct td_adapter_packet_view`：向引擎上报报文时携带的元数据（原始帧指针、VLAN ID、整机 ifindex（若 CPU tag 提供）以及源/目的 MAC、时间戳）。Realtek 平台暂无 CPU tag，默认将 ifindex 设置为 `0` 表示未知。
 - `struct td_adapter_arp_request`：ARP 保活请求描述，阶段 1 重构后新增 `tx_iface`、`tx_ifindex` 与有效标记，允许外层指定发送所用三层接口。
 - `struct td_adapter`：Realtek 私有状态，记录配置的接口、套接字 FD、默认 TX 接口的 MAC/IP 缓存、订阅回调、工作线程句柄以及互斥锁。
 
@@ -39,6 +39,25 @@
 - `send_lock`：串行化 ARP 发送，维持节流与每次动态绑定的一致性。
 - `atomic_bool running`：协调控制面与工作线程的启动/停止。
 
+## MAC 表桥接与 ifindex 获取方案
+- Realtek 适配器在编译期直接链接外部团队交付的 `td_switch_mac_bridge` 模块（见 `src/include/td_switch_mac_bridge.h`），从而复用 demo 中已验证的 `td_switch_mac_get_capacity/td_switch_mac_snapshot` 调用路径。`realtek_init` 首次运行时会调用 `td_switch_mac_get_capacity`，将返回值缓存到 `adapter->mac_capacity`，并一次性 `calloc` 对应数量的 `td_switch_mac_entry_t` 缓冲区；若桥接暂不可用，会以 `TD_ADAPTER_ERR_NOT_READY` 形式回传，调用方可按需重试。
+- 适配器新增内部结构 `struct realtek_mac_cache`：
+  - `td_switch_mac_entry_t *entries`：指向上述静态缓冲区，生命周期与适配器一致。
+  - `uint32_t capacity`/`uint32_t used`：缓存容量与最近一次快照条数。
+  - `uint64_t version`：自增版本号，便于终端管理器判断映射新旧。
+  - `struct timespec last_refresh`：最近一次成功刷新时间，采用单调时钟采集。
+  - `pthread_rwlock_t lock`：保证快照刷新（写）与查询（读）并发安全。
+- `mac_cache_refresh_locked(bool force)` 封装调用 `td_switch_mac_snapshot` 的过程：
+ 1. 写锁保护下检测快照是否过期（默认 `mac_snapshot_ttl_ms = 30000`，可通过后续配置覆盖，延长至 30s 以匹配 ifindex 更新不要求毫秒级实时性的特性）。
+ 2. 调用桥接接口填充 `entries` 缓冲区，并更新 `used`、`version` 与 `last_refresh`；若桥接返回条目超过容量会立即记录 ERROR 日志并截断，多余条目被丢弃以维持 ABI 约束。
+ 3. 将 `entries[0..used)` 解析为轻量映射表 `td_mac_location_t{mac,vlan,ifindex,attr}`，按照 MAC 做 FNV 哈希落入 256 个桶，便于 O(1) 查找；桶元素以链表维护并在刷新前全部回收，避免旧数据残留。
+- 适配器对外暴露 `realtek_mac_locator_lookup(const uint8_t mac[ETH_ALEN], uint16_t vlan, struct td_mac_location *out)`，该函数在读锁下查询映射；若快照过期会先释放读锁并触发一次 `mac_cache_refresh_locked(true)`，随后重新读取。查找到匹配 VLAN 的条目则返回真实 ifindex，否则给出 `TD_ADAPTER_ERR_NOT_READY`（桥接未初始化/刷新失败）或 `TD_ADAPTER_ERR_INVALID_ARG`（输入非法）。
+- `realtek_start` 启动时会拉起后台线程 `mac_cache_worker`：
+  - 工作线程监听条件变量 `mac_refresh_cond`，在显式刷新请求、TTL 到期或连续查询未命中时唤醒。
+  - 刷新成功后将 `version` 写入 `adapter->mac_cache_version` 并解锁，再通过回调 `adapter_env.log_fn` 记录一次 DEBUG 日志，包含刷新耗时与条目数量。
+  - 若桥接暂不可用或返回错误，线程会指数退避重试，并在 `adapter_env.log_fn` 打印 WARN 以提示上层。
+- 为了与 demo 行为保持一致，适配器绝不在快照路径内分配临时缓冲区，所有 `td_switch_mac_entry_t` 复用与容量缓存都在 `realtek_init` 阶段完成；桥接模块内部的 `createSwitch` 亦只在装载时执行一次，并由其自行管理线程安全与引用计数。
+- 适配器调用链在遇到桥接不可达、快照失败或查不到指定 MAC 时不会阻塞收包线程：查询函数仅返回错误码，终端管理器可选择保留 `ifindex=0` 并等待下次成功刷新；`mac_cache_worker` 将自动在后台重试刷新，避免在报文路径等待。
 ## 配置与日志
 - `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口默认为物理接口（即将切换至 `eth0`，在旧版本中仍可显式指定 `vlan1` 以兼容）、ARP 节流间隔 100ms、日志级别 INFO。
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
