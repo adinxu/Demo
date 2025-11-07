@@ -14,7 +14,7 @@ enum class ModifyTag : std::uint32_t {
 struct TerminalInfo {
     std::string mac;
     std::string ip;
-    std::uint32_t port;
+    std::uint32_t ifindex;
     ModifyTag tag;
 };
 

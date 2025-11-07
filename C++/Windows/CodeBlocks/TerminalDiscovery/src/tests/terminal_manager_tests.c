@@ -82,17 +82,17 @@ static void probe_callback(const terminal_probe_request_t *request, void *user_c
 
 static bool selector_callback(const struct terminal_metadata *meta,
                               char tx_iface[IFNAMSIZ],
-                              int *tx_ifindex,
+                              int *tx_kernel_ifindex,
                               void *user_ctx) {
     struct selector_ctx *ctx = (struct selector_ctx *)user_ctx;
-    if (!ctx || !meta || !tx_iface || !tx_ifindex) {
+    if (!ctx || !meta || !tx_iface || !tx_kernel_ifindex) {
         return false;
     }
     if (ctx->required_vlan >= 0 && meta->vlan_id != ctx->required_vlan) {
         return false;
     }
     snprintf(tx_iface, IFNAMSIZ, "ut%d", ctx->ifindex);
-    *tx_ifindex = ctx->ifindex;
+    *tx_kernel_ifindex = ctx->ifindex;
     return true;
 }
 
@@ -104,13 +104,13 @@ static void sleep_ms(unsigned int ms) {
 }
 
 static void apply_address_update(struct terminal_manager *mgr,
-                                 int ifindex,
+                                 int kernel_ifindex,
                                  const char *address,
                                  uint8_t prefix_len,
                                  bool is_add) {
     terminal_address_update_t update;
     memset(&update, 0, sizeof(update));
-    update.ifindex = ifindex;
+    update.kernel_ifindex = kernel_ifindex;
     update.prefix_len = prefix_len;
     update.is_add = is_add;
     if (address) {
@@ -124,7 +124,7 @@ static void build_arp_packet(struct td_adapter_packet_view *packet,
                              const uint8_t mac[ETH_ALEN],
                              const char *ip_text,
                              int vlan_id,
-                             uint32_t lport) {
+                             uint32_t ifindex) {
     memset(arp, 0, sizeof(*arp));
     arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
     arp->ea_hdr.ar_pro = htons(ETHERTYPE_IP);
@@ -140,7 +140,7 @@ static void build_arp_packet(struct td_adapter_packet_view *packet,
     packet->payload_len = sizeof(*arp);
     packet->ether_type = ETHERTYPE_ARP;
     packet->vlan_id = vlan_id;
-    packet->lport = lport;
+    packet->ifindex = ifindex;
     memcpy(packet->src_mac, mac, ETH_ALEN);
 }
 
@@ -331,8 +331,8 @@ static bool test_terminal_add_and_event(void) {
         goto done;
     }
 
-    if (events.records[0].port != 7U) {
-        fprintf(stderr, "unexpected port value %u\n", events.records[0].port);
+    if (events.records[0].ifindex != 7U) {
+        fprintf(stderr, "unexpected ifindex value %u\n", events.records[0].ifindex);
         ok = false;
         goto done;
     }
@@ -535,7 +535,7 @@ done:
     return ok;
 }
 
-static bool test_port_change_emits_mod(void) {
+static bool test_ifindex_change_emits_mod(void) {
     struct selector_ctx selector = {
         .ifindex = 103,
         .required_vlan = 400,
@@ -591,12 +591,12 @@ static bool test_port_change_emits_mod(void) {
 
     bool ok = true;
     if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_MOD) {
-        fprintf(stderr, "expected MOD event on port change, got %zu\n", events.count);
+    fprintf(stderr, "expected MOD event on ifindex change, got %zu\n", events.count);
         ok = false;
         goto done;
     }
-    if (events.records[0].port != 2U) {
-        fprintf(stderr, "expected port 2 in MOD event, got %u\n", events.records[0].port);
+    if (events.records[0].ifindex != 2U) {
+        fprintf(stderr, "expected ifindex 2 in MOD event, got %u\n", events.records[0].ifindex);
         ok = false;
         goto done;
     }
@@ -632,7 +632,7 @@ int main(void) {
         {"terminal_add_and_event", test_terminal_add_and_event},
         {"probe_failure_removes_terminal", test_probe_failure_removes_terminal},
         {"iface_invalid_holdoff", test_iface_invalid_holdoff},
-        {"port_change_emits_mod", test_port_change_emits_mod},
+    {"ifindex_change_emits_mod", test_ifindex_change_emits_mod},
     };
 
     size_t total = sizeof(tests) / sizeof(tests[0]);

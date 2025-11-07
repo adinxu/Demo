@@ -44,7 +44,7 @@
 
 ### 阶段 2：核心终端引擎（已完成）
 1. ✅ 终端表与状态机：
-   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据（CPU tag 或外部桥接获取的 ifindex 共用同一字段存储，ifindex 已编码底层 port 与接口类型，便于区分聚合/子接口等场景）、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_ifindex`）。
+   - `terminal_entry` 记录 MAC/IP、Ingress/VLAN 元数据（CPU tag 或外部桥接获取的 ifindex 共用同一字段存储，ifindex 已编码底层 port 与接口类型，便于区分聚合/子接口等场景）、探测节奏（`last_seen/last_probe/failed_probes`）与发包绑定（`tx_iface/tx_kernel_ifindex`）。
    - 状态流转：`ACTIVE ↔ PROBING` 基于报文与保活结果切换；若运行时检测到绑定接口缺失可用 IPv4（接口 down、IP 被移除或迁移至其他网段导致无法构造 ARP），即判定为不可保活并进入 `IFACE_INVALID`，按 `iface_invalid_holdoff_sec` 保留 30 分钟。
 2. ✅ 调度策略：
    - 专用 `terminal_manager_worker` 线程按 `scan_interval_ms` 周期驱动 `terminal_manager_on_timer`，统一处理过期、保活、删除流程。
@@ -54,10 +54,10 @@
    - `terminal_manager_on_timer` 聚合需要探测的终端，生成 `terminal_probe_request_t` 队列，脱离主锁逐个回调 `probe_cb`。
    - 超过 `keepalive_miss_threshold` 后清理终端并记录日志，避免 livelock。
 4. ✅ 接口感知：
-   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层暂未解析出 ifindex，则回落到配置/选择器给出的发包接口，同时触发异步调用桥接 API 尝试补全 ifindex。
-   - 仅监测虚接口 IPv4 地址的新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调），在 `terminal_manager` 内维护 `iface_address_table`（`ifindex -> prefix_list`）和反向索引 `iface_binding_index`（`ifindex -> terminal_entry*` 列表）。
-   - `resolve_tx_interface` 先确认 `if_nametoindex` 或 selector 返回的 `ifindex > 0`，再校验终端 IP 是否命中地址表中的任意前缀；否则清空绑定并立即置为 `IFACE_INVALID`。
-   - 地址表变更时仅遍历该 `ifindex` 对应的终端，将其设为 `IFACE_INVALID` 并等待后续报文或地址恢复重新探测。保活发送上下文仍依据终端绑定的 VLAN 元数据与物理接口配置组合，而非直接复用收包返回的 ifindex。
+   - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层暂未解析出逻辑 ifindex，则回落到配置/选择器给出的发包接口，同时触发异步调用桥接 API 尝试补全逻辑 ifindex。
+   - 仅监测虚接口 IPv4 地址的新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调），在 `terminal_manager` 内维护 `iface_address_table`（`kernel_ifindex -> prefix_list`）和反向索引 `iface_binding_index`（`kernel_ifindex -> terminal_entry*` 列表）。
+   - `resolve_tx_interface` 先确认 `if_nametoindex` 或 selector 返回的 `kernel_ifindex > 0`，再校验终端 IP 是否命中地址表中的任意前缀；否则清空绑定并立即置为 `IFACE_INVALID`。
+   - 地址表变更时仅遍历该 `kernel_ifindex` 对应的终端，将其设为 `IFACE_INVALID` 并等待后续报文或地址恢复重新探测。保活发送上下文仍依据终端绑定的 VLAN 元数据与物理接口配置组合，而非直接复用收包返回的逻辑 ifindex。
 5. ✅ 并发与锁：
    - 哈希桶访问由主互斥保护，探测回调在 worker 锁外执行，杜绝回调 re-entry 死锁。
 6. ✅ 文档：`doc/design/stage2_terminal_manager.md` 描述线程模型、接口解析策略与配置参数取值。

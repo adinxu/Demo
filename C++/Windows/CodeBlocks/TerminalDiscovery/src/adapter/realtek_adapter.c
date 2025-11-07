@@ -49,8 +49,8 @@ struct td_adapter {
     atomic_bool running;
     int rx_fd;
     int tx_fd;
-    int rx_ifindex;
-    int tx_ifindex;
+    int rx_kernel_ifindex;
+    int tx_kernel_ifindex;
     pthread_t rx_thread;
     bool rx_thread_started;
 
@@ -140,13 +140,13 @@ static int configure_rx_socket(struct td_adapter *adapter) {
         close(fd);
         return -1;
     }
-    adapter->rx_ifindex = ifr.ifr_ifindex;
+    adapter->rx_kernel_ifindex = ifr.ifr_ifindex;
 
     struct sockaddr_ll addr;
     memset(&addr, 0, sizeof(addr));
     addr.sll_family = AF_PACKET;
     addr.sll_protocol = htons(ETH_P_ALL);
-    addr.sll_ifindex = adapter->rx_ifindex;
+    addr.sll_ifindex = adapter->rx_kernel_ifindex;
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         realtek_logf(adapter, TD_LOG_ERROR, "bind(%s) failed: %s", adapter->rx_iface, strerror(errno));
@@ -201,7 +201,7 @@ static int configure_tx_socket(struct td_adapter *adapter) {
         close(fd);
         return -1;
     }
-    adapter->tx_ifindex = ifr.ifr_ifindex;
+    adapter->tx_kernel_ifindex = ifr.ifr_ifindex;
 
     if (ioctl(ioctl_fd, SIOCGIFHWADDR, &ifr) == 0) {
         memcpy(adapter->tx_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
@@ -231,7 +231,7 @@ static bool all_zero_mac(const uint8_t mac[ETH_ALEN]) {
 }
 
 static bool query_iface_details(const char *iface,
-                                int *ifindex_out,
+                                int *kernel_ifindex_out,
                                 uint8_t mac_out[ETH_ALEN],
                                 struct in_addr *ip_out) {
     if (!iface || !iface[0]) {
@@ -250,8 +250,8 @@ static bool query_iface_details(const char *iface,
     bool ok = true;
 
     if (ioctl(fd, SIOCGIFINDEX, &ifr) == 0) {
-        if (ifindex_out) {
-            *ifindex_out = ifr.ifr_ifindex;
+        if (kernel_ifindex_out) {
+            *kernel_ifindex_out = ifr.ifr_ifindex;
         }
     } else {
         ok = false;
@@ -415,7 +415,7 @@ static void *rx_thread_main(void *arg) {
         view.ether_type = ether_type;
     view.vlan_id = vlan_id;
         clock_gettime(CLOCK_REALTIME, &view.ts);
-        view.lport = 0U;
+    view.ifindex = 0U;
         memcpy(view.src_mac, eth_local.h_source, ETH_ALEN);
         memcpy(view.dst_mac, eth_local.h_dest, ETH_ALEN);
 
@@ -479,8 +479,8 @@ static td_adapter_result_t realtek_init(const struct td_adapter_config *cfg,
     atomic_init(&adapter->running, false);
     adapter->rx_fd = -1;
     adapter->tx_fd = -1;
-    adapter->rx_ifindex = -1;
-    adapter->tx_ifindex = -1;
+    adapter->rx_kernel_ifindex = -1;
+    adapter->tx_kernel_ifindex = -1;
     adapter->tx_ipv4.s_addr = 0;
     adapter->packet_subscribed = false;
     adapter->rx_thread_started = false;
@@ -628,7 +628,7 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
     }
 
     struct td_adapter *adapter = handle;
-    if (adapter->tx_fd < 0 || adapter->tx_ifindex <= 0) {
+    if (adapter->tx_fd < 0 || adapter->tx_kernel_ifindex <= 0) {
         return TD_ADAPTER_ERR_NOT_READY;
     }
 
@@ -654,15 +654,15 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
     }
 
     const char *tx_iface = adapter->tx_iface;
-    int tx_ifindex = adapter->tx_ifindex;
+    int tx_kernel_ifindex = adapter->tx_kernel_ifindex;
     struct in_addr iface_ip = adapter->tx_ipv4;
     uint8_t iface_mac[ETH_ALEN];
     memcpy(iface_mac, adapter->tx_mac, ETH_ALEN);
 
     if (req->tx_iface_valid && req->tx_iface[0]) {
         tx_iface = req->tx_iface;
-        tx_ifindex = req->tx_ifindex;
-        if (!query_iface_details(tx_iface, &tx_ifindex, iface_mac, &iface_ip)) {
+    tx_kernel_ifindex = req->tx_kernel_ifindex;
+    if (!query_iface_details(tx_iface, &tx_kernel_ifindex, iface_mac, &iface_ip)) {
             pthread_mutex_unlock(&adapter->send_lock);
             realtek_logf(adapter, TD_LOG_ERROR, "failed to resolve interface %s for ARP send", tx_iface);
             return TD_ADAPTER_ERR_INVALID_ARG;
@@ -673,8 +673,8 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
         return TD_ADAPTER_ERR_INVALID_ARG;
     }
 
-    if (tx_ifindex <= 0) {
-        if (!query_iface_details(tx_iface, &tx_ifindex, iface_mac, &iface_ip)) {
+    if (tx_kernel_ifindex <= 0) {
+        if (!query_iface_details(tx_iface, &tx_kernel_ifindex, iface_mac, &iface_ip)) {
             pthread_mutex_unlock(&adapter->send_lock);
             realtek_logf(adapter, TD_LOG_ERROR, "failed to resolve interface %s for ARP send", tx_iface);
             return TD_ADAPTER_ERR_INVALID_ARG;
@@ -744,7 +744,7 @@ static td_adapter_result_t realtek_send_arp(td_adapter_t *handle,
     memset(&addr, 0, sizeof(addr));
     addr.sll_family = AF_PACKET;
     addr.sll_protocol = htons(vlan_tagging ? ETH_P_8021Q : ETH_P_ARP);
-    addr.sll_ifindex = tx_ifindex;
+    addr.sll_ifindex = tx_kernel_ifindex;
     addr.sll_halen = ETH_ALEN;
     memcpy(addr.sll_addr, target_mac, ETH_ALEN);
 

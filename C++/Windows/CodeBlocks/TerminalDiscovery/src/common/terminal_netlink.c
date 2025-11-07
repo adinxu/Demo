@@ -74,7 +74,7 @@ static void handle_netlink_message(struct terminal_netlink_listener *listener,
     }
 
     terminal_address_update_t update = {
-        .ifindex = (int)ifa->ifa_index,
+        .kernel_ifindex = (int)ifa->ifa_index,
         .address = addr,
         .prefix_len = prefix_len,
         .is_add = (nlh->nlmsg_type == RTM_NEWADDR),

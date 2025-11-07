@@ -64,7 +64,7 @@ struct td_adapter_packet_view {
     uint16_t ether_type;        /* host-byte-order inner EtherType */
     int vlan_id;                /* -1 if no VLAN present */
     struct timespec ts;         /* capture timestamp */
-    uint32_t lport;             /* logical port from CPU tag; 0 when unavailable */
+    uint32_t ifindex;           /* logical interface identifier; 0 when unavailable */
     uint8_t src_mac[ETH_ALEN];
     uint8_t dst_mac[ETH_ALEN];
 };
@@ -91,7 +91,7 @@ struct td_adapter_arp_request {
     uint8_t target_mac[ETH_ALEN];
     int vlan_id;                 /* -1 when no VLAN tag is required, else 1-4094 */
     char tx_iface[IFNAMSIZ];        /* optional override transmit iface */
-    int tx_ifindex;                 /* optional, -1 if unknown */
+    int tx_kernel_ifindex;          /* optional kernel ifindex, -1 if unknown */
     bool tx_iface_valid;            /* true when tx_iface contains a preference */
 };
 

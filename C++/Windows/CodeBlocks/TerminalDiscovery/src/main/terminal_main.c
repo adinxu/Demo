@@ -132,11 +132,11 @@ static void terminal_event_logger(const terminal_event_record_t *records,
         }
         td_log_writef(TD_LOG_INFO,
                       "terminal_events",
-                      "event=%s mac=%s ip=%s port=%u",
+                      "event=%s mac=%s ip=%s ifindex=%u",
                       event_tag_to_string(rec->tag),
                       mac_buf,
                       ip_buf,
-                      rec->port);
+                      rec->ifindex);
     }
 }
 
@@ -161,8 +161,8 @@ static void terminal_probe_handler(const terminal_probe_request_t *request, void
     memcpy(arp_req.target_mac, request->key.mac, ETH_ALEN);
     arp_req.sender_ip = request->source_ip;
     arp_req.vlan_id = request->vlan_id;
-    bool fallback_possible = (request->tx_ifindex > 0 && request->tx_iface[0] != '\0');
-    arp_req.tx_ifindex = fallback_possible ? request->tx_ifindex : -1;
+    bool fallback_possible = (request->tx_kernel_ifindex > 0 && request->tx_iface[0] != '\0');
+    arp_req.tx_kernel_ifindex = fallback_possible ? request->tx_kernel_ifindex : -1;
     if (fallback_possible) {
         snprintf(arp_req.tx_iface, sizeof(arp_req.tx_iface), "%s", request->tx_iface);
     }

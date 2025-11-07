@@ -26,7 +26,7 @@ struct terminal_key {
 
 struct terminal_metadata {
     int vlan_id;            /* -1 if unknown */
-    uint32_t lport;         /* 0 when unavailable */
+    uint32_t ifindex;       /* 0 when unavailable; logical port identifier (not tx_kernel_ifindex) */
 };
 
 struct terminal_entry {
@@ -37,7 +37,7 @@ struct terminal_entry {
     uint32_t failed_probes;
     struct terminal_metadata meta;
     char tx_iface[IFNAMSIZ];
-    int tx_ifindex;
+    int tx_kernel_ifindex;
     struct in_addr tx_source_ip;
     struct terminal_entry *next;
 };
@@ -45,7 +45,7 @@ struct terminal_entry {
 typedef struct terminal_probe_request {
     struct terminal_key key;
     char tx_iface[IFNAMSIZ];
-    int tx_ifindex;
+    int tx_kernel_ifindex;
     struct in_addr source_ip;
     int vlan_id;
     terminal_state_t state_before_probe;
@@ -55,7 +55,7 @@ typedef void (*terminal_probe_fn)(const terminal_probe_request_t *request, void 
 
 typedef bool (*terminal_iface_selector_fn)(const struct terminal_metadata *meta,
                                            char tx_iface[IFNAMSIZ],
-                                           int *tx_ifindex,
+                                           int *tx_kernel_ifindex,
                                            void *user_ctx);
 
 typedef struct terminal_snapshot {
@@ -71,7 +71,7 @@ typedef enum {
 
 typedef struct terminal_event_record {
     struct terminal_key key;
-    uint32_t port; /* 0 when unknown */
+    uint32_t ifindex; /* 0 when unknown; logical port identifier */
     terminal_event_tag_t tag;
 } terminal_event_record_t;
 
@@ -96,7 +96,7 @@ struct terminal_manager_stats {
 struct terminal_manager;
 
 typedef struct terminal_address_update {
-    int ifindex;
+    int kernel_ifindex;
     struct in_addr address;
     uint8_t prefix_len; /* 0-32 */
     bool is_add;        /* true = add/update, false = remove */

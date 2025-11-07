@@ -70,7 +70,7 @@ bool accumulate_query(const terminal_event_record_t *record, void *user_ctx) {
         TerminalInfo info;
         info.mac = format_mac(record->key.mac);
         info.ip = format_ip(record->key.ip);
-        info.port = record->port;
+    info.ifindex = record->ifindex;
         info.tag = to_modify_tag(record->tag);
         ctx->info->push_back(std::move(info));
         return true;
@@ -112,7 +112,7 @@ void inc_report_adapter(const terminal_event_record_t *records, size_t count, vo
             TerminalInfo info;
             info.mac = format_mac(records[i].key.mac);
             info.ip = format_ip(records[i].key.ip);
-            info.port = records[i].port;
+            info.ifindex = records[i].ifindex;
             info.tag = to_modify_tag(records[i].tag);
             payload.push_back(std::move(info));
         }

@@ -19,24 +19,24 @@
 - `struct terminal_entry`
   - 按 `struct terminal_key{mac+ip}` 哈希存储于 `table[256]` 链表中。
   - 记录最近一次报文时间 `last_seen`、最近一次保活探测时间 `last_probe` 以及失败计数。
-  - `terminal_metadata` 保留 ARP 报文的 VLAN 与 ifindex（可来自 CPU tag 或 MAC 表查詢，缺失时写入 `0` 代表未知），其中 `ifindex` 统一表示整机接口标识；`vlan_id` 用于在物理口发包时封装 802.1Q 头部。
-  - `tx_iface/tx_ifindex` 仅在需要回退到 VLAN 虚接口的场景下填充；常规情况下置空并依赖 `meta.vlan_id` + 物理口完成发包，解析失败同样置空并进入 `IFACE_INVALID`。
+  - `terminal_metadata` 保留 ARP 报文的 VLAN 与 ifindex（可来自 CPU tag 或 MAC 表查詢，缺失时写入 `0` 代表未知），其中 `ifindex` 统一表示整机逻辑接口标识；`vlan_id` 用于在物理口发包时封装 802.1Q 头部。
+  - `tx_iface/tx_kernel_ifindex` 仅在需要回退到 VLAN 虚接口的场景下填充；常规情况下置空并依赖 `meta.vlan_id` + 物理口完成发包，解析失败同样置空并进入 `IFACE_INVALID`。
   - 时间戳字段（`last_seen`/`last_probe`）统一使用 `CLOCK_MONOTONIC` 采集，避免系统时间跳变对状态机造成干扰。
 
 - `struct terminal_manager`
   - 全局互斥锁 `lock` 保护哈希桶及状态更新。
   - 定时线程相关：`worker_thread` + `worker_lock` + `worker_cond`。线程按 `scan_interval_ms` 周期触发全量扫描。
   - `probe_cb`：由外部注入的探测函数，接收 `terminal_probe_request_t` 快照执行 ARP 保活。
-  - `iface_address_table`：哈希表维护 `ifindex -> prefix_list`，每项包含网络地址与掩码长度；仅在持有 `lock` 时更新。
-  - `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，`resolve_tx_interface` 成功后登记，便于地址变化时精准定位受影响终端。
+  - `iface_address_table`：哈希表维护 `kernel_ifindex -> prefix_list`，每项包含网络地址与掩码长度；仅在持有 `lock` 时更新。
+  - `iface_binding_index`：反向索引 `kernel_ifindex -> terminal_entry*` 链表，`resolve_tx_interface` 成功后登记，便于地址变化时精准定位受影响终端。
   - `struct terminal_metadata` 新增字段：
     - `uint32_t ifindex`：来自 MAC 表桥接的整机 ifindex，默认 `0` 表示未知。
     - `uint64_t mac_view_version`：记录最近一次成功解析 ifindex 时的 MAC 缓存版本号，便于快速判断是否需要重新查询。
   - 其余字段（VLAN、入口时间戳）保持不变。
 
 - `terminal_probe_request_t`
-  - 在定时扫描阶段生成的简化快照，携带终端 key、最近一次确认的 VLAN ID、可选的 `tx_iface/ifindex` 以及探测前状态，供探测回调直接构造 ARP 请求。
-  - `tx_iface/ifindex` 仅在需要回退到虚接口时才会赋值；常规物理口发包仅依赖 VLAN ID 与全局配置即可完成构帧。
+  - 在定时扫描阶段生成的简化快照，携带终端 key、最近一次确认的 VLAN ID、可选的 `tx_iface/kernel_ifindex` 以及探测前状态，供探测回调直接构造 ARP 请求。
+  - `tx_iface/kernel_ifindex` 仅在需要回退到虚接口时才会赋值；常规物理口发包仅依赖 VLAN ID 与全局配置即可完成构帧。
   - 保持只读语义，回调层若需要更新状态，应通过引擎公开的接口重新写回。
 
 ## 主要流程
@@ -47,23 +47,23 @@
   - 优先执行外部自定义 `iface_selector`，允许平台覆盖默认 VLAN -> 接口的推导规则。
   - 默认路径仍按 `vlan_iface_format` 生成 `vlanX` 等接口名，利用 `if_nametoindex` 解析出 VLANIF 以便查询地址资源；这些信息用于确定源 IP 与可用性，即便最终发包走物理口。
   - 只有当 `iface_address_table` 中存在命中的前缀时，才认为该 VLAN 的地址上下文有效；否则视为不可保活并保留 VLAN ID 以待后续报文复活。
-  - 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
+  - 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_kernel_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
 5. 当报文绑定成功且终端 `meta.ifindex == 0` 或 `meta.mac_view_version < realtek_mac_cache_version()` 时，将通过 `terminal_mac_locator_lookup(mac, vlan, &ifindex, &version)` 尝试解析整机 ifindex：
    - 函数由 Realtek 适配器提供，内部共享 demo 的容量缓存与静态缓冲区；若当前快照超过 TTL 会在查询前触发一次刷新。
    - 查询命中时将 `meta.ifindex` 更新为返回值，并将 `meta.mac_view_version` 写为最新 `version`；若 ifindex 发生变化（例如 MAC 漂移），会触发 `terminal_event_record_t` 的 `MOD` 事件。
    - 查询未命中时保持 `ifindex=0`，同时调用 `terminal_ifindex_tracker_mark_pending(entry)` 将该终端加入待刷新列表，等待后台回调或下一次报文触发重新解析。
 
 #### `resolve_tx_interface` 实现细节
-1. 记录历史绑定：在尝试解析前，先缓存旧的 `tx_iface/tx_ifindex`，用于后续比对及必要时的解绑。
+1. 记录历史绑定：在尝试解析前，先缓存旧的 `tx_iface/tx_kernel_ifindex`，用于后续比对及必要时的解绑。
 2. 多级候选选择：
-  - 首先调用可选的 `iface_selector` 回调返回接口名/ifindex；
+  - 首先调用可选的 `iface_selector` 回调返回接口名/kernel ifindex；
   - 若未解析成功且 VLAN ID >= 0，则根据 `vlan_iface_format`（默认 `vlan%u`）拼出接口名并通过 `if_nametoindex` 解析；
-  - 如果只有接口名，函数会再次调用 `if_nametoindex` 兜底，确保 ifindex 有效。
+  - 如果只有接口名，函数会再次调用 `if_nametoindex` 兜底，确保内核 ifindex 有效。
 3. 地址校验：解析出 ifindex 后，会到 `iface_records` 中查找对应地址前缀，并通过 `iface_record_select_ip` 挑选与终端 IP 匹配的源地址；失败时认为候选无效并回退。
 4. 解绑与回退：
-  - 当候选无效或完全无法解析时，会调用 `iface_binding_detach`（若此前存在绑定）并清空 `tx_iface/tx_ifindex/tx_source_ip`，随后返回 `false` 以便上层转入 `IFACE_INVALID`；
+  - 当候选无效或完全无法解析时，会调用 `iface_binding_detach`（若此前存在绑定）并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`，随后返回 `false` 以便上层转入 `IFACE_INVALID`；
   - 旧绑定与新的候选 ifindex 不一致时，同样先执行解绑以维持反向索引一致性。
-5. 建立新绑定：候选合法时，写入 `tx_iface/tx_ifindex/tx_source_ip` 并调用 `iface_binding_attach` 加入索引；若 attach 失败（内存不足等），会立即回滚到未绑定状态。
+5. 建立新绑定：候选合法时，写入 `tx_iface/tx_kernel_ifindex/tx_source_ip` 并调用 `iface_binding_attach` 加入索引；若 attach 失败（内存不足等），会立即回滚到未绑定状态。
 6. 返回值：成功解析且绑定完成时返回 `true`，否则返回 `false`，供调用方控制状态机（`apply_packet_binding` 在失败时将终端标记为 `IFACE_INVALID`）。
 
 ### 定时扫描 `terminal_manager_on_timer`
@@ -79,7 +79,7 @@
 
 ### 地址更新 `terminal_manager_on_address_update`
 - 通过 Netlink `RTM_NEWADDR/DELADDR`（或平台等效回调）更新 `iface_address_table`：
-  - 在持有 `lock` 的前提下增删前缀，并根据 `ifindex` 查询 `iface_binding_index`。
+  - 在持有 `lock` 的前提下增删前缀，并根据 `kernel_ifindex` 查询 `iface_binding_index`。
   - 对所有关联终端重新校验其 IP 是否仍命中该接口前缀；若不命中则清空回退接口绑定并调用 `set_state(...IFACE_INVALID)`，同时保留 VLAN ID 以便后续报文复活；更新仅影响内部状态，不直接排队事件。
   - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 ifindex 发生变化或终端被重新创建时才会触发对外事件。
   - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。

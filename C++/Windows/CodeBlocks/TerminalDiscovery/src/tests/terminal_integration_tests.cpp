@@ -50,9 +50,9 @@ struct selector_ctx {
 
 static bool selector_callback(const terminal_metadata *meta,
                               char tx_iface[IFNAMSIZ],
-                              int *tx_ifindex,
+                              int *tx_kernel_ifindex,
                               void *user_ctx) {
-    if (!meta || !tx_iface || !tx_ifindex || !user_ctx) {
+    if (!meta || !tx_iface || !tx_kernel_ifindex || !user_ctx) {
         return false;
     }
     auto *ctx = static_cast<selector_ctx *>(user_ctx);
@@ -60,7 +60,7 @@ static bool selector_callback(const terminal_metadata *meta,
         return false;
     }
     std::snprintf(tx_iface, IFNAMSIZ, "ut%d", ctx->ifindex);
-    *tx_ifindex = ctx->ifindex;
+    *tx_kernel_ifindex = ctx->ifindex;
     return true;
 }
 
@@ -69,13 +69,13 @@ static void sleep_ms(unsigned int ms) {
 }
 
 static void apply_address_update(terminal_manager *mgr,
-                                 int ifindex,
+                                 int kernel_ifindex,
                                  const char *address,
                                  uint8_t prefix_len,
                                  bool is_add) {
     terminal_address_update_t update;
     std::memset(&update, 0, sizeof(update));
-    update.ifindex = ifindex;
+    update.kernel_ifindex = kernel_ifindex;
     update.prefix_len = prefix_len;
     update.is_add = is_add;
     if (address) {
@@ -89,7 +89,7 @@ static void build_arp_packet(td_adapter_packet_view *packet,
                              const uint8_t mac[ETH_ALEN],
                              const char *ip_text,
                              int vlan_id,
-                             uint32_t lport) {
+                             uint32_t ifindex) {
     std::memset(arp, 0, sizeof(*arp));
     arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
     arp->ea_hdr.ar_pro = htons(ETHERTYPE_IP);
@@ -105,7 +105,7 @@ static void build_arp_packet(td_adapter_packet_view *packet,
     packet->payload_len = sizeof(*arp);
     packet->ether_type = ETHERTYPE_ARP;
     packet->vlan_id = vlan_id;
-    packet->lport = lport;
+    packet->ifindex = ifindex;
     std::memcpy(packet->src_mac, mac, ETH_ALEN);
 }
 
@@ -167,8 +167,8 @@ static bool test_increment_add_and_get_all(terminal_manager *mgr,
                 std::printf("[FAIL] expected ModifyTag::ADD\n");
                 ok = false;
             }
-            if (info.port != 7U) {
-                std::printf("[FAIL] expected port 7, got %u\n", info.port);
+            if (info.ifindex != 7U) {
+                std::printf("[FAIL] expected ifindex 7, got %u\n", info.ifindex);
                 ok = false;
             }
         }
@@ -181,6 +181,9 @@ static bool test_increment_add_and_get_all(terminal_manager *mgr,
         ok = false;
     } else if (snapshot.size() != 1) {
         std::printf("[FAIL] expected snapshot size 1, got %zu\n", snapshot.size());
+        ok = false;
+    } else if (snapshot.front().ifindex != 7U) {
+        std::printf("[FAIL] expected snapshot ifindex 7, got %u\n", snapshot.front().ifindex);
         ok = false;
     }
 

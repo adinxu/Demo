@@ -23,7 +23,7 @@
 - 文档使用中文输出，流程图(比如UML的状态机图、通信图、顺序图)优先使用mermaid语法绘制
 
 ## Chat Conventions
-- 使用中文回答问题
+- 优先使用中文回答问题
 
 ## Testing Guidelines
 
