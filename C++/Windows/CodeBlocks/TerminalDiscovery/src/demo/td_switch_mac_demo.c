@@ -41,9 +41,6 @@ static void td_switch_mac_print_entry(FILE *out, const SwUcMacEntry *entry, uint
 
 int td_switch_mac_demo_dump(void) {
     static SwUcMacEntry *entries = NULL;
-    static uint32_t entries_capacity = 0;
-
-    uint32_t capacity_hint;
 
     if (!g_capacity_initialized) {
         uint32_t queried_capacity = 0;
@@ -69,24 +66,11 @@ int td_switch_mac_demo_dump(void) {
             queried_capacity = TD_SWITCH_MAC_MAX_CAPACITY;
         }
 
-        if (queried_capacity == 0) {
-            queried_capacity = TD_SWITCH_MAC_DEFAULT_CAPACITY;
-        }
-
         g_cached_capacity_hint = queried_capacity;
         g_capacity_initialized = 1;
     }
 
-    capacity_hint = g_cached_capacity_hint;
-
-    if (capacity_hint == 0) {
-        capacity_hint = TD_SWITCH_MAC_DEFAULT_CAPACITY;
-    }
-
-    uint32_t capacity = capacity_hint;
-    if (capacity == 0) {
-        capacity = TD_SWITCH_MAC_DEFAULT_CAPACITY;
-    }
+    uint32_t capacity = g_cached_capacity_hint;
 
     if (entries == NULL) {
         entries = calloc(capacity, sizeof(*entries));
@@ -94,7 +78,6 @@ int td_switch_mac_demo_dump(void) {
             fprintf(stderr, "[switch-mac-demo] 分配 %u 项缓存失败: %s\n", capacity, strerror(errno));
             return -ENOMEM;
         }
-        entries_capacity = capacity;
     }
 
     uint32_t count = 0;
@@ -121,8 +104,11 @@ int td_switch_mac_demo_dump(void) {
     printf("索引  MAC 地址              VLAN   IFINDEX  属性 (原始值)\n");
     printf("-----  -------------------  -----  -------  -------------\n");
 
-    for (uint32_t i = 0; i < count; ++i) {
-        td_switch_mac_print_entry(stdout, &entries[i], i);
+    {
+        uint32_t i;
+        for (i = 0; i < count; ++i) {
+            td_switch_mac_print_entry(stdout, &entries[i], i);
+        }
     }
 
     return 0;
