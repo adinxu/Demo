@@ -29,6 +29,7 @@ CSRCS := \
 	common/terminal_netlink.c \
 	adapter/adapter_registry.c \
 	adapter/realtek_adapter.c \
+	stub/td_switch_mac_stub.c \
 	main/terminal_main.c
 
 CPPSRCS := \
@@ -45,6 +46,11 @@ INTEGRATION_TEST_SRCS := tests/terminal_integration_tests.cpp
 INTEGRATION_TEST_OBJS := $(INTEGRATION_TEST_SRCS:.cpp=.o)
 INTEGRATION_TEST_DEPS := common/terminal_manager.o common/td_logging.o common/terminal_northbound.o
 
+STUB_TEST_TARGET := td_switch_mac_stub_tests
+STUB_TEST_SRCS := tests/td_switch_mac_stub_tests.c
+STUB_TEST_OBJS := $(STUB_TEST_SRCS:.c=.o)
+STUB_TEST_DEPS := stub/td_switch_mac_stub.o
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
@@ -56,6 +62,9 @@ $(TEST_TARGET): $(TEST_OBJS) $(TEST_DEPS)
 $(INTEGRATION_TEST_TARGET): $(INTEGRATION_TEST_OBJS) $(INTEGRATION_TEST_DEPS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(STUB_TEST_TARGET): $(STUB_TEST_OBJS) $(STUB_TEST_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -63,7 +72,10 @@ $(INTEGRATION_TEST_TARGET): $(INTEGRATION_TEST_OBJS) $(INTEGRATION_TEST_DEPS)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(TARGET) $(OBJS) $(TEST_TARGET) $(TEST_OBJS) $(INTEGRATION_TEST_TARGET) $(INTEGRATION_TEST_OBJS)
+	rm -f $(TARGET) $(OBJS) \
+		$(TEST_TARGET) $(TEST_OBJS) \
+		$(INTEGRATION_TEST_TARGET) $(INTEGRATION_TEST_OBJS) \
+		$(STUB_TEST_TARGET) $(STUB_TEST_OBJS)
 
 cross:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-rtl83xx-linux- all
@@ -74,6 +86,7 @@ cross-generic:
 
 .PHONY: all clean cross cross-generic test
 
-test: $(TEST_TARGET) $(INTEGRATION_TEST_TARGET)
+test: $(TEST_TARGET) $(INTEGRATION_TEST_TARGET) $(STUB_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(INTEGRATION_TEST_TARGET)
+	./$(STUB_TEST_TARGET)

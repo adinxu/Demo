@@ -41,6 +41,7 @@
 
 ## MAC 表桥接与 ifindex 获取方案
 - Realtek 适配器在编译期直接链接外部团队交付的 `td_switch_mac_bridge` 模块（见 `src/include/td_switch_mac_bridge.h`），从而复用 demo 中已验证的 `td_switch_mac_get_capacity/td_switch_mac_snapshot` 调用路径。`realtek_init` 首次运行时会调用 `td_switch_mac_get_capacity`，将返回值缓存到 `adapter->mac_capacity`，并一次性 `calloc` 对应数量的 `td_switch_mac_entry_t` 缓冲区；若桥接暂不可用，会以 `TD_ADAPTER_ERR_NOT_READY` 形式回传，调用方可按需重试。
+  - 开发环境缺失 `libswitchapp.so` 时启用工程内置的弱符号桩实现（`src/stub/td_switch_mac_stub.c`）。桩在第一次调用时打印提示、返回固定容量 1024，并填充少量示例条目；真实桥接编译进最终镜像后会自动覆盖弱符号，无需修改调用方逻辑。
 - 适配器新增内部结构 `struct realtek_mac_cache`：
   - `td_switch_mac_entry_t *entries`：指向上述静态缓冲区，生命周期与适配器一致。
   - `uint32_t capacity`/`uint32_t used`：缓存容量与最近一次快照条数。

@@ -28,7 +28,7 @@
 4. ✅ Demo 校验：使用 stage0 demo 记录 `recvmsg` 返回的 ifindex/接口名，确认物理口 `eth0` 收到报文后解析出的接口名恒为 `eth0`，不能直接用于选择后续 ARP 发包接口，仍需依据终端绑定的 VLAN 元数据决定报文内容。
 5. ✅ VLAN tag 直出验证：扩展 stage0 demo 支持 `--tx-iface` + `--tx-vlan` 在用户态封装 802.1Q header 并直接从物理口发包，记录成功/失败条件及平台差异；该模式现已作为主线发包策略输入，虚接口绑定作为回退选项。
 6. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
-7. ✅ 新增 MAC 表桥接验证 demo：外部团队已交付 C++ 桥接源文件及其 C 接口，并与 `src/demo/td_switch_mac_demo.c` 联调通过。demo 在入口阶段调用 `td_switch_mac_get_capacity` 估算最大条目并缓存容量，后续复用同一 `SwUcMacEntry` 缓冲区驱动 `td_switch_mac_snapshot`；桥接模块在装载期间完成一次性 `createSwitch` 与 `SwitchDev*` 缓存，调用路径严格遵守 SDK 缓冲区约定。该 demo 现作为 ifindex 获取/同步方案的基线实现，后续生产逻辑需复用相同的容量缓存与缓冲区复用模式，确保与桥接模块的数据流一致。
+7. ✅ 新增 MAC 表桥接验证 demo：外部团队已交付 C++ 桥接源文件及其 C 接口，并与 `src/demo/td_switch_mac_demo.c` 联调通过。demo 在入口阶段调用 `td_switch_mac_get_capacity` 估算最大条目并缓存容量，后续复用同一 `SwUcMacEntry` 缓冲区驱动 `td_switch_mac_snapshot`；桥接模块在装载期间完成一次性 `createSwitch` 与 `SwitchDev*` 缓存，调用路径严格遵守 SDK 缓冲区约定。快照接口的第二个参数 `out_count` 完全作为出参使用，不支持“请求条数”语义；调用方需事先按容量准备缓存并在返回后读取实际条目。该 demo 现作为 ifindex 获取/同步方案的基线实现，后续生产逻辑需复用相同的容量缓存与缓冲区复用模式，确保与桥接模块的数据流一致。
 
 ### 阶段 1：适配层设计与实现（已完成）
 1. ✅ ABI 设计：`src/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。

@@ -38,7 +38,7 @@ typedef struct __SwUcMacEntry {
 #endif /* TD_SWITCH_MAC_FALLBACK_TYPES_DEFINED */
 
 int td_switch_mac_get_capacity(uint32_t *out_capacity);
-int td_switch_mac_snapshot(SwUcMacEntry *entries, uint32_t *inout_count);
+int td_switch_mac_snapshot(SwUcMacEntry *entries, uint32_t *out_count);
 
 #ifdef __cplusplus
 }

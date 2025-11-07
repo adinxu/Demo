@@ -69,3 +69,6 @@ C++/Windows/CodeBlocks/Terminal_Discovery/src/terminal_discovery
 C++/Windows/CodeBlocks/Terminal_Discovery/src/demo/stage0_raw_socket_demo
 C++/Windows/CodeBlocks/Terminal_Discovery/src/terminal_discovery_tests
 C++/Windows/CodeBlocks/Terminal_Discovery/src/terminal_integration_tests
+C++/Windows/CodeBlocks/TerminalDiscovery/src/td_switch_mac_stub_tests
+C++/Windows/CodeBlocks/TerminalDiscovery/src/terminal_discovery_tests
+C++/Windows/CodeBlocks/TerminalDiscovery/src/terminal_integration_tests
