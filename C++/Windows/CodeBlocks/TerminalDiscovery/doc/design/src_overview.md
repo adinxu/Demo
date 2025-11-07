@@ -76,6 +76,11 @@ flowchart TD
     - `send_lock` 用于保证发送节流 (`last_send`) 与 `sendto` 操作在未来可能的多线程场景下保持串行；当前探测仅来自管理器单线程，即便争用极低，也保留该锁以免后续扩展引入竞态。
   - 默认在物理接口（如 `eth0`）上构造并发送附带 802.1Q 标记的 ARP 帧，封装前先校验 VLAN 是否落在 1–4094 的有效范围，只有在平台拒绝该模式时才回退到绑定 VLAN 虚接口。
   - 所有平台 I/O 均通过原生 Raw Socket 完成，避免依赖平台 SDK。
+  - MAC 表定位：
+    - `realtek_mac_cache` 维护 `mac_bucket_entry` 哈希桶、`SwUcMacEntry` 缓冲区、缓存 TTL（默认 30s）与单调版本号，初始化时即尝试读取容量并复用同一缓冲区承载 `td_switch_mac_snapshot` 返回的数据。
+    - 注册 `td_adapter_mac_locator_ops`，向上层提供 `lookup/subscribe/get_version`：`subscribe` 拉起后台 `mac_cache_worker_main` 线程并保存回调句柄，`lookup` 在缓存过期时自动触发同步刷新一次，刷新仍失败则返回 `TD_ADAPTER_ERR_NOT_READY` 让终端管理器稍后重试。
+    - 刷新线程会在执行 `td_switch_mac_snapshot` 后重建散列表并递增版本；若刷新失败会保留旧数据并记录 WARN，同时通过 `refresh_cb(version=0)` 通知上层，避免终端管理器误判为成功。
+    - 订阅回调在每次成功刷新后携带最新版本号，供 `terminal_manager` 的 `mac_locator_on_refresh` 批量补齐 ifindex 并重新验证漂移终端。
 
 ### 4. 核心引擎 `common/terminal_manager`
 - **主要数据结构**：
@@ -84,11 +89,15 @@ flowchart TD
     - 互斥量 `lock` 保护终端表，`worker_thread` 驱动定期扫描。
     - 事件队列 `terminal_event_queue` 存放北向变更通知。
     - 统计字段 `terminal_manager_stats`（Stage 4 新增）。
+    - MAC 定位上下文：持有适配器提供的 `mac_locator_ops`，维护 `mac_need_refresh_head/tail` 与 `mac_pending_verify_head/tail` 队列、最新的 `mac_locator_version` 以及订阅标志 `mac_locator_subscribed`，用于跟踪桥接刷新状态。
   - `terminal_entry`
     - 记录 MAC/IP、状态机（`terminal_state_t`）、最近报文时间、探测信息和接口元数据。
+    - `terminal_metadata.ifindex` 与 `mac_view_version` 存储最近一次 MAC 表查表结果，`mac_refresh_enqueued/mac_verify_enqueued` 标志避免重复排队。
   - 缓存最近一次可用的发包上下文：`tx_iface/tx_kernel_ifindex`（仅在需要回退到 VLAN 虚接口时填充）以及 `tx_source_ip`（默认取自可用 VLANIF 的 IPv4，供物理口发包使用）。
   - `terminal_event_record_t`
     - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。
+  - `mac_lookup_task`
+    - 封装 MAC 查表请求（终端 key、VLAN、校验标志），由 `mac_need_refresh` 与 `mac_pending_verify` 队列驱动，最终在解锁后批量执行。
   - `terminal_probe_request_t`
     - `terminal_manager_on_timer` 构造的探测快照，包含终端 key、待使用的 VLAN ID、可选的回退接口和 `source_ip`；`terminal_probe_handler` 依据该结构直接生成以物理口为主、虚接口为备的 ARP 请求。
 - **关键函数**：
@@ -98,10 +107,20 @@ flowchart TD
   - `terminal_manager_on_address_update`：由 netlink 监听器触发的虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。
   - `terminal_manager_get_stats`：返回当前计数器快照。
+  - `mac_locator_on_refresh` / `mac_lookup_execute`：订阅适配器 MAC 表刷新回调，基于版本号批量重建 ifindex 视图并在必要时排队 MOD 事件或累计 `event_dispatch_failures`。
 - **线程模型**：
   - 后台 `worker_thread` 每 `scan_interval_ms` 唤醒执行 `terminal_manager_on_timer`。
   - 适配器 RX 线程在收到报文后调用 `terminal_manager_on_packet`（持 `lock`）。
   - 北向事件分发在脱锁后执行，避免长时间占用互斥量。
+
+#### MAC 表 ifindex 维护
+
+- `terminal_manager_create` 会在检测到适配器实现 `mac_locator_ops` 时初始化缓存版本并注册 `mac_locator_on_refresh`。刷新回调在持锁状态下合并 `mac_need_refresh` 与 `mac_pending_verify` 队列，并遍历全部终端，将 `ifindex` 缺失或版本过期的条目排队查表。
+- 解锁后由 `mac_lookup_execute` 执行批量查表：
+  - 命中时更新 `terminal_metadata.ifindex` 与 `mac_view_version`，若端口发生漂移，会通过事件队列投递 `MOD` 并同步反向索引；
+  - SDK 返回暂不可用（`TD_ADAPTER_ERR_NOT_READY`）或桥接失败时会保留队列状态，等待下一轮刷新或定时器重新排队；
+  - 查表过程中所有事件统计在 `terminal_manager_stats.events_dispatched/event_dispatch_failures` 中体现，缺少回调时清空队列也会自增失败计数。
+- `terminal_manager_on_packet` 和 `terminal_manager_on_timer` 均会在检测到版本落后或 `ifindex` 缺失时主动入队查表任务，确保不依赖新的 MAC 刷新信号即可尝试恢复端口信息。
 
   #### 终端状态机
 
@@ -199,6 +218,12 @@ classDiagram
     +terminal_probe_request_t request
     +probe_task* next
   }
+  class mac_lookup_task {
+    +terminal_key key
+    +int vlan_id
+    +bool verify
+    +mac_lookup_task* next
+  }
   class terminal_probe_request_t {
     +terminal_key key
     +char tx_iface[IFNAMSIZ]
@@ -217,6 +242,8 @@ classDiagram
   iface_binding_entry "1" --> "1" terminal_entry
   terminal_manager "1" o--> "*" probe_task : pending
   probe_task "1" --> "1" terminal_probe_request_t
+  terminal_manager "1" o--> "*" mac_lookup_task : mac queues
+  mac_lookup_task --> terminal_key
   terminal_probe_request_t --> terminal_key
   terminal_entry --> terminal_metadata
   terminal_entry --> terminal_key

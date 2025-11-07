@@ -439,6 +439,9 @@ static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr)
     pthread_mutex_lock(&mgr->lock);
 
     if (!mgr->event_cb) {
+        if (mgr->events.size > 0) {
+            mgr->stats.event_dispatch_failures += 1;
+        }
         free_event_queue(&mgr->events);
         pthread_mutex_unlock(&mgr->lock);
         return;
@@ -1697,7 +1700,11 @@ int terminal_manager_set_event_sink(struct terminal_manager *mgr,
     mgr->event_cb = callback;
     mgr->event_cb_ctx = callback_ctx;
     if (!callback) {
+        size_t dropped = mgr->events.size;
         free_event_queue(&mgr->events);
+        if (dropped > 0) {
+            mgr->stats.event_dispatch_failures += 1;
+        }
     }
     pthread_mutex_unlock(&mgr->lock);
 

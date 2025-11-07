@@ -84,7 +84,7 @@
 
 ### 阶段 5：测试与验收（进行中）
 1. ✅ 单元测试：新增 `terminal_discovery_tests` 覆盖状态机（探测失败淘汰、接口失效保留期、ifindex 变更上报）与事件分发，命令 `make test` 可在 x86 环境快速执行。
-   - ⏳ 规划新增针对日志时间戳格式的断言或日志 sink 打桩，覆盖秒级时间前缀。
+   - ✅ 已实现日志时间戳断言（`test_default_log_timestamp`），通过重定向标准错误验证默认 sink 输出格式。
 2. ✅ 集成测试：新增 `terminal_integration_tests`，基于打桩 netlink/ARP 流程验证 `ADD/DEL` 事件、统计数据和重复注册保护。
 3. ✅ 北向测试：
    - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex` 数值）与重复注册告警。
@@ -95,9 +95,9 @@
    - Realtek MAC 表桥接：使用打桩接口模拟桥接 C API（如 `td_switch_mac_snapshot`）成功与失败，验证 ifindex 解析缓存、重试节奏与错误日志；同时确认调用侧缓冲区复用路径在容量不足、溢出提示等场景下的健壮性。
    - 配置转换：对 `td_config_to_manager_config` 提供边界输入（0、极大值）确保默认兜底与错误码表现正确。
    - 统计日志：替换日志 sink，驱动 `g_should_dump_stats` 触发，确认 `terminal_stats` 字段完整性与节奏控制。
-4. ⏳ 实机/压力验证：
+5. ⏳ 实机/压力验证：
    - 300 终端 Realtek Demo 回归；1k 终端压力测试记录 CPU/内存/丢包。
-5. ⏳ 验收输出：整理测试报告、回滚策略、性能曲线。
+6. ⏳ 验收输出：整理测试报告、回滚策略、性能曲线。
 
 ## 依赖与风险
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。

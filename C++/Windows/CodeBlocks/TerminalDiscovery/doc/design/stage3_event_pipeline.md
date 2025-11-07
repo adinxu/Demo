@@ -35,13 +35,15 @@
      1. 摘除整条链表并记录事件数量。
      2. 分配连续数组，顺序拷贝 `terminal_event_record_t`。
      3. 调用 `terminal_event_callback_fn(const terminal_event_record_t *records, size_t count, void *ctx)`。
-   - 若内存分配失败，会记录告警并丢弃该批事件（节点依旧被释放，防止堆积）。
+   - 若内存分配失败或已无有效回调，会记录 WARN 并丢弃该批事件；对应的 `event_dispatch_failures` 会自增 1，随后仍释放原队列节点，避免长期堆积。
 
 3. **显式操作**
    - `terminal_manager_set_event_sink`
      - 注册或清除增量上报回调；启用时立即触发一次分发，确保历史积压事件第一时间上报。
+     - 关闭回调时若仍有待发事件，会在清理队列的同时增加一次 `event_dispatch_failures` 计数，用于提示北向忘记消费的批次。
    - `terminal_manager_flush_events`
      - 手动刷新入口（例如关闭前或测试时立即输出积压事件）。
+      - 内部直接调用 `terminal_manager_maybe_dispatch_events`，保持与后台分发一致的统计口径。
 
 ## 北向查询
 - `terminal_manager_query_all`

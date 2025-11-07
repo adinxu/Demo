@@ -30,7 +30,7 @@
 | `probe_failures` | 因探测失败被淘汰的终端数 | 超过阈值后删除条目 |
 | `address_update_events` | 虚接口 IPv4 前缀增删次数 | `terminal_manager_on_address_update` |
 | `events_dispatched` | 成功下发给北向回调的事件条目数 | `terminal_manager_maybe_dispatch_events` |
-| `event_dispatch_failures` | 事件批次因内存不足或回调缺失被丢弃次数 | `terminal_manager_maybe_dispatch_events` |
+| `event_dispatch_failures` | 事件批次因内存不足或回调缺失被丢弃次数（包括关闭回调时的残留队列） | `terminal_manager_maybe_dispatch_events` / `terminal_manager_set_event_sink` |
 | `current_terminals` | 当前终端表内条目数量 | 新建/删除条目、或通过 `terminal_manager_get_stats` 读取时同步 |
 
 - `terminal_manager_get_stats` 提供线程安全的快照接口，持有管理器互斥锁后拷贝统计结构体，调用方只需传入预分配的 `struct terminal_manager_stats`。
