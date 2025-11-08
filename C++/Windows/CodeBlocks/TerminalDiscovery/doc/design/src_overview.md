@@ -6,18 +6,40 @@
 
 ```
 src/
+ ├── adapter/
+ │   ├── adapter_registry.c/.h
+ │   └── realtek_adapter.c/.h
  ├── common/
  │   ├── td_logging.c/.h
  │   ├── td_config.c/.h
  │   ├── terminal_manager.c/.h
  │   ├── terminal_netlink.c/.h
  │   └── terminal_northbound.cpp / terminal_discovery_api.hpp
- ├── adapter/
- │   ├── adapter_registry.c/.h
- │   └── realtek_adapter.c/.h
- └── main/
-     └── terminal_main.c
+ ├── include/
+ │   ├── adapter_api.h
+ │   ├── terminal_manager.h
+ │   └── ...（对外暴露的公共头文件）
+ ├── main/
+ │   └── terminal_main.c
+ ├── stub/
+ │   └── td_switch_mac_stub.c/.h
+ ├── tests/
+ │   ├── terminal_manager_tests.c
+ │   ├── terminal_integration_tests.cpp
+ │   └── ...（单元/集成测试入口）
+ ├── demo/
+ │   └── ...（示例或验证程序，不参与发布）
+ └── ref/
+   └── ...（供应商参考实现，仅供查阅）
 ```
+
+- `adapter/` 集中适配层实现，当前仅有 `realtek_adapter` 提供真实硬件接入能力。
+- `common/` 含业务核心：终端管理器、配置、日志、netlink 与北向桥接实现。
+- `include/` 存放跨目录共享的对外头文件，供适配层与测试复用。
+- `stub/` 提供 `td_switch_mac_stub` 等模拟组件，主要服务于单元测试与无硬件环境。
+- `tests/` 汇总 C/C++ 单元与集成测试入口，`make test` 将直接执行此目录下的目标。
+- `demo/` 保留实验性/演示用程序，不随正式版本发布。
+- `ref/` 仅存放厂商给出的参考代码或头文件，保持只读，用于对照实际实现。
 
 ### 架构视图（模块/组件层）
 
@@ -36,6 +58,20 @@ flowchart TD
         NB["terminal_northbound"]
     end
 
+  subgraph Include["include/"]
+    API["adapter_api.h"]
+    TMH["terminal_manager.h"]
+  end
+
+  subgraph Stub["stub/"]
+    MACStub["td_switch_mac_stub"]
+  end
+
+  subgraph Tests["tests/"]
+    TmUT["terminal_manager_tests"]
+    TiIT["terminal_integration_tests"]
+  end
+
     subgraph Main["main/"]
         ENTRY["terminal_main"]
     end
@@ -51,9 +87,18 @@ flowchart TD
     RA -.-> TM
     NL -.-> TM
     NB -.-> TM
+  API -.-> RA
+  API -.-> MACStub
+  TMH -.-> TM
+  TMH -.-> NB
+  MACStub -.-> TM
+  TmUT --> TM
+  TmUT --> MACStub
+  TiIT --> NB
+  TiIT --> MACStub
 ```
 
-上述组件关系对应 `terminal_main.c` 的初始化流程：主程序拉起配置与日志组件、从 `adapter_registry` 解析适配器、构造 `terminal_manager` 并串联 netlink 监听与北向回调。
+上述组件关系对应 `terminal_main.c` 的初始化流程：主程序拉起配置与日志组件、从 `adapter_registry` 解析适配器、构造 `terminal_manager` 并串联 netlink 监听与北向回调。`include/` 提供各层共享 API，`stub/` 的 `td_switch_mac_stub` 通过同一接口模拟 MAC 桥接，`tests/` 下的单元/集成测试既验证管理器行为，也验证北向回调与 MAC stub 的协同。
 
 ### 1. 日志子系统 `common/td_logging`
 - 提供线程安全的日志级别、输出接口（`td_log_writef`）。
