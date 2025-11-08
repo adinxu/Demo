@@ -173,31 +173,57 @@ flowchart TD
 
   #### 终端状态机
 
-  `terminal_manager` 中的 `terminal_entry.state` 由 `set_state` 在多个调用点更新，完整流转见下图：
+  `terminal_manager` 中的 `terminal_entry.state` 由 `set_state` 在多个调用点更新，用于标识终端是否具备发包能力以及是否需要保活。
+
+  **抽象视图**
+
+  抽象视图将状态机压缩为三种语义状态，便于在高层次理解终端的生命周期与集中管理目标。
 
   ```mermaid
   stateDiagram-v2
-      [*] --> ACTIVE : 首次有效 ARP
-      ACTIVE --> PROBING : 超过 keepalive_interval
-      PROBING --> ACTIVE : 收到新的报文
-      PROBING --> IFACE_INVALID : 发送前接口失效
-      PROBING --> [*] : failed_probes >= threshold
-      ACTIVE --> IFACE_INVALID : resolve_tx_interface 失败 / 地址事件取消前缀
-      IFACE_INVALID --> ACTIVE : 新报文成功解析接口
-      IFACE_INVALID --> PROBING : 接口恢复后由 on_timer 触发探测
-      IFACE_INVALID --> [*] : 超过 iface_invalid_holdoff
+    state "已可联通" as LINKED
+    state "正在确认" as VERIFYING
+    state "无可用接口" as UNBOUND
+
+    [*] --> LINKED
+    LINKED --> VERIFYING : 保活周期到
+    VERIFYING --> LINKED : 探测成功或新报文
+    LINKED --> UNBOUND : 接口/地址不可用
+    VERIFYING --> UNBOUND : 探测前发现接口不可用
+    UNBOUND --> VERIFYING : 新报文触发重建
+    UNBOUND --> [*] : 保留期到期删除
   ```
 
-  关键判断逻辑分别位于 `terminal_manager_on_packet`、`terminal_manager_on_timer` 与 `terminal_manager_on_address_update` 中：
-  - `terminal_manager_on_packet` 负责刷新 `last_seen`、重置 `failed_probes`，并在 `resolve_tx_interface` 成功时将终端转回 `ACTIVE`。
-  - `terminal_manager_on_timer` 在超时后生成 `terminal_probe_request_t`，若探测累计失败则删除条目。
-  - 地址事件清空可用前缀时会调用 `set_state(...IFACE_INVALID)` 并延迟清理，同时清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`，防止后续探测误用过期的 VLANIF。
+  其中 `LINKED` 表示终端已经具备可发包接口，`VERIFYING` 表示进入保活确认阶段，`UNBOUND` 表示暂时缺失回程路径；终端在接口异常或保活失败时会离开 `LINKED`，并在收到新报文或探测成功后逐步恢复。
+
+  **实现视图**
+
+  实现视图直接对应 `terminal_state_t` 的 `ACTIVE/PROBING/IFACE_INVALID`，展示具体转移条件与淘汰路径。
+
+  ```mermaid
+  stateDiagram-v2
+    [*] --> ACTIVE : 首次有效 ARP
+    ACTIVE --> PROBING : 保活定时超出 keepalive_interval
+    PROBING --> ACTIVE : 收到新报文 / 保活成功
+    PROBING --> IFACE_INVALID : 探测前接口不可用
+    PROBING --> [*] : failed_probes >= keepalive_miss_threshold
+    ACTIVE --> IFACE_INVALID : resolve_tx_interface 失败或地址前缀被移除
+    IFACE_INVALID --> PROBING : 新报文触发且接口重新解析成功
+    IFACE_INVALID --> [*] : 超过 iface_invalid_holdoff_sec
+  ```
+
+  关键判断点对应源码中的：
+  - `terminal_manager_on_packet`：刷新 `last_seen`、清零 `failed_probes`，若 `resolve_tx_interface` 失败则立即 `set_state(IFACE_INVALID)`；成功时根据旧状态切回 `ACTIVE` 或 `PROBING`。
+  - `terminal_manager_on_timer`：仅当 `is_iface_available` 成立时才进入 `PROBING` 并排队探测；无法发包则保持/转入 `IFACE_INVALID`。连续探测失败满足阈值后删除终端。
+  - `terminal_manager_on_address_update`：当接口前缀被删除，调用 `iface_binding_detach` 并 `set_state(IFACE_INVALID)`；新增前缀只更新仍绑定终端的 `tx_source_ip`。
+  - `has_expired`：在 `IFACE_INVALID` 持续超过 `iface_invalid_holdoff_sec` 时触发淘汰，保障异常终端不会无限保留。
 
   ##### IFACE_INVALID 恢复细节
 
   - 任意路径命中 `IFACE_INVALID`（例如 `resolve_tx_interface` 失败、地址事件移除前缀）都会先调用 `iface_binding_detach`，立即从 `iface_records` 的绑定列表中移除终端并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`。MAC 查表失败仅会把 `meta.ifindex` 清零，状态仍由后续流程依据 `is_iface_available` 判定是否需要进入 `IFACE_INVALID`。
   - 定时器扫描阶段通过 `is_iface_available` 判断是否具备 `tx_kernel_ifindex` 与 `tx_source_ip`；若任一字段缺失则保持 `IFACE_INVALID`，并依赖 `iface_invalid_holdoff_sec` 的到期逻辑进行淘汰，不会发起探测。
-  - 只有当新的 ARP 报文到达并让 `resolve_tx_interface` 再次成功（形成新的绑定且写回源 IP）时，状态才会从 `IFACE_INVALID` 切换至 `PROBING`/`ACTIVE`。若报文抵达时仍缺少可用前缀，状态将维持在 `IFACE_INVALID` 直至地址同步完成。
+  - 只有当新的 ARP 报文到达并让 `resolve_tx_interface` 再次成功（形成新的绑定且写回源 IP）时，状态才会从 `IFACE_INVALID` 切换至 `PROBING`；后续需再次收到报文或探测成功才会恢复到 `ACTIVE`。若报文抵达时仍缺少可用前缀，状态将维持在 `IFACE_INVALID` 直至地址同步完成。
+  - 当前实现不会在同一次状态更新中直接从 `IFACE_INVALID` 回到 `ACTIVE`，需严格经历 `IFACE_INVALID` -> `PROBING` -> `ACTIVE` 的顺序。
   - `terminal_manager_on_address_update` 在新增前缀时，仅刷新仍在绑定列表中的终端的 `tx_source_ip`；已被移除绑定的 `IFACE_INVALID` 条目不会即时恢复，需要等待下一次报文或其它触发源重新绑定。
   - 地址删除路径会调用 `monotonic_now` 更新 `last_seen`，使保留期从解绑时刻重新计时，避免因历史时间戳过期而在持锁逻辑之外提前被扫描线程删除。
 
