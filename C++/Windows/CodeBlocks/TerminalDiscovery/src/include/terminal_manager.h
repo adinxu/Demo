@@ -56,11 +56,6 @@ typedef struct terminal_probe_request {
 
 typedef void (*terminal_probe_fn)(const terminal_probe_request_t *request, void *user_ctx);
 
-typedef bool (*terminal_iface_selector_fn)(const struct terminal_metadata *meta,
-                                           char tx_iface[IFNAMSIZ],
-                                           int *tx_kernel_ifindex,
-                                           void *user_ctx);
-
 typedef struct terminal_snapshot {
     struct terminal_key key;
     struct terminal_metadata meta;
@@ -111,8 +106,6 @@ struct terminal_manager_config {
     unsigned int iface_invalid_holdoff_sec;
     unsigned int scan_interval_ms;
     const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
-    terminal_iface_selector_fn iface_selector;
-    void *iface_selector_ctx;
     size_t max_terminals;
 };
 

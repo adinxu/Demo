@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -31,12 +32,25 @@ struct probe_capture {
     size_t count;
 };
 
-struct selector_ctx {
-    int ifindex;
-    int required_vlan;
-};
-
 static struct td_adapter g_stub_adapter;
+
+static int mock_kernel_ifindex_for_vlan(int vlan_id) {
+    return 1000 + vlan_id;
+}
+
+unsigned int if_nametoindex(const char *name) {
+    if (!name) {
+        return 0U;
+    }
+    if (strncmp(name, "vlan", 4) == 0) {
+        char *endptr = NULL;
+        long vlan = strtol(name + 4, &endptr, 10);
+        if (endptr && *endptr == '\0' && vlan > 0 && vlan < 4096) {
+            return (unsigned int)mock_kernel_ifindex_for_vlan((int)vlan);
+        }
+    }
+    return 0U;
+}
 
 static void capture_reset(struct event_capture *capture) {
     if (!capture) {
@@ -78,22 +92,6 @@ static void probe_callback(const terminal_probe_request_t *request, void *user_c
     }
     capture->last_request = *request;
     capture->count += 1;
-}
-
-static bool selector_callback(const struct terminal_metadata *meta,
-                              char tx_iface[IFNAMSIZ],
-                              int *tx_kernel_ifindex,
-                              void *user_ctx) {
-    struct selector_ctx *ctx = (struct selector_ctx *)user_ctx;
-    if (!ctx || !meta || !tx_iface || !tx_kernel_ifindex) {
-        return false;
-    }
-    if (ctx->required_vlan >= 0 && meta->vlan_id != ctx->required_vlan) {
-        return false;
-    }
-    snprintf(tx_iface, IFNAMSIZ, "ut%d", ctx->ifindex);
-    *tx_kernel_ifindex = ctx->ifindex;
-    return true;
 }
 
 static void sleep_ms(unsigned int ms) {
@@ -282,19 +280,15 @@ static bool query_counter_callback(const terminal_event_record_t *record, void *
 }
 
 static bool test_terminal_add_and_event(void) {
-    struct selector_ctx selector = {
-        .ifindex = 100,
-        .required_vlan = 100,
-    };
+    const int vlan_id = 100;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
     struct terminal_manager_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.keepalive_interval_sec = 5;
     cfg.keepalive_miss_threshold = 3;
     cfg.iface_invalid_holdoff_sec = 30;
     cfg.scan_interval_ms = 60000;
-    cfg.vlan_iface_format = NULL;
-    cfg.iface_selector = selector_callback;
-    cfg.iface_selector_ctx = &selector;
+    cfg.vlan_iface_format = "vlan%u";
     cfg.max_terminals = 16;
 
     struct event_capture events;
@@ -314,12 +308,12 @@ static bool test_terminal_add_and_event(void) {
 
     terminal_manager_set_event_sink(mgr, capture_callback, &events);
 
-    apply_address_update(mgr, selector.ifindex, "192.0.2.1", 24, true);
+    apply_address_update(mgr, tx_kernel_ifindex, "192.0.2.1", 24, true);
 
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
-    build_arp_packet(&packet, &arp, mac, "192.0.2.10", selector.required_vlan, 7);
+    build_arp_packet(&packet, &arp, mac, "192.0.2.10", vlan_id, 7);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -367,19 +361,15 @@ done:
 }
 
 static bool test_probe_failure_removes_terminal(void) {
-    struct selector_ctx selector = {
-        .ifindex = 101,
-        .required_vlan = 200,
-    };
+    const int vlan_id = 200;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
     struct terminal_manager_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.keepalive_interval_sec = 1;
     cfg.keepalive_miss_threshold = 1;
     cfg.iface_invalid_holdoff_sec = 30;
     cfg.scan_interval_ms = 60000;
-    cfg.vlan_iface_format = NULL;
-    cfg.iface_selector = selector_callback;
-    cfg.iface_selector_ctx = &selector;
+    cfg.vlan_iface_format = "vlan%u";
     cfg.max_terminals = 16;
 
     struct event_capture events;
@@ -399,12 +389,12 @@ static bool test_probe_failure_removes_terminal(void) {
 
     terminal_manager_set_event_sink(mgr, capture_callback, &events);
 
-    apply_address_update(mgr, selector.ifindex, "198.51.100.1", 24, true);
+    apply_address_update(mgr, tx_kernel_ifindex, "198.51.100.1", 24, true);
 
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
-    build_arp_packet(&packet, &arp, mac, "198.51.100.42", selector.required_vlan, 11);
+    build_arp_packet(&packet, &arp, mac, "198.51.100.42", vlan_id, 11);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -446,19 +436,15 @@ done:
 }
 
 static bool test_iface_invalid_holdoff(void) {
-    struct selector_ctx selector = {
-        .ifindex = 102,
-        .required_vlan = 300,
-    };
+    const int vlan_id = 300;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
     struct terminal_manager_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.keepalive_interval_sec = 10;
     cfg.keepalive_miss_threshold = 3;
     cfg.iface_invalid_holdoff_sec = 1;
     cfg.scan_interval_ms = 60000;
-    cfg.vlan_iface_format = NULL;
-    cfg.iface_selector = selector_callback;
-    cfg.iface_selector_ctx = &selector;
+    cfg.vlan_iface_format = "vlan%u";
     cfg.max_terminals = 16;
 
     struct event_capture events;
@@ -478,18 +464,18 @@ static bool test_iface_invalid_holdoff(void) {
 
     terminal_manager_set_event_sink(mgr, capture_callback, &events);
 
-    apply_address_update(mgr, selector.ifindex, "203.0.113.1", 24, true);
+    apply_address_update(mgr, tx_kernel_ifindex, "203.0.113.1", 24, true);
 
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x00, 0xde, 0xad, 0xbe, 0xef, 0x01};
-    build_arp_packet(&packet, &arp, mac, "203.0.113.9", selector.required_vlan, 3);
+    build_arp_packet(&packet, &arp, mac, "203.0.113.9", vlan_id, 3);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
     capture_reset(&events);
 
-    apply_address_update(mgr, selector.ifindex, "203.0.113.1", 24, false);
+    apply_address_update(mgr, tx_kernel_ifindex, "203.0.113.1", 24, false);
     terminal_manager_on_timer(mgr);
     terminal_manager_flush_events(mgr);
 
@@ -539,19 +525,15 @@ done:
 }
 
 static bool test_ifindex_change_emits_mod(void) {
-    struct selector_ctx selector = {
-        .ifindex = 103,
-        .required_vlan = 400,
-    };
+    const int vlan_id = 400;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
     struct terminal_manager_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.keepalive_interval_sec = 10;
     cfg.keepalive_miss_threshold = 3;
     cfg.iface_invalid_holdoff_sec = 30;
     cfg.scan_interval_ms = 60000;
-    cfg.vlan_iface_format = NULL;
-    cfg.iface_selector = selector_callback;
-    cfg.iface_selector_ctx = &selector;
+    cfg.vlan_iface_format = "vlan%u";
     cfg.max_terminals = 16;
 
     struct event_capture events;
@@ -571,12 +553,12 @@ static bool test_ifindex_change_emits_mod(void) {
 
     terminal_manager_set_event_sink(mgr, capture_callback, &events);
 
-    apply_address_update(mgr, selector.ifindex, "10.10.10.1", 24, true);
+    apply_address_update(mgr, tx_kernel_ifindex, "10.10.10.1", 24, true);
 
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
-    build_arp_packet(&packet, &arp, mac, "10.10.10.20", selector.required_vlan, 1);
+    build_arp_packet(&packet, &arp, mac, "10.10.10.20", vlan_id, 1);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -589,7 +571,7 @@ static bool test_ifindex_change_emits_mod(void) {
 
     capture_reset(&events);
 
-    build_arp_packet(&packet, &arp, mac, "10.10.10.20", selector.required_vlan, 2);
+    build_arp_packet(&packet, &arp, mac, "10.10.10.20", vlan_id, 2);
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
 

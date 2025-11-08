@@ -11,7 +11,6 @@
 - `iface_invalid_holdoff_sec`：接口失效后保留时间（默认 1800s）。
 - `scan_interval_ms`：固定周期扫描全部终端的间隔（默认 1000ms）。
 - `vlan_iface_format`：根据 VLAN ID 生成三层虚接口名的格式串，默认 `vlan%u`。
-- `iface_selector` / `iface_selector_ctx`：可选回调，支持自定义从 `terminal_metadata` 推导发包接口名/ifindex。
 
 未显式配置的字段会在 `terminal_manager_create` 内自动落到默认值，避免调用方遗漏。
 
@@ -48,8 +47,7 @@
 1. 解析 ARP 报文中的 `arp_sha` 与 `arp_spa` 作为终端 key。
 2. 命中已有条目则刷新 `last_seen` 并重置 `failed_probes`；未命中创建新节点。
 4. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
-  - 优先执行外部自定义 `iface_selector`，允许平台覆盖默认 VLAN -> 接口的推导规则。
-  - 默认路径仍按 `vlan_iface_format` 生成 `vlanX` 等接口名，利用 `if_nametoindex` 解析出 VLANIF 以便查询地址资源；这些信息用于确定源 IP 与可用性，即便最终发包走物理口。
+  - 根据 `vlan_iface_format` 生成 `vlanX` 等接口名，利用 `if_nametoindex` 解析出 VLANIF 以便查询地址资源；这些信息用于确定源 IP 与可用性，即便最终发包走物理口。
   - 只有当 `iface_address_table` 中存在命中的前缀时，才认为该 VLAN 的地址上下文有效；否则视为不可保活并保留 VLAN ID 以待后续报文复活。
   - 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_kernel_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
 5. 当报文绑定成功且终端 `meta.ifindex == 0`、或 `meta.mac_view_version < mac_locator_version` 时，会尝试解析整机 ifindex：
@@ -59,10 +57,7 @@
 
 #### `resolve_tx_interface` 实现细节
 1. 记录历史绑定：在尝试解析前，先缓存旧的 `tx_iface/tx_kernel_ifindex`，用于后续比对及必要时的解绑。
-2. 多级候选选择：
-  - 首先调用可选的 `iface_selector` 回调返回接口名/kernel ifindex；
-  - 若未解析成功且 VLAN ID >= 0，则根据 `vlan_iface_format`（默认 `vlan%u`）拼出接口名并通过 `if_nametoindex` 解析；
-  - 如果只有接口名，函数会再次调用 `if_nametoindex` 兜底，确保内核 ifindex 有效。
+2. 生成单一候选：若 VLAN ID >= 0，则根据 `vlan_iface_format`（默认 `vlan%u`）拼出接口名并通过 `if_nametoindex` 解析；若仅得到接口名，函数会再次调用 `if_nametoindex` 兜底，确保内核 ifindex 有效。
 3. 地址校验：解析出 ifindex 后，会到 `iface_records` 中查找对应地址前缀，并通过 `iface_record_select_ip` 挑选与终端 IP 匹配的源地址；失败时认为候选无效并回退。
 4. 解绑与回退：
   - 当候选无效或完全无法解析时，会调用 `iface_binding_detach`（若此前存在绑定）并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`，随后返回 `false` 以便上层转入 `IFACE_INVALID`；
@@ -114,4 +109,4 @@ Realtek 适配器提供 `mac_locator_ops->subscribe` 接口；`terminal_manager_
 ## 后续扩展点
 - Stage 3 将在当前基础上新增增量事件队列，继续消费 `terminal_entry` 中的 VLAN/ifindex 元数据；探测请求不再重复存储该信息。
 - 若扫描量级增加，可以 `worker_cond` 唤醒机制为基础替换为时间轮或按过期时间排序的容器。
-- 需要跨网段校验、接口元数据缓存等能力时，可复用 `iface_selector` 回调引入额外的拓扑信息。
+- 后续若引入跨网段校验或接口元数据缓存，可在保持 VLAN 命名约定的前提下扩展额外的拓扑查询模块。

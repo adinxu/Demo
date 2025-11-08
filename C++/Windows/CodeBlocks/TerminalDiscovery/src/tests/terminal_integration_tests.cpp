@@ -11,6 +11,7 @@ extern "C" {
 #include <netinet/if_ether.h>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -21,6 +22,24 @@ struct td_adapter {
 };
 
 static td_adapter g_stub_adapter;
+
+static int mock_kernel_ifindex_for_vlan(int vlan_id) {
+    return 2000 + vlan_id;
+}
+
+extern "C" unsigned int if_nametoindex(const char *name) {
+    if (!name) {
+        return 0U;
+    }
+    if (std::strncmp(name, "vlan", 4) == 0) {
+        char *endptr = nullptr;
+        long vlan = std::strtol(name + 4, &endptr, 10);
+        if (endptr && *endptr == '\0' && vlan > 0 && vlan < 4096) {
+            return static_cast<unsigned int>(mock_kernel_ifindex_for_vlan(static_cast<int>(vlan)));
+        }
+    }
+    return 0U;
+}
 
 struct probe_capture {
     terminal_probe_request_t last_request;
@@ -41,27 +60,6 @@ static void probe_callback(const terminal_probe_request_t *request, void *user_c
     auto *capture = static_cast<probe_capture *>(user_ctx);
     capture->last_request = *request;
     capture->count += 1;
-}
-
-struct selector_ctx {
-    int ifindex;
-    int required_vlan;
-};
-
-static bool selector_callback(const terminal_metadata *meta,
-                              char tx_iface[IFNAMSIZ],
-                              int *tx_kernel_ifindex,
-                              void *user_ctx) {
-    if (!meta || !tx_iface || !tx_kernel_ifindex || !user_ctx) {
-        return false;
-    }
-    auto *ctx = static_cast<selector_ctx *>(user_ctx);
-    if (ctx->required_vlan >= 0 && meta->vlan_id != ctx->required_vlan) {
-        return false;
-    }
-    std::snprintf(tx_iface, IFNAMSIZ, "ut%d", ctx->ifindex);
-    *tx_kernel_ifindex = ctx->ifindex;
-    return true;
 }
 
 static void sleep_ms(unsigned int ms) {
@@ -258,16 +256,15 @@ static bool test_stats_tracking(terminal_manager *mgr) {
 int main() {
     td_log_set_level(TD_LOG_ERROR);
 
-    selector_ctx selector{200, 200};
+    const int vlan_id = 200;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
     terminal_manager_config cfg;
     std::memset(&cfg, 0, sizeof(cfg));
     cfg.keepalive_interval_sec = 1;
     cfg.keepalive_miss_threshold = 1;
     cfg.iface_invalid_holdoff_sec = 1;
     cfg.scan_interval_ms = 60000;
-    cfg.vlan_iface_format = nullptr;
-    cfg.iface_selector = selector_callback;
-    cfg.iface_selector_ctx = &selector;
+    cfg.vlan_iface_format = "vlan%u";
     cfg.max_terminals = 16;
 
     probe_capture probes;
@@ -292,8 +289,8 @@ int main() {
 
     bool all_ok = true;
     all_ok &= test_duplicate_registration();
-    all_ok &= test_increment_add_and_get_all(mgr, selector.ifindex, selector.required_vlan);
-    all_ok &= test_netlink_removal(mgr, selector.ifindex, "192.0.2.1");
+    all_ok &= test_increment_add_and_get_all(mgr, tx_kernel_ifindex, vlan_id);
+    all_ok &= test_netlink_removal(mgr, tx_kernel_ifindex, "192.0.2.1");
     all_ok &= test_stats_tracking(mgr);
 
     terminal_manager_set_event_sink(mgr, nullptr, nullptr);

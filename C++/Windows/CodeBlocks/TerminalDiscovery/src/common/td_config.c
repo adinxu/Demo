@@ -45,8 +45,6 @@ int td_config_to_manager_config(const struct td_runtime_config *runtime,
     out->iface_invalid_holdoff_sec = runtime->iface_invalid_holdoff_sec;
     out->scan_interval_ms = 0U;
     out->vlan_iface_format = NULL;
-    out->iface_selector = NULL;
-    out->iface_selector_ctx = NULL;
     out->max_terminals = runtime->max_terminals;
 
     return 0;

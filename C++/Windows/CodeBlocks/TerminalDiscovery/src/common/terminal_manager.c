@@ -792,14 +792,7 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
 
     struct in_addr candidate_source_ip = {0};
 
-    if (mgr->cfg.iface_selector) {
-        resolved = mgr->cfg.iface_selector(&entry->meta,
-                                           candidate,
-                                           &candidate_kernel_ifindex,
-                                           mgr->cfg.iface_selector_ctx);
-    }
-
-    if (!resolved && mgr->cfg.vlan_iface_format && entry->meta.vlan_id >= 0) {
+    if (mgr->cfg.vlan_iface_format && entry->meta.vlan_id >= 0) {
         snprintf(candidate,
                  sizeof(candidate),
                  mgr->cfg.vlan_iface_format,
@@ -808,7 +801,7 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
         resolved = candidate_kernel_ifindex > 0;
     }
 
-    if (resolved && candidate_kernel_ifindex <= 0 && candidate[0] != '\0') {
+    if (!resolved && candidate[0] != '\0') {
         candidate_kernel_ifindex = (int)if_nametoindex(candidate);
         resolved = candidate_kernel_ifindex > 0;
     }
