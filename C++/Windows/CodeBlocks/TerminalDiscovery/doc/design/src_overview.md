@@ -202,16 +202,31 @@ classDiagram
   class terminal_manager {
     +terminal_manager_config cfg
     +td_adapter_t* adapter
+    +const td_adapter_ops* adapter_ops
+    +const td_adapter_mac_locator_ops* mac_locator_ops
     +terminal_probe_fn probe_cb
+    +void* probe_ctx
     +pthread_mutex_t lock
     +pthread_mutex_t worker_lock
     +pthread_cond_t worker_cond
+    +bool worker_stop
+    +bool worker_started
+    +pthread_t worker_thread
+    +terminal_event_callback_fn event_cb
+    +void* event_cb_ctx
     +terminal_event_queue events
     +terminal_entry* table[256]
     +iface_record* iface_records
     +size_t terminal_count
     +size_t max_terminals
     +terminal_manager_stats stats
+    +mac_lookup_task* mac_need_refresh_head
+    +mac_lookup_task* mac_need_refresh_tail
+    +mac_lookup_task* mac_pending_verify_head
+    +mac_lookup_task* mac_pending_verify_tail
+    +uint64_t mac_locator_version
+    +bool mac_locator_subscribed
+    +bool destroying
   }
   class terminal_entry {
     +terminal_key key
@@ -223,6 +238,8 @@ classDiagram
     +char tx_iface[IFNAMSIZ]
   +int tx_kernel_ifindex
     +in_addr tx_source_ip
+    +bool mac_refresh_enqueued
+    +bool mac_verify_enqueued
     +terminal_entry* next
   }
   class terminal_key {
@@ -232,6 +249,7 @@ classDiagram
   class terminal_metadata {
     +int vlan_id
     +uint32_t ifindex
+    +uint64_t mac_view_version
   }
   class terminal_event_queue {
     +terminal_event_node* head
@@ -300,10 +318,11 @@ classDiagram
 
 事件、接口索引与探测链路均在 `terminal_manager.lock` 保护下维护：
 - 事件队列节点在 `queue_event` 中申请并加入 `terminal_event_queue`，由 `terminal_manager_maybe_dispatch_events` 在脱锁后批量释放。
+- 事件队列节点在 `queue_event` 中申请并加入 `terminal_event_queue`，由 `terminal_manager_maybe_dispatch_events` 在脱锁后批量释放。
 - `terminal_manager_maybe_dispatch_events` 同时被 `terminal_manager_on_packet`、`terminal_manager_on_timer`、`mac_lookup_execute` 与显式的 `terminal_manager_flush_events` 调用；如果回调缺失或批量分配失败，会在释放节点的同时自增一次 `event_dispatch_failures`。
 - `iface_record` 与 `iface_binding_entry` 的增删由 `terminal_manager_on_address_update` 和 `resolve_tx_interface` 驱动，均在持锁状态下保持一致性。
 - `probe_task` 链表在 `terminal_manager_on_timer` 内构建（持锁），随后释放锁并逐个执行回调。
-- `mac_lookup_task` 队列由 `mac_need_refresh`/`mac_pending_verify` 两条链维护：`terminal_manager_on_packet`、`terminal_manager_on_timer` 与 MAC 刷新回调都会向其中追加任务；真正的桥接查询在解锁后通过 `mac_lookup_execute` 执行，命中后更新 `terminal_metadata.ifindex` 并触发必要的 `MOD` 事件。
+- `mac_lookup_task` 队列由 `mac_need_refresh`/`mac_pending_verify` 两条链维护：`terminal_manager_on_packet`、`terminal_manager_on_timer` 与 MAC 刷新回调都会向其中追加任务；真正的桥接查询在解锁后通过 `mac_lookup_execute` 执行，命中后更新 `terminal_metadata.ifindex` 与 `mac_view_version` 并触发必要的 `MOD` 事件。
 - Realtek 适配器的 `mac_cache_worker` 线程在刷新 `td_switch_mac_snapshot` 成功后调用订阅回调 `mac_locator_on_refresh(version)`；若失败则上报 `version=0`，管理器会保留待处理任务等待下一轮刷新。
 
 ### 5. Netlink 监听器 `common/terminal_netlink`
@@ -346,8 +365,8 @@ classDiagram
     +atomic_bool running
     +int rx_fd
     +int tx_fd
-  +int rx_kernel_ifindex
-  +int tx_kernel_ifindex
+    +int rx_kernel_ifindex
+    +int tx_kernel_ifindex
     +pthread_t rx_thread
     +bool rx_thread_started
     +td_adapter_packet_subscription packet_sub
@@ -357,6 +376,7 @@ classDiagram
     +timespec last_send
     +uint8_t tx_mac[6]
     +in_addr tx_ipv4
+    +realtek_mac_cache mac_cache
   }
   class td_adapter_packet_subscription {
     +td_adapter_packet_cb callback
@@ -368,13 +388,40 @@ classDiagram
     +uint32_t rx_ring_size
     +uint32_t tx_interval_ms
   }
+  class realtek_mac_cache {
+    +pthread_rwlock_t map_lock
+    +mac_bucket_entry* buckets[256]
+    +SwUcMacEntry* entries
+    +uint32_t capacity
+    +uint64_t version
+    +timespec last_refresh
+    +uint32_t ttl_ms
+    +pthread_mutex_t worker_lock
+    +pthread_cond_t worker_cond
+    +pthread_t worker_thread
+    +bool worker_started
+    +bool worker_stop
+    +bool refresh_requested
+    +td_adapter_mac_locator_refresh_cb refresh_cb
+    +void* refresh_ctx
+  }
+  class mac_bucket_entry {
+    +uint8_t mac[6]
+    +uint16_t vlan
+    +uint32_t ifindex
+    +mac_bucket_entry* next
+  }
   td_adapter --> td_adapter_packet_subscription
   td_adapter --> td_adapter_config
+  td_adapter --> realtek_mac_cache
+  realtek_mac_cache "1" o--> "*" mac_bucket_entry
 ```
 
-- `state_lock` 保护订阅回调与 RX 线程状态，避免在运行期重入修改。
+- `state_lock` 保护订阅回调与 RX 线程状态，避免在运行期重入修改；`packet_subscribed` 标记确保回调只注册一次。
 - `send_lock` 与 `last_send` 实现 ARP 发送节流，确保 `realtek_send_arp` 在多次调用时保持顺序与间隔。
-- `running` 原子变量用于 `rx_thread_main` 的退出控制。
+- `running` 原子变量用于 `rx_thread_main` 的退出控制，来自 `td_atomic.h` 的轻量封装。
+- `mac_cache` 维护桥表快照：`map_lock` 保证哈希桶并发访问，`worker_lock/worker_cond` 控制后台刷新线程，`refresh_cb` 将最新版本号上报给终端管理器。
+- `mac_bucket_entry` 链表为每个 VLAN/MAC 提供 ifindex 缓存，刷新失败时保留旧快照以提高稳定性。
 
 ## 通信与顺序
 
@@ -520,7 +567,7 @@ td_switch_mac_get_capacity"]
 | 主线程 | `main()` | CLI 解析、初始化、信号监听、最终清理 | 使用信号处理器设置 `g_should_stop` 原子变量 |
 | 适配器 RX 线程 | `realtek_adapter` | `poll` + `recvmsg` 收取 ARP，并调用 `terminal_manager_on_packet` | 访问终端表时依赖 `terminal_manager` 的 `lock` |
 | 终端管理器 Worker | `terminal_manager_worker` | 定期扫描终端表、安排探测、淘汰终端 | `worker_lock` 控制线程休眠，核心操作持 `lock` |
-| Netlink 监听线程 | `terminal_netlink` | 订阅 `RTM_NEWADDR/DELADDR` 并更新地址表 | 调用 `terminal_manager_on_address_update` 时获取管理器互斥锁 |
+| Netlink 监听线程 | `terminal_netlink` | 订阅 `RTM_NEWADDR/DELADDR` 并更新地址表 | `terminal_netlink_listener.running` 原子标记线程退出；调用 `terminal_manager_on_address_update` 时获取管理器互斥锁 |
 | 北向回调上下文（非独立线程） | `terminal_manager_maybe_dispatch_events` | 由触发事件的线程在脱锁后同步调用外部回调 | 事件队列在 `lock` 下构建；回调执行期间不持锁 |
 | MAC 缓存线程 | `realtek_adapter` | 周期性刷新 `td_switch_mac_snapshot` 并触发 `mac_locator_on_refresh` | 刷新后回调在持锁状态下合并 `mac_lookup_task`，真正查表在脱锁环境执行 |
 
@@ -545,6 +592,7 @@ td_switch_mac_get_capacity"]
 | `g_inc_report_mutex` | 北向增量回调全局句柄 | `setIncrementReport` |
 | `realtek_mac_cache.map_lock` (rwlock) | MAC 缓存哈希桶、`entries` 缓冲区、`version` 与刷新时间戳 | `mac_cache_refresh`、`realtek_mac_locator_lookup`、`realtek_mac_locator_get_version` |
 | `realtek_mac_cache.worker_lock` + `worker_cond` | 后台刷新线程启动/停止、`refresh_requested` 标记、回调上下文 | `mac_cache_start_worker`、`mac_cache_stop_worker`、`mac_cache_worker_main` |
+| `terminal_netlink_listener.running` (atomic) | 控制 Netlink 监听线程循环退出 | `terminal_netlink_start`、`terminal_netlink_stop` |
 
 `mac_lookup_execute` 在脱锁上下文运行：无论任务由 `worker_thread` 还是 MAC 刷新回调触发，都会在释放 `terminal_manager.lock` 后顺序调用适配器的 `mac_locator_ops.lookup`，再重新持锁写回 `ifindex` 与事件结果，避免刷新线程长时间阻塞其他表操作。
 
