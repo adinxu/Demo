@@ -96,7 +96,7 @@ Realtek 适配器提供 `mac_locator_ops->subscribe` 接口；`terminal_manager_
   1. 在持锁状态下取出 `need_refresh`/`pending_verify` 队列，并遍历全部终端，将 `meta.ifindex == 0` 或 `mac_view_version < version` 的条目补齐到这两个队列中（借助 `mac_refresh_enqueued/mac_verify_enqueued` 标志避免重复排队）。
   2. 解锁后调用 `mac_locator_ops->lookup` 执行批量查询：刷新队列命中即更新 `meta.ifindex` 与 `mac_view_version`，必要时入队 `MOD`；验证队列若发现 ifindex 漂移则同样触发事件并更新索引。
   3. 当回调收到 `version == 0` 时，仅记录 WARN 并保留原有队列，等待下一轮刷新。
-- `terminal_manager_on_timer` 在保活扫描阶段也会尝试用 `terminal_mac_locator_lookup` 更新 `IFACE_INVALID` 状态的终端，以便在收不到新报文时也能通过 MAC 表漂移检测恢复 ifindex。
+- `terminal_manager_on_timer` 在保活扫描阶段若发现终端处于 `IFACE_INVALID`，会根据当前 `mac_locator_version` 将其加入即时查表或等待刷新队列，确保即便没有新报文到达也能借助 MAC 表恢复 ifindex。
 - 所有 `mac_locator` 调用都在释放互斥锁后执行，避免桥接刷新过程阻塞报文线程；查询完成后再重新上锁写回终端结构与事件队列。
 
 ## 并发与线程模型

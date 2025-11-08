@@ -55,12 +55,12 @@
 - 适配器对外暴露 `realtek_mac_locator_lookup(const uint8_t mac[ETH_ALEN], uint16_t vlan, uint32_t *ifindex_out, uint64_t *version_out)`，该函数在读锁下查询映射；若快照过期会先释放读锁并触发一次 `mac_cache_refresh(true)`，随后重新读取。查找到匹配 VLAN 的条目则写回 ifindex 与当前版本号，否则返回 `TD_ADAPTER_ERR_NOT_READY`（桥接未初始化/刷新失败）或 `TD_ADAPTER_ERR_INVALID_ARG`（输入非法）。
 - `realtek_start` 启动时会拉起后台线程 `mac_cache_worker`：
   - 工作线程监听条件变量 `worker_cond`，仅在显式刷新请求或 TTL 到期时唤醒；连续查询未命中不会触发额外处理。
-  - 刷新成功后将 `version` 写入 `adapter->mac_cache_version` 并解锁，再通过回调 `adapter_env.log_fn` 记录一次 DEBUG 日志，包含刷新耗时与条目数量。
+  - 刷新成功后记录一次 DEBUG 日志（包含耗时与条目数量），随后调用注册的 `refresh_cb(version, ctx)` 通知终端管理器刷新结果。
   - 若桥接暂不可用或返回错误，线程不会执行退避重试，而是保留当前状态等待下一次常规唤醒；发生错误时仍会通过 `adapter_env.log_fn` 输出 WARN 供排查。
 - 为了与 demo 行为保持一致，适配器绝不在快照路径内分配临时缓冲区，所有 `SwUcMacEntry` 复用与容量缓存都在 `realtek_init` 阶段完成；桥接模块内部的 `createSwitch` 亦只在装载时执行一次，并由其自行管理线程安全与引用计数。
 - 适配器调用链在遇到桥接不可达、快照失败或查不到指定 MAC 时不会阻塞收包线程：查询函数仅返回错误码，终端管理器可选择保留 `ifindex=0` 并等待下次成功刷新；`mac_cache_worker` 将自动在后台重试刷新，避免在报文路径等待。
 ## 配置与日志
-- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口默认为物理接口（即将切换至 `eth0`，在旧版本中仍可显式指定 `vlan1` 以兼容）、ARP 节流间隔 100ms、日志级别 INFO。
+- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口 `eth0`、ARP 节流间隔 100 ms、日志级别 INFO。
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
 
 ## 构建产物

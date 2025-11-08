@@ -26,8 +26,8 @@
      - 条目过期或探测失败超过阈值时入队 `DEL` 事件。
      - 仍存活的条目仅当端口变化时才入队 `MOD` 事件。
    - `terminal_manager_on_address_update`
-      - 更新地址表并针对受影响终端清空绑定，必要时触发 `IFACE_INVALID` 状态；操作仅调整内部状态，不直接入队事件，除非后续报文导致终端 ifindex 变化或条目被重新建表。
-   - 未配置事件接收器 (`event_cb == NULL`) 时跳过节点分配，避免无意义开销。
+     - 更新地址表并针对受影响终端清空绑定，必要时触发 `IFACE_INVALID` 状态；操作仅调整内部状态，不直接入队事件，除非后续报文导致终端 ifindex 变化或条目被重新建表。
+   - 未配置事件接收器 (`event_cb == NULL`) 时 `queue_event` 会直接返回，不分配节点；后续在释放队列或清理回调时会把这些批次记入 `event_dispatch_failures`。
 
 2. **批量分发** – `terminal_manager_maybe_dispatch_events`
    - 在上述 API 释放互斥锁后调用，保证回调执行不持有内部锁。
@@ -36,14 +36,16 @@
      2. 分配连续数组，顺序拷贝 `terminal_event_record_t`。
      3. 调用 `terminal_event_callback_fn(const terminal_event_record_t *records, size_t count, void *ctx)`。
    - 若内存分配失败或已无有效回调，会记录 WARN 并丢弃该批事件；对应的 `event_dispatch_failures` 会自增 1，随后仍释放原队列节点，避免长期堆积。
+  - `mac_lookup_execute`（由报文与定时路径触发的异步 MAC 查表）在完成批处理后同样调用该函数，以确保查表阶段累计的 `MOD/DEL` 事件不会滞后。
 
 3. **显式操作**
    - `terminal_manager_set_event_sink`
      - 注册或清除增量上报回调；启用时立即触发一次分发，确保历史积压事件第一时间上报。
      - 关闭回调时若仍有待发事件，会在清理队列的同时增加一次 `event_dispatch_failures` 计数，用于提示北向忘记消费的批次。
+     - 设置新回调后在锁外调用 `terminal_manager_maybe_dispatch_events`，即时推送当前批次。
    - `terminal_manager_flush_events`
      - 手动刷新入口（例如关闭前或测试时立即输出积压事件）。
-      - 内部直接调用 `terminal_manager_maybe_dispatch_events`，保持与后台分发一致的统计口径。
+     - 内部直接调用 `terminal_manager_maybe_dispatch_events`，保持与后台分发一致的统计口径。
 
 ## 北向查询
 - `terminal_manager_query_all`
@@ -67,6 +69,7 @@
 ## 并发与内存安全
 - 所有终端表与事件队列的修改都在主互斥锁 `lock` 内完成，确保状态一致。
 - 分发阶段释放内部锁后执行回调并逐个释放节点，避免回调重入造成死锁。
+- `mac_lookup_execute` 运行在无锁上下文中执行适配器查表，并在结束时再次触发 `terminal_manager_maybe_dispatch_events`，使查表结果与事件输出保持同一节奏。
 - 销毁流程会在释放终端条目前先清理事件队列，防止残留节点泄漏。
 
 ## 关键对外接口速览
