@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "td_logging.h"
+#include "td_time_utils.h"
 #include "td_switch_mac_bridge.h"
 
 #ifndef TD_REALTEK_RX_BUFFER_SIZE
@@ -57,10 +58,8 @@ struct realtek_mac_cache {
     struct mac_bucket_entry *buckets[TD_REALTEK_MAC_BUCKET_COUNT];
     SwUcMacEntry *entries;
     uint32_t capacity;
-    uint32_t used;
     uint64_t version;
     struct timespec last_refresh;
-    struct timespec last_attempt;
     uint32_t ttl_ms;
     pthread_mutex_t worker_lock;
     pthread_cond_t worker_cond;
@@ -401,39 +400,6 @@ static void bind_socket_to_iface(struct td_adapter *adapter, const char *iface) 
     }
 }
 
-static uint64_t timespec_diff_ms(const struct timespec *start, const struct timespec *end) {
-    if (!start || !end) {
-        return 0ULL;
-    }
-
-    time_t sec = end->tv_sec - start->tv_sec;
-    long nsec = end->tv_nsec - start->tv_nsec;
-    if (sec < 0) {
-        return 0ULL;
-    }
-    if (nsec < 0) {
-        sec -= 1;
-        nsec += 1000000000L;
-        if (sec < 0) {
-            return 0ULL;
-        }
-    }
-    uint64_t millis = (uint64_t)sec * 1000ULL;
-    millis += (uint64_t)(nsec / 1000000L);
-    return millis;
-}
-
-static struct timespec timespec_add_ms(const struct timespec *base, uint32_t ms) {
-    struct timespec result = *base;
-    result.tv_sec += ms / 1000U;
-    result.tv_nsec += (long)(ms % 1000U) * 1000000L;
-    if (result.tv_nsec >= 1000000000L) {
-        result.tv_sec += 1;
-        result.tv_nsec -= 1000000000L;
-    }
-    return result;
-}
-
 static uint32_t mac_hash(const uint8_t mac[ETH_ALEN], uint16_t vlan) {
     uint64_t hash = 1469598103934665603ULL;
     for (size_t i = 0; i < ETH_ALEN; ++i) {
@@ -449,7 +415,6 @@ static void mac_cache_clear_buckets(struct realtek_mac_cache *cache) {
     if (!cache) {
         return;
     }
-    cache->used = 0;
     for (size_t i = 0; i < TD_REALTEK_MAC_BUCKET_COUNT; ++i) {
         struct mac_bucket_entry *node = cache->buckets[i];
         while (node) {
@@ -474,12 +439,9 @@ static void mac_cache_destroy(struct td_adapter *adapter) {
     SwUcMacEntry *entries = cache->entries;
     cache->entries = NULL;
     cache->capacity = 0;
-    cache->used = 0;
     cache->version = 0ULL;
     cache->last_refresh.tv_sec = 0;
     cache->last_refresh.tv_nsec = 0;
-    cache->last_attempt.tv_sec = 0;
-    cache->last_attempt.tv_nsec = 0;
     pthread_rwlock_unlock(&cache->map_lock);
 
     free(entries);
@@ -543,12 +505,9 @@ static bool mac_cache_ensure_capacity(struct td_adapter *adapter) {
 
     cache->entries = entries;
     cache->capacity = capacity;
-    cache->used = 0;
     cache->version = 0ULL;
     cache->last_refresh.tv_sec = 0;
     cache->last_refresh.tv_nsec = 0;
-    cache->last_attempt.tv_sec = 0;
-    cache->last_attempt.tv_nsec = 0;
     return true;
 }
 
@@ -571,8 +530,6 @@ static bool mac_cache_refresh(struct td_adapter *adapter, bool force) {
         pthread_rwlock_unlock(&cache->map_lock);
         return true;
     }
-
-    cache->last_attempt = start;
 
     uint32_t count = 0;
     int rc = td_switch_mac_snapshot(cache->entries, &count);
@@ -614,7 +571,6 @@ static bool mac_cache_refresh(struct td_adapter *adapter, bool force) {
         inserted += 1U;
     }
 
-    cache->used = inserted;
     cache->version += 1ULL;
 
     struct timespec end;

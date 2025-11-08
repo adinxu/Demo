@@ -123,6 +123,7 @@ flowchart TD
   - 所有平台 I/O 均通过原生 Raw Socket 完成，避免依赖平台 SDK。
   - MAC 表定位：
     - `realtek_mac_cache` 维护 `mac_bucket_entry` 哈希桶、`SwUcMacEntry` 缓冲区、缓存 TTL（默认 30s）与单调版本号，初始化时即尝试读取容量并复用同一缓冲区承载 `td_switch_mac_snapshot` 返回的数据。
+    - 该结构使用 `map_lock`（读写锁）保护散列表、版本号与快照缓冲区，保证刷新与查询互斥；`worker_lock` + `worker_cond` 驱动后台刷新线程的睡眠/唤醒，`refresh_requested`/`worker_stop` 标记均在此互斥下更新，避免与 `mac_cache_worker_main` 之间的竞态。
     - 注册 `td_adapter_mac_locator_ops`，向上层提供 `lookup/subscribe/get_version`：`subscribe` 拉起后台 `mac_cache_worker_main` 线程并保存回调句柄，`lookup` 在缓存过期时自动触发同步刷新一次，刷新仍失败则返回 `TD_ADAPTER_ERR_NOT_READY` 让终端管理器稍后重试。
     - 刷新线程会在执行 `td_switch_mac_snapshot` 后重建散列表并递增版本；若刷新失败会保留旧数据并记录 WARN，同时通过 `refresh_cb(version=0)` 通知上层，避免终端管理器误判为成功。
     - 订阅回调在每次成功刷新后携带最新版本号，供 `terminal_manager` 的 `mac_locator_on_refresh` 批量补齐 ifindex 并重新验证漂移终端。
@@ -143,7 +144,7 @@ flowchart TD
     - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。
     - 仅当外部注册了事件回调时才会通过 `queue_event` 生成节点；`event_cb == NULL` 时函数直接返回，避免无意义的内存分配，未消费的批次会在统计中累计到 `event_dispatch_failures`。
   - `mac_lookup_task`
-    - 封装 MAC 查表请求（终端 key、VLAN、校验标志），由 `mac_need_refresh` 与 `mac_pending_verify` 队列驱动，最终在解锁后批量执行。
+    - 封装 MAC 查表请求（终端 key、VLAN、校验标志），由 `mac_need_refresh` 与 `mac_pending_verify` 队列驱动，最终在解锁后批量执行；`verify == true` 表示该任务源自版本刷新后的二次校验，需确认现有 `ifindex` 是否仍与桥表一致，失败时会按照 `mac_lookup_apply_result` 中的逻辑清空旧端口并触发 `MOD` 事件。
   - `terminal_probe_request_t`
     - `terminal_manager_on_timer` 构造的探测快照，包含终端 key、待使用的 VLAN ID、可选的回退接口和 `source_ip`；`terminal_probe_handler` 依据该结构直接生成以物理口为主、虚接口为备的 ARP 请求。
 - **关键函数**：
@@ -164,7 +165,8 @@ flowchart TD
 - `terminal_manager_create` 会在检测到适配器实现 `mac_locator_ops` 时初始化缓存版本并注册 `mac_locator_on_refresh`。刷新回调在持锁状态下合并 `mac_need_refresh` 与 `mac_pending_verify` 队列，并遍历全部终端，将 `ifindex` 缺失或版本过期的条目排队查表。
 - 解锁后由 `mac_lookup_execute` 执行批量查表：
   - 命中时更新 `terminal_metadata.ifindex` 与 `mac_view_version`，若端口发生漂移，会通过事件队列投递 `MOD` 并同步反向索引；
-  - SDK 返回暂不可用（`TD_ADAPTER_ERR_NOT_READY`）或桥接失败时会保留队列状态，等待下一轮刷新或定时器重新排队；
+  - `verify` 任务由 `mac_locator_on_refresh` 在检测到 `version` 前进时生成：对于已有 `ifindex` 但 `mac_view_version < version` 的终端，会进入 `mac_pending_verify` 队列，查表失败（返回 `TD_ADAPTER_ERR_NOT_READY`）时立即清零终端的 `ifindex`，保证北向能尽快感知端口失效；
+  - SDK 返回暂不可用（`TD_ADAPTER_ERR_NOT_READY`）或桥接失败时会保留队列状态，等待下一轮刷新或定时器重新排队；刷新队列中的非校验任务会复用 `enqueue_need_refresh` 再次尝试。
   - 查表过程中所有事件统计在 `terminal_manager_stats.events_dispatched/event_dispatch_failures` 中体现，缺少回调时清空队列也会自增失败计数。
 - `terminal_manager_on_packet` 和 `terminal_manager_on_timer` 均会在检测到版本落后或 `ifindex` 缺失时主动入队查表任务，确保不依赖新的 MAC 刷新信号即可尝试恢复端口信息。
   - 两条路径在解锁后都会调用 `mac_lookup_execute`，该函数顺序执行适配器查表并在完成后触发一次 `terminal_manager_maybe_dispatch_events`，确保查表过程中积累的 `MOD/DEL` 事件能够及时推送。
@@ -541,6 +543,8 @@ td_switch_mac_get_capacity"]
 | `realtek_adapter.send_lock` | `last_send` 节流时间戳、`sendto` 调用序列 | `realtek_send_arp` |
 | `realtek_adapter.running` (atomic) | 控制 RX 线程循环退出 | `realtek_start`、`realtek_stop`、`rx_thread_main` |
 | `g_inc_report_mutex` | 北向增量回调全局句柄 | `setIncrementReport` |
+| `realtek_mac_cache.map_lock` (rwlock) | MAC 缓存哈希桶、`entries` 缓冲区、`version` 与刷新时间戳 | `mac_cache_refresh`、`realtek_mac_locator_lookup`、`realtek_mac_locator_get_version` |
+| `realtek_mac_cache.worker_lock` + `worker_cond` | 后台刷新线程启动/停止、`refresh_requested` 标记、回调上下文 | `mac_cache_start_worker`、`mac_cache_stop_worker`、`mac_cache_worker_main` |
 
 `mac_lookup_execute` 在脱锁上下文运行：无论任务由 `worker_thread` 还是 MAC 刷新回调触发，都会在释放 `terminal_manager.lock` 后顺序调用适配器的 `mac_locator_ops.lookup`，再重新持锁写回 `ifindex` 与事件结果，避免刷新线程长时间阻塞其他表操作。
 
