@@ -170,6 +170,7 @@ flowchart TD
   - 查表过程中所有事件统计在 `terminal_manager_stats.events_dispatched/event_dispatch_failures` 中体现，缺少回调时清空队列也会自增失败计数。
 - `terminal_manager_on_packet` 和 `terminal_manager_on_timer` 均会在检测到版本落后或 `ifindex` 缺失时主动入队查表任务，确保不依赖新的 MAC 刷新信号即可尝试恢复端口信息。
   - 两条路径在解锁后都会调用 `mac_lookup_execute`，该函数顺序执行适配器查表并在完成后触发一次 `terminal_manager_maybe_dispatch_events`，确保查表过程中积累的 `MOD/DEL` 事件能够及时推送。
+  - 查表结果只会更新 `terminal_metadata.ifindex/mac_view_version` 以及必要的 `MOD` 事件，整个流程不会直接调用 `set_state`，终端状态仍然由接口可达性和保活逻辑决定。
 
   #### 终端状态机
 
@@ -217,6 +218,7 @@ flowchart TD
   - `terminal_manager_on_timer`：仅当 `is_iface_available` 成立时才进入 `PROBING` 并排队探测；无法发包则保持/转入 `IFACE_INVALID`。连续探测失败满足阈值后删除终端。
   - `terminal_manager_on_address_update`：当接口前缀被删除，调用 `iface_binding_detach` 并 `set_state(IFACE_INVALID)`；新增前缀只更新仍绑定终端的 `tx_source_ip`。
   - `has_expired`：在 `IFACE_INVALID` 持续超过 `iface_invalid_holdoff_sec` 时触发淘汰，保障异常终端不会无限保留。
+  - `mac_locator_on_refresh` / `mac_lookup_execute`：仅更新 `terminal_metadata.ifindex` 与事件队列，不会直接驱动 `terminal_entry.state` 变化，状态仍由是否可发包的接口条件决定。
 
   ##### IFACE_INVALID 恢复细节
 
@@ -226,6 +228,7 @@ flowchart TD
   - 当前实现不会在同一次状态更新中直接从 `IFACE_INVALID` 回到 `ACTIVE`，需严格经历 `IFACE_INVALID` -> `PROBING` -> `ACTIVE` 的顺序。
   - `terminal_manager_on_address_update` 在新增前缀时，仅刷新仍在绑定列表中的终端的 `tx_source_ip`；已被移除绑定的 `IFACE_INVALID` 条目不会即时恢复，需要等待下一次报文或其它触发源重新绑定。
   - 地址删除路径会调用 `monotonic_now` 更新 `last_seen`，使保留期从解绑时刻重新计时，避免因历史时间戳过期而在持锁逻辑之外提前被扫描线程删除。
+  - **限制说明**：若终端进入 `IFACE_INVALID` 后迟迟没有新的报文或其它触发源抵达，即便后台地址等外部条件已经恢复可用，也只是刷新元数据而不会触发状态更新；条目会一直停留在 `IFACE_INVALID`，直至 `iface_invalid_holdoff_sec` 到期被淘汰。
 
 #### 数据结构关系
 
