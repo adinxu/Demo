@@ -801,11 +801,6 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
         resolved = candidate_kernel_ifindex > 0;
     }
 
-    if (!resolved && candidate[0] != '\0') {
-        candidate_kernel_ifindex = (int)if_nametoindex(candidate);
-        resolved = candidate_kernel_ifindex > 0;
-    }
-
     if (resolved) {
         struct iface_record *record = get_iface_record(mgr, candidate_kernel_ifindex);
         if (!record || !iface_record_select_ip(record, entry->key.ip, &candidate_source_ip)) {

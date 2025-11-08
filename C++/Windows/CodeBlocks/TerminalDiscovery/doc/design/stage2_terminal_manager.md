@@ -85,6 +85,13 @@
   - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。
   - `main/terminal_main.c` 在管理器创建后启动 `terminal_netlink` 监听线程，直接调用该接口完成同步，无需额外的适配层事件桥接。
 
+### IFACE_INVALID 状态补充
+- 所有进入 `IFACE_INVALID` 的路径（如 `resolve_tx_interface` 返回失败、地址事件删除前缀）都会调用 `iface_binding_detach`，立即从 `iface_binding_index` 中移除终端并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`。若 MAC 查询失败并返回未知 ifindex，仅会把 `meta.ifindex` 重置为 0，状态仍保持不变，等待后续路径再次评估 `is_iface_available`。
+- 定时线程依赖 `is_iface_available` 判断是否具备有效的 `tx_kernel_ifindex` 与 `tx_source_ip`。任一字段缺失都会保持 `IFACE_INVALID`，并通过 `iface_invalid_holdoff_sec` 的倒计时决定是否淘汰，不会主动发起探测。
+- 恢复路径依赖新的报文或对 `resolve_tx_interface` 的再尝试：当有新报文到达且绑定成功时，状态从 `IFACE_INVALID` 先过渡到 `PROBING`，随后在定时线程或再次报文中切回 `ACTIVE`。若报文到达时仍缺乏地址前缀，则保持 `IFACE_INVALID`。
+- `terminal_manager_on_address_update` 在新增前缀时只会刷新仍保持绑定的终端的 `tx_source_ip`。已被解绑的 `IFACE_INVALID` 条目需要等待下一次报文重新入表；其 `last_seen` 会在解绑时刻更新，确保保留期从最新的事件重新计时。
+- **限制说明**：如果终端在进入 `IFACE_INVALID` 后始终没有新的报文抵达，即便后台地址恢复也不会主动触发 `resolve_tx_interface` 或保活探测，条目会一直停留在 `IFACE_INVALID` 状态直至 `iface_invalid_holdoff_sec` 到期被删除。当前实现依赖后续业务流量来唤醒终端，需在 Stage 3+ 评估是否引入主动重试机制。
+
 ## ifindex 同步策略
 Realtek 适配器提供 `mac_locator_ops->subscribe` 接口；`terminal_manager_create` 成功后会注册 `mac_locator_on_refresh(uint64_t version, void *ctx)`，用于感知 MAC 快照更新或失败。
 - `mac_locator_on_refresh` 执行流程：

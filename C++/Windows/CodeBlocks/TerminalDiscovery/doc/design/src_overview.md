@@ -193,6 +193,14 @@ flowchart TD
   - `terminal_manager_on_timer` 在超时后生成 `terminal_probe_request_t`，若探测累计失败则删除条目。
   - 地址事件清空可用前缀时会调用 `set_state(...IFACE_INVALID)` 并延迟清理，同时清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`，防止后续探测误用过期的 VLANIF。
 
+  ##### IFACE_INVALID 恢复细节
+
+  - 任意路径命中 `IFACE_INVALID`（例如 `resolve_tx_interface` 失败、地址事件移除前缀）都会先调用 `iface_binding_detach`，立即从 `iface_records` 的绑定列表中移除终端并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`。MAC 查表失败仅会把 `meta.ifindex` 清零，状态仍由后续流程依据 `is_iface_available` 判定是否需要进入 `IFACE_INVALID`。
+  - 定时器扫描阶段通过 `is_iface_available` 判断是否具备 `tx_kernel_ifindex` 与 `tx_source_ip`；若任一字段缺失则保持 `IFACE_INVALID`，并依赖 `iface_invalid_holdoff_sec` 的到期逻辑进行淘汰，不会发起探测。
+  - 只有当新的 ARP 报文到达并让 `resolve_tx_interface` 再次成功（形成新的绑定且写回源 IP）时，状态才会从 `IFACE_INVALID` 切换至 `PROBING`/`ACTIVE`。若报文抵达时仍缺少可用前缀，状态将维持在 `IFACE_INVALID` 直至地址同步完成。
+  - `terminal_manager_on_address_update` 在新增前缀时，仅刷新仍在绑定列表中的终端的 `tx_source_ip`；已被移除绑定的 `IFACE_INVALID` 条目不会即时恢复，需要等待下一次报文或其它触发源重新绑定。
+  - 地址删除路径会调用 `monotonic_now` 更新 `last_seen`，使保留期从解绑时刻重新计时，避免因历史时间戳过期而在持锁逻辑之外提前被扫描线程删除。
+
 #### 数据结构关系
 
 以下类图基于 `terminal_manager.c` 中的结构定义，展示核心管理器、事件队列、接口索引与探测任务之间的关系。
