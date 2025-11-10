@@ -15,6 +15,7 @@
 #include "td_adapter_registry.h"
 #include "td_config.h"
 #include "td_logging.h"
+#include "terminal_discovery_embed.h"
 #include "terminal_manager.h"
 #include "terminal_netlink.h"
 
@@ -23,6 +24,8 @@ struct app_context {
     td_adapter_t *adapter;
     const struct td_adapter_ops *ops;
     struct terminal_netlink_listener *netlink_listener;
+    bool adapter_started;
+    bool packet_rx_registered;
 };
 
 static volatile sig_atomic_t g_should_stop = 0;
@@ -198,6 +201,132 @@ static void terminal_probe_handler(const terminal_probe_request_t *request, void
     }
 }
 
+static void terminal_discovery_cleanup(struct app_context *ctx) {
+    if (!ctx) {
+        return;
+    }
+
+    if (ctx->ops && ctx->adapter && ctx->adapter_started) {
+        ctx->ops->stop(ctx->adapter);
+        ctx->adapter_started = false;
+    }
+
+    if (ctx->netlink_listener) {
+        terminal_netlink_stop(ctx->netlink_listener);
+        ctx->netlink_listener = NULL;
+    }
+
+    if (ctx->manager) {
+        terminal_manager_flush_events(ctx->manager);
+        terminal_manager_set_event_sink(ctx->manager, NULL, NULL);
+        terminal_manager_destroy(ctx->manager);
+        ctx->manager = NULL;
+    }
+
+    if (ctx->ops && ctx->adapter) {
+        ctx->ops->shutdown(ctx->adapter);
+        ctx->adapter = NULL;
+    }
+
+    ctx->ops = NULL;
+    ctx->packet_rx_registered = false;
+}
+
+static int terminal_discovery_bootstrap(const struct td_runtime_config *runtime_cfg,
+                                        terminal_event_callback_fn event_cb,
+                                        void *event_ctx,
+                                        struct app_context *ctx) {
+    if (!runtime_cfg || !event_cb || !ctx) {
+        return -EINVAL;
+    }
+
+    memset(ctx, 0, sizeof(*ctx));
+
+    const struct td_adapter_descriptor *adapter_desc = td_adapter_registry_find(runtime_cfg->adapter_name);
+    if (!adapter_desc || !adapter_desc->ops) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter '%s' not found", runtime_cfg->adapter_name);
+        return -ENOENT;
+    }
+
+    struct td_adapter_config adapter_cfg = {
+        .rx_iface = runtime_cfg->rx_iface,
+        .tx_iface = runtime_cfg->tx_iface,
+        .tx_interval_ms = runtime_cfg->tx_interval_ms,
+        .rx_ring_size = 0,
+    };
+
+    struct td_adapter_env adapter_env = {
+        .log_fn = adapter_log_bridge,
+        .log_user_data = NULL,
+    };
+
+    td_adapter_t *adapter_handle = NULL;
+    td_adapter_result_t adapter_rc = adapter_desc->ops->init(&adapter_cfg, &adapter_env, &adapter_handle);
+    if (adapter_rc != TD_ADAPTER_OK) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter init failed: %d", adapter_rc);
+        return adapter_rc;
+    }
+
+    ctx->adapter = adapter_handle;
+    ctx->ops = adapter_desc->ops;
+
+    struct terminal_manager_config manager_cfg;
+    if (td_config_to_manager_config(runtime_cfg, &manager_cfg) != 0) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to translate runtime config");
+        terminal_discovery_cleanup(ctx);
+        return -1;
+    }
+
+    struct terminal_manager *manager = terminal_manager_create(&manager_cfg,
+                                                               adapter_handle,
+                                                               adapter_desc->ops,
+                                                               terminal_probe_handler,
+                                                               ctx);
+    if (!manager) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to create terminal manager");
+        terminal_discovery_cleanup(ctx);
+        return -1;
+    }
+    ctx->manager = manager;
+
+    struct terminal_netlink_listener *netlink_listener = NULL;
+    if (terminal_netlink_start(manager, &netlink_listener) != 0) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to start netlink listener");
+        terminal_discovery_cleanup(ctx);
+        return -1;
+    }
+    ctx->netlink_listener = netlink_listener;
+
+    if (terminal_manager_set_event_sink(manager, event_cb, event_ctx) != 0) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to set event sink");
+        terminal_discovery_cleanup(ctx);
+        return -1;
+    }
+
+    struct td_adapter_packet_subscription packet_sub = {
+        .callback = adapter_packet_callback,
+        .user_ctx = ctx,
+    };
+
+    adapter_rc = adapter_desc->ops->register_packet_rx(adapter_handle, &packet_sub);
+    if (adapter_rc != TD_ADAPTER_OK) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "register_packet_rx failed: %d", adapter_rc);
+        terminal_discovery_cleanup(ctx);
+        return adapter_rc;
+    }
+    ctx->packet_rx_registered = true;
+
+    adapter_rc = adapter_desc->ops->start(adapter_handle);
+    if (adapter_rc != TD_ADAPTER_OK) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter start failed: %d", adapter_rc);
+        terminal_discovery_cleanup(ctx);
+        return adapter_rc;
+    }
+    ctx->adapter_started = true;
+
+    return 0;
+}
+
 static void print_usage(FILE *stream) {
     fprintf(stream,
             "Usage: %s [options]\n"
@@ -246,6 +375,7 @@ static int parse_size_t_option(const char *opt_name, const char *value, size_t *
     return 0;
 }
 
+#ifndef TD_DISABLE_APP_MAIN
 int main(int argc, char **argv) {
     if (argc > 0 && argv && argv[0]) {
         g_program_name = argv[0];
@@ -360,98 +490,9 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, handle_stats_signal);
 
-    const struct td_adapter_descriptor *adapter_desc = td_adapter_registry_find(runtime_cfg.adapter_name);
-    if (!adapter_desc || !adapter_desc->ops) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter '%s' not found", runtime_cfg.adapter_name);
-        return EXIT_FAILURE;
-    }
-
-    struct td_adapter_config adapter_cfg = {
-        .rx_iface = runtime_cfg.rx_iface,
-        .tx_iface = runtime_cfg.tx_iface,
-        .tx_interval_ms = runtime_cfg.tx_interval_ms,
-        .rx_ring_size = 0,
-    };
-
-    struct td_adapter_env adapter_env = {
-        .log_fn = adapter_log_bridge,
-        .log_user_data = NULL,
-    };
-
-    td_adapter_t *adapter_handle = NULL;
-    td_adapter_result_t adapter_rc = adapter_desc->ops->init(&adapter_cfg, &adapter_env, &adapter_handle);
-    if (adapter_rc != TD_ADAPTER_OK) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter init failed: %d", adapter_rc);
-        return EXIT_FAILURE;
-    }
-
-    struct terminal_manager_config manager_cfg;
-    if (td_config_to_manager_config(&runtime_cfg, &manager_cfg) != 0) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to translate runtime config");
-        adapter_desc->ops->shutdown(adapter_handle);
-        return EXIT_FAILURE;
-    }
-
     struct app_context ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.adapter = adapter_handle;
-    ctx.ops = adapter_desc->ops;
-    ctx.netlink_listener = NULL;
-
-    struct terminal_manager *manager = terminal_manager_create(&manager_cfg,
-                                                               adapter_handle,
-                                                               adapter_desc->ops,
-                                                               terminal_probe_handler,
-                                                               &ctx);
-    if (!manager) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to create terminal manager");
-        adapter_desc->ops->shutdown(adapter_handle);
-        return EXIT_FAILURE;
-    }
-    ctx.manager = manager;
-
-    struct terminal_netlink_listener *netlink_listener = NULL;
-    if (terminal_netlink_start(manager, &netlink_listener) != 0) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to start netlink listener");
-        terminal_manager_destroy(manager);
-        adapter_desc->ops->shutdown(adapter_handle);
-        return EXIT_FAILURE;
-    }
-    ctx.netlink_listener = netlink_listener;
-
-    if (terminal_manager_set_event_sink(manager, terminal_event_logger, &ctx) != 0) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to set event sink");
-        terminal_netlink_stop(ctx.netlink_listener);
-        ctx.netlink_listener = NULL;
-        terminal_manager_destroy(manager);
-        adapter_desc->ops->shutdown(adapter_handle);
-        return EXIT_FAILURE;
-    }
-
-    struct td_adapter_packet_subscription packet_sub = {
-        .callback = adapter_packet_callback,
-        .user_ctx = &ctx,
-    };
-
-    adapter_rc = adapter_desc->ops->register_packet_rx(adapter_handle, &packet_sub);
-    if (adapter_rc != TD_ADAPTER_OK) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "register_packet_rx failed: %d", adapter_rc);
-        terminal_netlink_stop(ctx.netlink_listener);
-        ctx.netlink_listener = NULL;
-        terminal_manager_set_event_sink(manager, NULL, NULL);
-        terminal_manager_destroy(manager);
-        adapter_desc->ops->shutdown(adapter_handle);
-        return EXIT_FAILURE;
-    }
-
-    adapter_rc = adapter_desc->ops->start(adapter_handle);
-    if (adapter_rc != TD_ADAPTER_OK) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "adapter start failed: %d", adapter_rc);
-        terminal_netlink_stop(ctx.netlink_listener);
-        ctx.netlink_listener = NULL;
-        terminal_manager_set_event_sink(manager, NULL, NULL);
-        terminal_manager_destroy(manager);
-        adapter_desc->ops->shutdown(adapter_handle);
+    int bootstrap_rc = terminal_discovery_bootstrap(&runtime_cfg, terminal_event_logger, &ctx, &ctx);
+    if (bootstrap_rc != 0) {
         return EXIT_FAILURE;
     }
 
@@ -463,32 +504,90 @@ int main(int argc, char **argv) {
         }
         if (g_should_dump_stats) {
             g_should_dump_stats = 0;
-            log_manager_stats(manager);
+            log_manager_stats(ctx.manager);
         }
         if (runtime_cfg.stats_log_interval_sec > 0) {
             if (++stats_elapsed_sec >= runtime_cfg.stats_log_interval_sec) {
                 stats_elapsed_sec = 0;
-                log_manager_stats(manager);
+                log_manager_stats(ctx.manager);
             }
         }
     }
 
     if (g_should_dump_stats) {
         g_should_dump_stats = 0;
-        log_manager_stats(manager);
+        log_manager_stats(ctx.manager);
     }
 
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "signal %d received, shutting down", g_should_stop);
-    log_manager_stats(manager);
+    log_manager_stats(ctx.manager);
 
-    adapter_desc->ops->stop(adapter_handle);
-    terminal_netlink_stop(ctx.netlink_listener);
-    ctx.netlink_listener = NULL;
-    terminal_manager_flush_events(manager);
-    terminal_manager_set_event_sink(manager, NULL, NULL);
-    terminal_manager_destroy(manager);
-    adapter_desc->ops->shutdown(adapter_handle);
+    terminal_discovery_cleanup(&ctx);
 
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "shutdown complete");
     return EXIT_SUCCESS;
+}
+#endif
+
+static struct app_context g_embedded_ctx;
+static bool g_embedded_initialized = false;
+
+struct terminal_manager *terminal_discovery_get_manager(void) {
+    if (!g_embedded_initialized) {
+        return NULL;
+    }
+    return g_embedded_ctx.manager;
+}
+
+const struct app_context *terminal_discovery_get_app_context(void) {
+    if (!g_embedded_initialized) {
+        return NULL;
+    }
+    return &g_embedded_ctx;
+}
+
+int terminal_discovery_initialize(const struct terminal_discovery_init_params *params) {
+    if (!params || !params->event_callback) {
+        return -EINVAL;
+    }
+
+    if (g_embedded_initialized) {
+        return -EALREADY;
+    }
+
+    struct td_runtime_config runtime_cfg;
+    if (td_config_load_defaults(&runtime_cfg) != 0) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to load default runtime configuration");
+        return -EIO;
+    }
+
+    if (params->runtime_config) {
+        runtime_cfg = *params->runtime_config;
+    }
+
+    td_log_set_level(runtime_cfg.log_level);
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_daemon",
+                  "starting (adapter=%s rx=%s tx=%s keepalive=%us miss=%u holdoff=%us max=%u stats=%us)",
+                  runtime_cfg.adapter_name,
+                  runtime_cfg.rx_iface,
+                  runtime_cfg.tx_iface,
+                  runtime_cfg.keepalive_interval_sec,
+                  runtime_cfg.keepalive_miss_threshold,
+                  runtime_cfg.iface_invalid_holdoff_sec,
+                  runtime_cfg.max_terminals,
+                  runtime_cfg.stats_log_interval_sec);
+
+    int rc = terminal_discovery_bootstrap(&runtime_cfg,
+                                          params->event_callback,
+                                          params->event_callback_ctx,
+                                          &g_embedded_ctx);
+    if (rc != 0) {
+        terminal_discovery_cleanup(&g_embedded_ctx);
+        memset(&g_embedded_ctx, 0, sizeof(g_embedded_ctx));
+        return rc;
+    }
+
+    g_embedded_initialized = true;
+    return 0;
 }

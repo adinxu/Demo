@@ -36,8 +36,9 @@ src/
 - `adapter/` 集中适配层实现，当前仅有 `realtek_adapter` 提供真实硬件接入能力。
 - `common/` 含业务核心：终端管理器、配置、日志、netlink 与北向桥接实现。
 - `include/` 存放跨目录共享的对外头文件，供适配层与测试复用。
+- `main/` 目前仅有 `terminal_main.c`，既提供 CLI 启动入口，也导出嵌入式接口 `terminal_discovery_initialize` 及只读 accessor（`terminal_discovery_get_manager` / `terminal_discovery_get_app_context`，声明于 `terminal_discovery_embed.h`）。
 - `stub/` 提供 `td_switch_mac_stub` 等模拟组件，主要服务于单元测试与无硬件环境。
-- `tests/` 汇总 C/C++ 单元与集成测试入口，`make test` 将直接执行此目录下的目标。
+- `tests/` 汇总 C/C++ 单元与集成测试入口，新增 `terminal_embedded_init_tests` 覆盖嵌入式初始化回滚与重复注册场景；`make test` 将直接执行此目录下的目标。
 - `demo/` 保留实验性/演示用程序，不随正式版本发布。
 - `ref/` 仅存放厂商给出的参考代码或头文件，保持只读，用于对照实际实现。
 

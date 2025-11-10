@@ -51,6 +51,11 @@ STUB_TEST_SRCS := tests/td_switch_mac_stub_tests.c
 STUB_TEST_OBJS := $(STUB_TEST_SRCS:.c=.o)
 STUB_TEST_DEPS := stub/td_switch_mac_stub.o
 
+EMBED_TEST_TARGET := terminal_embedded_init_tests
+EMBED_TEST_SRCS := tests/terminal_embedded_init_tests.c
+EMBED_TEST_OBJS := $(EMBED_TEST_SRCS:.c=.o) tests/terminal_main_for_tests.o
+EMBED_TEST_DEPS := common/td_config.o common/td_logging.o
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
@@ -65,6 +70,12 @@ $(INTEGRATION_TEST_TARGET): $(INTEGRATION_TEST_OBJS) $(INTEGRATION_TEST_DEPS)
 $(STUB_TEST_TARGET): $(STUB_TEST_OBJS) $(STUB_TEST_DEPS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+$(EMBED_TEST_TARGET): $(EMBED_TEST_OBJS) $(EMBED_TEST_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/terminal_main_for_tests.o: main/terminal_main.c
+	$(CC) $(CFLAGS) -DTD_DISABLE_APP_MAIN -c $< -o $@
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -75,7 +86,8 @@ clean:
 	rm -f $(TARGET) $(OBJS) \
 		$(TEST_TARGET) $(TEST_OBJS) \
 		$(INTEGRATION_TEST_TARGET) $(INTEGRATION_TEST_OBJS) \
-		$(STUB_TEST_TARGET) $(STUB_TEST_OBJS)
+		$(STUB_TEST_TARGET) $(STUB_TEST_OBJS) \
+		$(EMBED_TEST_TARGET) $(EMBED_TEST_OBJS)
 
 cross:
 	$(MAKE) TOOLCHAIN_PREFIX=mips-rtl83xx-linux- all
@@ -86,7 +98,8 @@ cross-generic:
 
 .PHONY: all clean cross cross-generic test
 
-test: $(TEST_TARGET) $(INTEGRATION_TEST_TARGET) $(STUB_TEST_TARGET)
+test: $(TEST_TARGET) $(INTEGRATION_TEST_TARGET) $(STUB_TEST_TARGET) $(EMBED_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(INTEGRATION_TEST_TARGET)
 	./$(STUB_TEST_TARGET)
+	./$(EMBED_TEST_TARGET)
