@@ -22,15 +22,7 @@
 
 int terminal_northbound_attach_default_sink(struct terminal_manager *manager);
 
-struct app_context {
-    struct terminal_manager *manager;
-    td_adapter_t *adapter;
-    const struct td_adapter_ops *ops;
-    struct terminal_netlink_listener *netlink_listener;
-    bool adapter_started;
-    bool packet_rx_registered;
-};
-
+#ifndef TD_DISABLE_APP_MAIN
 static volatile sig_atomic_t g_should_stop = 0;
 static volatile sig_atomic_t g_should_dump_stats = 0;
 static const char *g_program_name = "terminal_discovery";
@@ -43,6 +35,16 @@ static void handle_stats_signal(int sig) {
     (void)sig;
     g_should_dump_stats = 1;
 }
+#endif
+
+struct app_context {
+    struct terminal_manager *manager;
+    td_adapter_t *adapter;
+    const struct td_adapter_ops *ops;
+    struct terminal_netlink_listener *netlink_listener;
+    bool adapter_started;
+    bool packet_rx_registered;
+};
 
 static void adapter_log_bridge(void *user_data,
                                td_log_level_t level,
@@ -83,6 +85,8 @@ static const char *state_to_string(terminal_state_t state) {
         return "UNKNOWN";
     }
 }
+
+#ifndef TD_DISABLE_APP_MAIN
 
 static void print_prompt(void) {
     fprintf(stdout, "td> ");
@@ -358,6 +362,8 @@ static void log_manager_stats(struct terminal_manager *manager) {
                   stats.address_update_events);
 }
 
+#endif /* TD_DISABLE_APP_MAIN */
+
 static void adapter_packet_callback(const struct td_adapter_packet_view *packet, void *user_ctx) {
     struct app_context *ctx = (struct app_context *)user_ctx;
     if (!ctx || !ctx->manager || !packet) {
@@ -540,6 +546,8 @@ static int terminal_discovery_bootstrap(const struct td_runtime_config *runtime_
     return 0;
 }
 
+#ifndef TD_DISABLE_APP_MAIN
+
 static void print_usage(FILE *stream) {
     fprintf(stream,
             "Usage: %s [options]\n"
@@ -588,7 +596,6 @@ static int parse_size_t_option(const char *opt_name, const char *value, size_t *
     return 0;
 }
 
-#ifndef TD_DISABLE_APP_MAIN
 int main(int argc, char **argv) {
     if (argc > 0 && argv && argv[0]) {
         g_program_name = argv[0];
@@ -792,7 +799,8 @@ int main(int argc, char **argv) {
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "shutdown complete");
     return EXIT_SUCCESS;
 }
-#endif
+
+#endif /* TD_DISABLE_APP_MAIN */
 
 static struct app_context g_embedded_ctx;
 static bool g_embedded_initialized = false;
