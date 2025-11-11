@@ -1,7 +1,7 @@
 #include "terminal_discovery_api.hpp"
 
-#include "terminal_manager.h"
 #include "td_logging.h"
+#include "terminal_manager.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -41,6 +41,19 @@ std::string format_ip(const struct in_addr &ip) {
         return std::string();
     }
     return std::string(buf);
+}
+
+const char *event_tag_to_string(terminal_event_tag_t tag) {
+    switch (tag) {
+    case TERMINAL_EVENT_TAG_ADD:
+        return "ADD";
+    case TERMINAL_EVENT_TAG_DEL:
+        return "DEL";
+    case TERMINAL_EVENT_TAG_MOD:
+        return "MOD";
+    default:
+        return "UNK";
+    }
 }
 
 ModifyTag to_modify_tag(terminal_event_tag_t tag) {
@@ -143,6 +156,33 @@ void inc_report_adapter(const terminal_event_record_t *records, size_t count, vo
     }
 }
 
+void default_event_logger(const terminal_event_record_t *records, size_t count, void *ctx) {
+    (void)ctx;
+    if (!records || count == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const terminal_event_record_t &rec = records[i];
+        std::string mac = format_mac(rec.key.mac);
+
+        char ip_buf[INET_ADDRSTRLEN];
+        std::memset(ip_buf, 0, sizeof(ip_buf));
+        const char *ip_str = inet_ntop(AF_INET, &rec.key.ip, ip_buf, sizeof(ip_buf));
+        if (!ip_str) {
+            ip_str = "<invalid>";
+        }
+
+        td_log_writef(TD_LOG_INFO,
+                      "terminal_events",
+                      "event=%s mac=%s ip=%s ifindex=%u",
+                      event_tag_to_string(rec.tag),
+                      mac.c_str(),
+                      ip_str,
+                      rec.ifindex);
+    }
+}
+
 } // namespace
 
 extern "C" int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo) {
@@ -172,6 +212,26 @@ extern "C" int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo) {
     }
 
     return 0;
+}
+
+extern "C" int terminal_northbound_attach_default_sink(struct terminal_manager *manager) {
+    if (!manager) {
+        return -EINVAL;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_inc_report_mutex);
+        g_inc_report_cb = nullptr;
+    }
+
+    int rc = terminal_manager_set_event_sink(manager, default_event_logger, nullptr);
+    if (rc != 0) {
+        td_log_writef(TD_LOG_ERROR,
+                      "terminal_northbound",
+                      "terminal_manager_set_event_sink failed: %d",
+                      rc);
+    }
+    return rc;
 }
 
 extern "C" int setIncrementReport(IncReportCb cb) {

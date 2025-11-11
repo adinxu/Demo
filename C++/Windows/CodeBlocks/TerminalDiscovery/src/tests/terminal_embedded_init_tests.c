@@ -7,6 +7,8 @@
 #include "terminal_manager.h"
 #include "terminal_netlink.h"
 
+int terminal_northbound_attach_default_sink(struct terminal_manager *manager);
+
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,6 +33,7 @@ struct stub_state {
     td_adapter_result_t register_result;
     td_adapter_result_t start_result;
     int netlink_start_result;
+    int northbound_attach_result;
     int set_event_sink_result;
     bool fail_manager_create;
     unsigned int init_calls;
@@ -43,11 +46,13 @@ struct stub_state {
     unsigned int netlink_start_calls;
     unsigned int netlink_stop_calls;
     unsigned int set_sink_calls;
+    unsigned int northbound_attach_calls;
     struct terminal_manager_config manager_cfg;
     terminal_event_callback_fn registered_callback;
     void *registered_ctx;
     terminal_event_callback_fn last_nonnull_callback;
     void *last_nonnull_ctx;
+    struct terminal_manager *last_attached_manager;
     struct td_adapter_packet_subscription last_subscription;
 };
 
@@ -55,6 +60,14 @@ static struct stub_state g_stub;
 static struct td_adapter g_stub_adapter_handle;
 static struct terminal_manager g_stub_manager_handle;
 static struct terminal_netlink_listener g_stub_listener_handle;
+
+static void stub_default_sink(const terminal_event_record_t *records,
+                              size_t count,
+                              void *ctx) {
+    (void)records;
+    (void)count;
+    (void)ctx;
+}
 
 static td_adapter_result_t stub_adapter_init(const struct td_adapter_config *cfg,
                                              const struct td_adapter_env *env,
@@ -166,12 +179,14 @@ int terminal_manager_set_event_sink(struct terminal_manager *mgr,
     if (callback) {
         g_stub.last_nonnull_callback = callback;
         g_stub.last_nonnull_ctx = callback_ctx;
+        if (g_stub.set_event_sink_result != 0) {
+            int err = g_stub.set_event_sink_result;
+            g_stub.set_event_sink_result = 0;
+            return err;
+        }
     }
     g_stub.registered_callback = callback;
     g_stub.registered_ctx = callback_ctx;
-    if (g_stub.set_event_sink_result != 0) {
-        return g_stub.set_event_sink_result;
-    }
     return 0;
 }
 
@@ -206,26 +221,31 @@ void terminal_netlink_stop(struct terminal_netlink_listener *listener) {
     g_stub.netlink_stop_calls += 1;
 }
 
+int terminal_northbound_attach_default_sink(struct terminal_manager *manager) {
+    g_stub.northbound_attach_calls += 1;
+    g_stub.last_attached_manager = manager;
+    if (g_stub.northbound_attach_result != 0) {
+        return g_stub.northbound_attach_result;
+    }
+    return terminal_manager_set_event_sink(manager, stub_default_sink, NULL);
+}
+
 static void stub_reset(void) {
     memset(&g_stub, 0, sizeof(g_stub));
     g_stub.init_result = TD_ADAPTER_OK;
     g_stub.register_result = TD_ADAPTER_OK;
     g_stub.start_result = TD_ADAPTER_OK;
     g_stub.netlink_start_result = 0;
+    g_stub.northbound_attach_result = 0;
     g_stub.set_event_sink_result = 0;
     g_stub.fail_manager_create = false;
-    memset(&g_stub.last_subscription, 0, sizeof(g_stub.last_subscription));
+    g_stub.registered_callback = NULL;
+    g_stub.registered_ctx = NULL;
     g_stub.last_nonnull_callback = NULL;
     g_stub.last_nonnull_ctx = NULL;
+    g_stub.last_attached_manager = NULL;
+    memset(&g_stub.last_subscription, 0, sizeof(g_stub.last_subscription));
     td_log_set_level(TD_LOG_NONE);
-}
-
-static void dummy_event_sink(const terminal_event_record_t *records,
-                             size_t count,
-                             void *ctx) {
-    (void)records;
-    (void)count;
-    (void)ctx;
 }
 
 static bool test_accessors_before_init(void) {
@@ -241,59 +261,12 @@ static bool test_accessors_before_init(void) {
     return true;
 }
 
-static bool test_initialize_defaults_to_logger_when_callback_missing(void) {
-    stub_reset();
-    g_stub.register_result = TD_ADAPTER_ERR_SYS;
-
-    struct terminal_discovery_init_params params;
-    memset(&params, 0, sizeof(params));
-    params.event_callback = NULL;
-    params.event_callback_ctx = &params; /* arbitrary sentinel */
-
-    int rc = terminal_discovery_initialize(&params);
-    if (rc != g_stub.register_result) {
-        fprintf(stderr, "expected %d, got %d\n", g_stub.register_result, rc);
-        return false;
-    }
-    if (g_stub.init_calls != 1U) {
-        fprintf(stderr, "expected adapter init once, got %u\n", g_stub.init_calls);
-        return false;
-    }
-    if (g_stub.last_nonnull_callback == NULL) {
-        fprintf(stderr, "expected fallback callback to be registered\n");
-        return false;
-    }
-    if (g_stub.last_nonnull_callback == dummy_event_sink) {
-        fprintf(stderr, "fallback callback should differ from user sink\n");
-        return false;
-    }
-    if (g_stub.last_nonnull_ctx != params.event_callback_ctx) {
-        fprintf(stderr, "fallback should forward event ctx\n");
-        return false;
-    }
-    if (g_stub.set_sink_calls != 2U) {
-        fprintf(stderr, "expected sink set and reset once each, got %u\n", g_stub.set_sink_calls);
-        return false;
-    }
-    if (g_stub.register_calls != 1U) {
-        fprintf(stderr, "expected packet registration once, got %u\n", g_stub.register_calls);
-        return false;
-    }
-    if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
-        fprintf(stderr, "accessors should remain NULL after fallback initialization failure\n");
-        return false;
-    }
-    return true;
-}
-
 static bool test_initialize_adapter_init_failure(void) {
     stub_reset();
     g_stub.init_result = TD_ADAPTER_ERR_SYS;
 
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
-    params.event_callback = dummy_event_sink;
-    params.event_callback_ctx = NULL;
 
     int rc = terminal_discovery_initialize(&params);
     if (rc != TD_ADAPTER_ERR_SYS) {
@@ -305,11 +278,54 @@ static bool test_initialize_adapter_init_failure(void) {
         return false;
     }
     if (g_stub.shutdown_calls != 0U) {
-        fprintf(stderr, "expected shutdown not called\n");
+        fprintf(stderr, "adapter shutdown should not run\n");
+        return false;
+    }
+    if (g_stub.northbound_attach_calls != 0U) {
+        fprintf(stderr, "northbound attach should not run\n");
         return false;
     }
     if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
         fprintf(stderr, "accessors should remain NULL when adapter init fails\n");
+        return false;
+    }
+    return true;
+}
+
+static bool test_initialize_manager_create_failure(void) {
+    stub_reset();
+    g_stub.fail_manager_create = true;
+
+    struct terminal_discovery_init_params params;
+    memset(&params, 0, sizeof(params));
+
+    int rc = terminal_discovery_initialize(&params);
+    if (rc != -1) {
+        fprintf(stderr, "expected -1, got %d\n", rc);
+        return false;
+    }
+    if (g_stub.init_calls != 1U) {
+        fprintf(stderr, "expected adapter init once\n");
+        return false;
+    }
+    if (g_stub.shutdown_calls != 1U) {
+        fprintf(stderr, "expected adapter shutdown after failure\n");
+        return false;
+    }
+    if (g_stub.destroy_calls != 0U) {
+        fprintf(stderr, "manager should not be destroyed when creation fails\n");
+        return false;
+    }
+    if (g_stub.northbound_attach_calls != 0U) {
+        fprintf(stderr, "northbound attach should not run\n");
+        return false;
+    }
+    if (g_stub.netlink_start_calls != 0U) {
+        fprintf(stderr, "netlink should not start when manager creation fails\n");
+        return false;
+    }
+    if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
+        fprintf(stderr, "accessors should remain NULL when manager creation fails\n");
         return false;
     }
     return true;
@@ -321,67 +337,85 @@ static bool test_initialize_netlink_failure_triggers_cleanup(void) {
 
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
-    params.event_callback = dummy_event_sink;
 
     int rc = terminal_discovery_initialize(&params);
     if (rc != -1) {
         fprintf(stderr, "expected -1, got %d\n", rc);
         return false;
     }
-    if (g_stub.destroy_calls != 1U) {
-        fprintf(stderr, "expected manager destroyed\n");
-        return false;
-    }
-    if (g_stub.shutdown_calls != 1U) {
-        fprintf(stderr, "expected adapter shutdown\n");
+    if (g_stub.netlink_start_calls != 1U) {
+        fprintf(stderr, "expected netlink start once\n");
         return false;
     }
     if (g_stub.netlink_stop_calls != 0U) {
-        fprintf(stderr, "netlink stop should not run when start fails early\n");
+        fprintf(stderr, "netlink stop should not run when start fails\n");
         return false;
     }
-        if (g_stub.set_sink_calls != 1U) {
-            fprintf(stderr, "expected cleanup to reset event sink once\n");
-            return false;
-        }
-        if (g_stub.flush_calls != 1U) {
-            fprintf(stderr, "expected events flushed once\n");
-            return false;
-        }
-        if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
-            fprintf(stderr, "accessors should remain NULL when netlink start fails\n");
-            return false;
-        }
+    if (g_stub.destroy_calls != 1U) {
+        fprintf(stderr, "manager should be destroyed\n");
+        return false;
+    }
+    if (g_stub.shutdown_calls != 1U) {
+        fprintf(stderr, "adapter shutdown should run\n");
+        return false;
+    }
+    if (g_stub.flush_calls != 1U) {
+        fprintf(stderr, "manager events should be flushed once\n");
+        return false;
+    }
+    if (g_stub.set_sink_calls != 1U) {
+        fprintf(stderr, "cleanup should reset event sink once\n");
+        return false;
+    }
+    if (g_stub.northbound_attach_calls != 0U) {
+        fprintf(stderr, "northbound attach should not run after netlink failure\n");
+        return false;
+    }
+    if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
+        fprintf(stderr, "accessors should remain NULL when netlink start fails\n");
+        return false;
+    }
     return true;
 }
 
-static bool test_initialize_manager_create_failure(void) {
+static bool test_initialize_northbound_helper_failure(void) {
     stub_reset();
-    g_stub.fail_manager_create = true;
+    g_stub.northbound_attach_result = -9;
 
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
-    params.event_callback = dummy_event_sink;
 
     int rc = terminal_discovery_initialize(&params);
     if (rc != -1) {
         fprintf(stderr, "expected -1, got %d\n", rc);
         return false;
     }
-    if (g_stub.init_calls != 1U) {
-        fprintf(stderr, "expected adapter init to be called\n");
+    if (g_stub.northbound_attach_calls != 1U) {
+        fprintf(stderr, "expected northbound attach once\n");
+        return false;
+    }
+    if (g_stub.set_sink_calls != 1U) {
+        fprintf(stderr, "cleanup should reset event sink once\n");
+        return false;
+    }
+    if (g_stub.last_nonnull_callback != NULL) {
+        fprintf(stderr, "default sink should not be recorded on helper failure\n");
+        return false;
+    }
+    if (g_stub.netlink_stop_calls != 1U) {
+        fprintf(stderr, "expected netlink stop during cleanup\n");
+        return false;
+    }
+    if (g_stub.destroy_calls != 1U) {
+        fprintf(stderr, "manager should be destroyed\n");
         return false;
     }
     if (g_stub.shutdown_calls != 1U) {
-        fprintf(stderr, "expected adapter shutdown after failure\n");
-        return false;
-    }
-    if (g_stub.destroy_calls != 0U) {
-        fprintf(stderr, "manager should not be destroyed when creation fails\n");
+        fprintf(stderr, "adapter shutdown should run\n");
         return false;
     }
     if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
-        fprintf(stderr, "accessors should remain NULL when manager creation fails\n");
+        fprintf(stderr, "accessors should remain NULL when northbound helper fails\n");
         return false;
     }
     return true;
@@ -393,35 +427,42 @@ static bool test_initialize_event_sink_failure_stops_listener(void) {
 
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
-    params.event_callback = dummy_event_sink;
 
     int rc = terminal_discovery_initialize(&params);
     if (rc != -1) {
         fprintf(stderr, "expected -1, got %d\n", rc);
         return false;
     }
-    if (g_stub.netlink_stop_calls != 1U) {
-        fprintf(stderr, "expected netlink stop during cleanup, got %u\n", g_stub.netlink_stop_calls);
-        return false;
-    }
-    if (g_stub.destroy_calls != 1U) {
-        fprintf(stderr, "expected manager destroyed\n");
-        return false;
-    }
-    if (g_stub.shutdown_calls != 1U) {
-        fprintf(stderr, "expected adapter shutdown\n");
+    if (g_stub.northbound_attach_calls != 1U) {
+        fprintf(stderr, "expected northbound attach once\n");
         return false;
     }
     if (g_stub.set_sink_calls != 2U) {
-        fprintf(stderr, "expected event sink set + reset during cleanup\n");
+        fprintf(stderr, "expected attach attempt and cleanup reset\n");
+        return false;
+    }
+    if (g_stub.last_nonnull_callback != stub_default_sink) {
+        fprintf(stderr, "default sink should be attempted\n");
         return false;
     }
     if (g_stub.registered_callback != NULL || g_stub.registered_ctx != NULL) {
-        fprintf(stderr, "cleanup should reset event sink state\n");
+        fprintf(stderr, "default sink should not remain registered on failure\n");
+        return false;
+    }
+    if (g_stub.netlink_stop_calls != 1U) {
+        fprintf(stderr, "expected netlink stop during cleanup\n");
+        return false;
+    }
+    if (g_stub.destroy_calls != 1U) {
+        fprintf(stderr, "manager should be destroyed\n");
+        return false;
+    }
+    if (g_stub.shutdown_calls != 1U) {
+        fprintf(stderr, "adapter shutdown should run\n");
         return false;
     }
     if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
-        fprintf(stderr, "accessors should remain NULL when event sink setup fails\n");
+        fprintf(stderr, "accessors should remain NULL when sink set fails\n");
         return false;
     }
     return true;
@@ -433,39 +474,46 @@ static bool test_initialize_register_failure_cleans_up(void) {
 
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
-    params.event_callback = dummy_event_sink;
 
     int rc = terminal_discovery_initialize(&params);
     if (rc != g_stub.register_result) {
         fprintf(stderr, "expected %d, got %d\n", g_stub.register_result, rc);
         return false;
     }
-    if (g_stub.netlink_stop_calls != 1U) {
-        fprintf(stderr, "expected netlink stop during cleanup\n");
-        return false;
-    }
-    if (g_stub.destroy_calls != 1U) {
-        fprintf(stderr, "expected manager destroyed\n");
-        return false;
-    }
-    if (g_stub.shutdown_calls != 1U) {
-        fprintf(stderr, "expected adapter shutdown\n");
+    if (g_stub.northbound_attach_calls != 1U) {
+        fprintf(stderr, "expected northbound attach once\n");
         return false;
     }
     if (g_stub.set_sink_calls != 2U) {
-        fprintf(stderr, "expected event sink set + reset\n");
+        fprintf(stderr, "expected default sink set + cleanup reset\n");
+        return false;
+    }
+    if (g_stub.last_nonnull_callback != stub_default_sink) {
+        fprintf(stderr, "default sink should be recorded\n");
+        return false;
+    }
+    if (g_stub.registered_callback != NULL || g_stub.registered_ctx != NULL) {
+        fprintf(stderr, "cleanup should clear event sink\n");
         return false;
     }
     if (g_stub.flush_calls != 1U) {
-        fprintf(stderr, "expected events flushed once\n");
+        fprintf(stderr, "events should be flushed once\n");
         return false;
     }
-    if (!g_stub.last_subscription.callback) {
-        fprintf(stderr, "expected packet subscription captured\n");
+    if (g_stub.netlink_stop_calls != 1U) {
+        fprintf(stderr, "netlink stop should run during cleanup\n");
+        return false;
+    }
+    if (g_stub.destroy_calls != 1U) {
+        fprintf(stderr, "manager should be destroyed\n");
+        return false;
+    }
+    if (g_stub.shutdown_calls != 1U) {
+        fprintf(stderr, "adapter shutdown should run\n");
         return false;
     }
     if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
-        fprintf(stderr, "accessors should remain NULL when RX registration fails\n");
+        fprintf(stderr, "accessors should remain NULL when registration fails\n");
         return false;
     }
     return true;
@@ -487,8 +535,6 @@ static bool test_initialize_success_then_repeat_guard(void) {
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
     params.runtime_config = &cfg;
-    params.event_callback = dummy_event_sink;
-    params.event_callback_ctx = &cfg;
 
     int rc = terminal_discovery_initialize(&params);
     if (rc != 0) {
@@ -499,12 +545,20 @@ static bool test_initialize_success_then_repeat_guard(void) {
         fprintf(stderr, "unexpected adapter call counts\n");
         return false;
     }
-    if (g_stub.set_sink_calls != 1U) {
-        fprintf(stderr, "expected event sink set\n");
+    if (g_stub.northbound_attach_calls != 1U) {
+        fprintf(stderr, "default sink should be attached once\n");
         return false;
     }
-    if (g_stub.registered_callback != dummy_event_sink || g_stub.registered_ctx != &cfg) {
-        fprintf(stderr, "event sink registration mismatch\n");
+    if (g_stub.set_sink_calls != 1U) {
+        fprintf(stderr, "default sink should be installed once\n");
+        return false;
+    }
+    if (g_stub.last_nonnull_callback != stub_default_sink || g_stub.registered_callback != stub_default_sink) {
+        fprintf(stderr, "default sink registration mismatch\n");
+        return false;
+    }
+    if (g_stub.registered_ctx != NULL) {
+        fprintf(stderr, "default sink should not receive context\n");
         return false;
     }
     if (g_stub.manager_cfg.keepalive_interval_sec != cfg.keepalive_interval_sec ||
@@ -514,13 +568,15 @@ static bool test_initialize_success_then_repeat_guard(void) {
         fprintf(stderr, "manager config does not reflect runtime overrides\n");
         return false;
     }
-
+    if (g_stub.last_attached_manager != &g_stub_manager_handle) {
+        fprintf(stderr, "default sink should attach manager handle\n");
+        return false;
+    }
     if (terminal_discovery_get_manager() != &g_stub_manager_handle) {
         fprintf(stderr, "manager accessor did not return expected handle\n");
         return false;
     }
-    const struct app_context *ctx_ptr = terminal_discovery_get_app_context();
-    if (!ctx_ptr) {
+    if (!terminal_discovery_get_app_context()) {
         fprintf(stderr, "app_context accessor returned NULL after init\n");
         return false;
     }
@@ -544,10 +600,10 @@ int main(void) {
         bool (*fn)(void);
     } tests[] = {
         {"accessors_before_init", test_accessors_before_init},
-        {"defaults_to_logger_when_callback_missing", test_initialize_defaults_to_logger_when_callback_missing},
         {"adapter_init_failure", test_initialize_adapter_init_failure},
-        {"netlink_failure_cleanup", test_initialize_netlink_failure_triggers_cleanup},
         {"manager_create_failure", test_initialize_manager_create_failure},
+        {"netlink_failure_cleanup", test_initialize_netlink_failure_triggers_cleanup},
+        {"northbound_helper_failure", test_initialize_northbound_helper_failure},
         {"event_sink_failure", test_initialize_event_sink_failure_stops_listener},
         {"register_failure", test_initialize_register_failure_cleans_up},
         {"success_then_repeat", test_initialize_success_then_repeat_guard},
@@ -574,3 +630,4 @@ int main(void) {
     printf("all %zu tests passed\n", total);
     return EXIT_SUCCESS;
 }
+

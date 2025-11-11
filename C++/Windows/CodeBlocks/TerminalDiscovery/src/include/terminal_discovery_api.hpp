@@ -24,4 +24,7 @@ using IncReportCb = void (*)(const MAC_IP_INFO &info);
 extern "C" int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo);
 extern "C" int setIncrementReport(IncReportCb cb);
 
+struct terminal_manager;
+extern "C" int terminal_northbound_attach_default_sink(struct terminal_manager *manager);
+
 #endif /* TERMINAL_DISCOVERY_API_HPP */

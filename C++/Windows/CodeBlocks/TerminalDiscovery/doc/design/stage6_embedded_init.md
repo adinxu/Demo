@@ -16,15 +16,13 @@
 | 字段 | 说明 |
 | ---- | ---- |
 | `runtime_config` | （可选）指向 `td_runtime_config` 的完整覆写。若为 `NULL`，函数自动加载默认值。调用方可先调用 `td_config_load_defaults`，再按需修改字段。结构体将按值拷贝，后续对原始内存的修改不会影响运行实例。 |
-| `event_callback` | （可选）增量事件回调，等效 `terminal_manager_set_event_sink` 所需的指针。若缺省则自动注册内置 `terminal_event_logger`，即使不上报也能在日志中观察事件走势。 |
-| `event_callback_ctx` | （可选）回调透传上下文，初始化期间会一同注册，清理时复位为 `NULL`。 |
 
 ### 初始化流程摘要
 
 1. 加载默认配置并合并 `runtime_config` 覆写，随后同步日志级别到 `runtime_cfg.log_level`。
 2. 通过 `td_adapter_registry_find` 定位适配器描述符，构造 `td_adapter_config`/`td_adapter_env` 并调用 `ops->init`。
 3. 将 `td_runtime_config` 转换为 `terminal_manager_config`，创建 `terminal_manager`；若适配器或管理器失败会立即回滚。
-4. 启动 netlink 监听器、注册事件回调（使用调用方提供的函数/上下文）。
+4. 启动 netlink 监听器，随后调用 `terminal_northbound_attach_default_sink` 绑定默认日志回调，确保外部暂未注册增量上报时也能观测事件。
 5. 订阅报文回调 `register_packet_rx` 并启动适配器；成功后 `terminal_discovery_initialize` 返回 0，随后实例常驻运行。
 6. 任意步骤失败都会触发 `terminal_discovery_cleanup`，按启动逆序停止适配器、netlink 与管理器，并复原内部上下文。
 
@@ -39,7 +37,7 @@
 | `-EIO` | 默认配置加载失败（极少发生）。 |
 | `-ENOENT` | 指定的适配器不存在（由 `td_adapter_registry_find` 返回）。 |
 | `TD_ADAPTER_ERR_*` | 适配器生命周期（`init/register_packet_rx/start`）中的具体失败值会原样透出。 |
-| 其他负值 | `terminal_netlink_start`、`terminal_manager_set_event_sink`、`td_config_to_manager_config` 或内部清理路径返回的错误，均会回滚并传递该值。 |
+| 其他负值 | `terminal_netlink_start`、`terminal_northbound_attach_default_sink`（含 `terminal_manager_set_event_sink`）、`td_config_to_manager_config` 或内部清理路径返回的错误，均会回滚并传递该值。 |
 
 清理过程保证：
 
@@ -59,12 +57,10 @@
 
    struct terminal_discovery_init_params params = {
        .runtime_config = &cfg,
-       .event_callback = my_sink,
-       .event_callback_ctx = my_ctx,
    };
    int rc = terminal_discovery_initialize(&params);
    ```
-  若宿主暂不消费增量通知，可将 `event_callback` 留空，模块会自动注册 `terminal_event_logger` 在 INFO 级别输出事件日志，便于调试。
+  初始化默认挂接日志 sink；若宿主暂不消费增量通知，可保持默认配置，通过 INFO 级别日志观察事件。
 2. 由于配置按值拷贝，初始化返回后无需保持 `cfg` 生命周期；仍可记录副本供调试。
 3. 若需要手动触发统计输出，可调用 `terminal_discovery_get_manager()` 获取管理器句柄，再结合 `terminal_manager_get_stats` 输出统计；亦可缓存 `terminal_discovery_get_app_context()` 结果以备扩展使用（返回指针仅供只读查询）。
 4. 当前版本默认与进程同生共死，未提供显式停止 API；宿主退出即可释放所有资源。

@@ -379,13 +379,13 @@ classDiagram
 - 负责将上述组件组合成终端发现进程：
   1. `td_config_load_defaults` -> 解析 CLI 参数 -> 设置日志级别。
   2. 查找适配器 (`td_adapter_registry_find`)，初始化 `td_adapter_ops`。
-  3. 创建 `terminal_manager`，启动 netlink 监听器，注册事件回调 `terminal_event_logger`。
+  3. 创建 `terminal_manager`，启动 netlink 监听器，并通过 `terminal_northbound_attach_default_sink` 绑定默认日志回调。
   4. 将适配器报文回调绑定至 `terminal_manager_on_packet`。
   5. 启动适配器并进入主循环（等待信号退出）。
   6. 收到 SIGINT/SIGTERM 后依次停止适配器、销毁管理器、输出 shutdown 日志。
 - 主循环结合 `handle_stats_signal` 与 `g_should_dump_stats` 监控 `SIGUSR1`，并在收到信号或累计达到 `stats_log_interval_sec` 时调用 `log_manager_stats` 打印 `terminal_manager_get_stats` 快照。
 - `terminal_probe_handler`：实现 `terminal_probe_fn`，按请求中的 VLAN ID 与 `source_ip` 构造物理口 ARP 帧；默认优先走物理接口（例如 `eth0`），仅当 `tx_iface_valid` 标记存在且物理口发送失败时才尝试回退到 VLAN 虚接口。
-- `terminal_event_logger`：默认注册的事件回调，将终端的 `ADD/DEL/MOD` 变更写入结构化日志，便于观察流水线行为或在没有北向监听器时进行测试验证。
+- 默认日志 sink：由 `terminal_northbound_attach_default_sink` 挂接，输出 `event=<TAG> mac=<MAC> ip=<IP> ifindex=<IDX>` 格式的 INFO 日志，便于在缺少北向监听器时验证事件流。
 - CLI 支持配置适配器名、接口、保活参数、容量阈值、日志级别等。
 - 通过 `adapter_log_bridge` 将适配器内部日志回落至 `td_logging`。
 

@@ -19,6 +19,8 @@
 #include "terminal_manager.h"
 #include "terminal_netlink.h"
 
+int terminal_northbound_attach_default_sink(struct terminal_manager *manager);
+
 struct app_context {
     struct terminal_manager *manager;
     td_adapter_t *adapter;
@@ -68,19 +70,6 @@ static void format_mac(const uint8_t mac[ETH_ALEN], char out[18]) {
              mac[5]);
 }
 
-static const char *event_tag_to_string(terminal_event_tag_t tag) {
-    switch (tag) {
-    case TERMINAL_EVENT_TAG_ADD:
-        return "ADD";
-    case TERMINAL_EVENT_TAG_DEL:
-        return "DEL";
-    case TERMINAL_EVENT_TAG_MOD:
-        return "MOD";
-    default:
-        return "UNK";
-    }
-}
-
 static const char *state_to_string(terminal_state_t state) {
     switch (state) {
     case TERMINAL_STATE_ACTIVE:
@@ -119,28 +108,6 @@ static void log_manager_stats(struct terminal_manager *manager) {
                   stats.events_dispatched,
                   stats.event_dispatch_failures,
                   stats.address_update_events);
-}
-
-static void terminal_event_logger(const terminal_event_record_t *records,
-                                  size_t count,
-                                  void *user_ctx) {
-    (void)user_ctx;
-    for (size_t i = 0; i < count; ++i) {
-        const terminal_event_record_t *rec = &records[i];
-        char mac_buf[18];
-        char ip_buf[INET_ADDRSTRLEN];
-        format_mac(rec->key.mac, mac_buf);
-        if (!inet_ntop(AF_INET, &rec->key.ip, ip_buf, sizeof(ip_buf))) {
-            snprintf(ip_buf, sizeof(ip_buf), "<invalid>");
-        }
-        td_log_writef(TD_LOG_INFO,
-                      "terminal_events",
-                      "event=%s mac=%s ip=%s ifindex=%u",
-                      event_tag_to_string(rec->tag),
-                      mac_buf,
-                      ip_buf,
-                      rec->ifindex);
-    }
 }
 
 static void adapter_packet_callback(const struct td_adapter_packet_view *packet, void *user_ctx) {
@@ -233,8 +200,6 @@ static void terminal_discovery_cleanup(struct app_context *ctx) {
 }
 
 static int terminal_discovery_bootstrap(const struct td_runtime_config *runtime_cfg,
-                                        terminal_event_callback_fn event_cb,
-                                        void *event_ctx,
                                         struct app_context *ctx) {
     if (!runtime_cfg || !ctx) {
         return -EINVAL;
@@ -297,10 +262,8 @@ static int terminal_discovery_bootstrap(const struct td_runtime_config *runtime_
     }
     ctx->netlink_listener = netlink_listener;
 
-    terminal_event_callback_fn effective_cb = event_cb ? event_cb : terminal_event_logger;
-
-    if (terminal_manager_set_event_sink(manager, effective_cb, event_ctx) != 0) {
-        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to set event sink");
+    if (terminal_northbound_attach_default_sink(manager) != 0) {
+        td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to attach northbound event sink");
         terminal_discovery_cleanup(ctx);
         return -1;
     }
@@ -493,7 +456,7 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, handle_stats_signal);
 
     struct app_context ctx;
-    int bootstrap_rc = terminal_discovery_bootstrap(&runtime_cfg, NULL, NULL, &ctx);
+    int bootstrap_rc = terminal_discovery_bootstrap(&runtime_cfg, &ctx);
     if (bootstrap_rc != 0) {
         return EXIT_FAILURE;
     }
@@ -580,13 +543,7 @@ int terminal_discovery_initialize(const struct terminal_discovery_init_params *p
                   runtime_cfg.max_terminals,
                   runtime_cfg.stats_log_interval_sec);
 
-    terminal_event_callback_fn effective_callback = params->event_callback ? params->event_callback : terminal_event_logger;
-    void *effective_ctx = params->event_callback_ctx;
-
-    int rc = terminal_discovery_bootstrap(&runtime_cfg,
-                                          effective_callback,
-                                          effective_ctx,
-                                          &g_embedded_ctx);
+    int rc = terminal_discovery_bootstrap(&runtime_cfg, &g_embedded_ctx);
     if (rc != 0) {
         terminal_discovery_cleanup(&g_embedded_ctx);
         memset(&g_embedded_ctx, 0, sizeof(g_embedded_ctx));

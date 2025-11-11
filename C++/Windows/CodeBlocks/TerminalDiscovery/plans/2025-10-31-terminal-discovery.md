@@ -100,11 +100,11 @@
 6. ⏳ 验收输出：整理测试报告、回滚策略、性能曲线。
 
 ### 阶段 6：守护进程初始化入口（待启动）
-1. 明确初始化函数的输入/输出契约：设计仅包含配置结构体与事件回调指针的参数，定义返回码语义，以及我们内部的配置覆盖与错误处理规则（无其他注入能力）；当宿主未提供回调时需降级至内建 `terminal_event_logger`，确保调试期仍可通过日志观察事件。
-2. 在 `src/main/terminal_main.c` 提取或重构可复用的启动 helper，使 CLI 与新入口共享配置合并、`td_config_to_manager_config` 转换、`terminal_manager` 创建、Netlink 启动、事件回调注册、适配器订阅/启动及探测回调绑定逻辑。
-3. 实现新的初始化函数（遵循 `terminal_discovery_*` 命名），并补充只读 accessor：一个返回内部 `terminal_manager` 句柄供查询统计使用，另一个返回 `app_context` 引用以支撑未来扩展；确保仍由 CLI 与嵌入共享同一 helper，且未经初始化不可获取有效句柄。
-4. 构建测试用例：利用现有 mock 适配器和事件捕获工具补充单元/集成测试，覆盖配置覆写、回调缺失时落入 `terminal_event_logger`、适配器启动失败、异常回滚等路径，并验证 accessor 在成功与失败场景下的可见性与重复调用保护。
-5. 更新文档：在 `doc/` 与相关 README 中新增初始化模块使用说明与 accessor 示例，描述参数结构、调用方式、回调约束与故障排查；同步引用最新 spec/plan 条目。
+1. 重构初始化契约：嵌入入口仅接收运行时配置结构体，定义返回码语义与配置覆写规则；移除外部事件回调参数，默认绑定内置日志回调以保证最小可观测性。
+2. 在 `src/main/terminal_main.c` 提取共享启动 helper，负责配置合并、`td_config_to_manager_config` 转换、`terminal_manager` 创建、Netlink 启动与适配器订阅/启动，CLI 与嵌入路径共用该流程。
+3. 暴露只读 accessor（`terminal_discovery_get_manager`/`terminal_discovery_get_app_context`）供嵌入方观测，同时确保 `setIncrementReport` 成为唯一增量上报入口；桥接层新增 `terminal_northbound_attach_default_sink` 负责默认日志模式，后续通过 `terminal_manager_set_event_sink` 切换至业务回调。
+4. 构建测试用例：基于现有 mock 覆盖默认日志模式、调用 `setIncrementReport` 后的事件切换、重复注册保护、适配器/Netlink 失败回滚与 accessor 可见性，确保无回调路径依旧安全。
+5. 更新文档：在 `doc/` 与 README 补充初始化流程、默认日志说明、使用 `setIncrementReport` 启用/停用上报及 C++ 日志回调示例，并保持与规范一致。
 6. 确认现有 `make test` 及新增测试全部通过，完成代码与文档交付。
 
 ## 依赖与风险
