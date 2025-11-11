@@ -66,6 +66,73 @@ static void probe_reset(struct probe_capture *capture) {
     memset(capture, 0, sizeof(*capture));
 }
 
+struct debug_capture {
+    char *data;
+    size_t size;
+    size_t capacity;
+    bool had_error;
+};
+
+static void debug_capture_init(struct debug_capture *capture) {
+    if (!capture) {
+        return;
+    }
+    capture->data = NULL;
+    capture->size = 0;
+    capture->capacity = 0;
+    capture->had_error = false;
+}
+
+static void debug_capture_reset(struct debug_capture *capture) {
+    if (!capture) {
+        return;
+    }
+    capture->size = 0;
+    if (capture->data) {
+        capture->data[0] = '\0';
+    }
+    capture->had_error = false;
+}
+
+static void debug_capture_free(struct debug_capture *capture) {
+    if (!capture) {
+        return;
+    }
+    free(capture->data);
+    capture->data = NULL;
+    capture->size = 0;
+    capture->capacity = 0;
+    capture->had_error = false;
+}
+
+static void debug_capture_writer(void *ctx, const char *line) {
+    struct debug_capture *capture = (struct debug_capture *)ctx;
+    if (!capture || !line) {
+        if (capture) {
+            capture->had_error = true;
+        }
+        return;
+    }
+    size_t len = strlen(line);
+    size_t needed = capture->size + len + 1;
+    if (needed > capture->capacity) {
+        size_t new_capacity = capture->capacity ? capture->capacity * 2U : 256U;
+        while (new_capacity < needed) {
+            new_capacity *= 2U;
+        }
+        char *tmp = (char *)realloc(capture->data, new_capacity);
+        if (!tmp) {
+            capture->had_error = true;
+            return;
+        }
+        capture->data = tmp;
+        capture->capacity = new_capacity;
+    }
+    memcpy(capture->data + capture->size, line, len);
+    capture->size += len;
+    capture->data[capture->size] = '\0';
+}
+
 static void capture_callback(const terminal_event_record_t *records,
                              size_t count,
                              void *user_ctx) {
@@ -607,6 +674,120 @@ done:
     return ok;
 }
 
+static bool test_debug_dump_interfaces(void) {
+    const int vlan_id = 310;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 16;
+
+    struct probe_capture probes;
+    probe_reset(&probes);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            NULL,
+                                                            probe_callback,
+                                                            &probes);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for debug dump test\n");
+        return false;
+    }
+
+    apply_address_update(mgr, tx_kernel_ifindex, "203.0.113.1", 24, true);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
+    build_arp_packet(&packet, &arp, mac, "203.0.113.20", vlan_id, 5);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    struct debug_capture capture;
+    debug_capture_init(&capture);
+
+    td_debug_dump_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.verbose_metrics = true;
+
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, &opts);
+
+    bool ok = true;
+
+    int rc = td_debug_dump_terminal_table(mgr, &opts, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "terminal mac=")) {
+        fprintf(stderr, "terminal table dump failed rc=%d had_error=%d\n", rc, ctx.had_error ? 1 : 0);
+        ok = false;
+        goto cleanup;
+    }
+
+    debug_capture_reset(&capture);
+    opts.filter_by_vlan = true;
+    opts.vlan_id = 999;
+    td_debug_context_reset(&ctx, &opts);
+    rc = td_debug_dump_terminal_table(mgr, &opts, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || (capture.data && strstr(capture.data, "terminal mac="))) {
+        fprintf(stderr, "unexpected terminal output when filter excludes entries\n");
+        ok = false;
+        goto cleanup;
+    }
+
+    debug_capture_reset(&capture);
+    opts.filter_by_vlan = false;
+    opts.expand_terminals = true;
+    td_debug_context_reset(&ctx, &opts);
+    rc = td_debug_dump_iface_binding_table(mgr, &opts, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "binding kernel_ifindex")) {
+        fprintf(stderr, "iface binding dump failed rc=%d\n", rc);
+        ok = false;
+        goto cleanup;
+    }
+    if (!strstr(capture.data, "  terminal mac=")) {
+        fprintf(stderr, "binding dump missing expanded terminal entries\n");
+        ok = false;
+        goto cleanup;
+    }
+
+    debug_capture_reset(&capture);
+    td_debug_context_reset(&ctx, NULL);
+    rc = td_debug_dump_iface_prefix_table(mgr, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "iface kernel_ifindex")) {
+        fprintf(stderr, "iface prefix dump failed rc=%d\n", rc);
+        ok = false;
+        goto cleanup;
+    }
+
+    debug_capture_reset(&capture);
+    td_debug_context_reset(&ctx, NULL);
+    rc = td_debug_dump_mac_lookup_queue(mgr, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "mac_lookup")) {
+        fprintf(stderr, "mac lookup queue dump failed rc=%d\n", rc);
+        ok = false;
+        goto cleanup;
+    }
+
+    debug_capture_reset(&capture);
+    td_debug_context_reset(&ctx, NULL);
+    rc = td_debug_dump_mac_locator_state(mgr, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "mac_locator")) {
+        fprintf(stderr, "mac locator dump failed rc=%d\n", rc);
+        ok = false;
+        goto cleanup;
+    }
+
+cleanup:
+    debug_capture_free(&capture);
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
 int main(void) {
     td_log_set_level(TD_LOG_ERROR);
 
@@ -618,7 +799,8 @@ int main(void) {
         {"terminal_add_and_event", test_terminal_add_and_event},
         {"probe_failure_removes_terminal", test_probe_failure_removes_terminal},
         {"iface_invalid_holdoff", test_iface_invalid_holdoff},
-    {"ifindex_change_emits_mod", test_ifindex_change_emits_mod},
+        {"ifindex_change_emits_mod", test_ifindex_change_emits_mod},
+        {"debug_dump_interfaces", test_debug_dump_interfaces},
     };
 
     size_t total = sizeof(tests) / sizeof(tests[0]);

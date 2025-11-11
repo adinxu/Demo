@@ -185,6 +185,41 @@ static bool test_increment_add_and_get_all(terminal_manager *mgr,
         ok = false;
     }
 
+    TerminalDebugSnapshot debug_snapshot(mgr);
+    if (!debug_snapshot.valid()) {
+        std::printf("[FAIL] TerminalDebugSnapshot invalid\n");
+        ok = false;
+    } else {
+        TdDebugDumpOptions options;
+        options.verboseMetrics = true;
+        options.expandTerminals = true;
+        std::string terminals = debug_snapshot.dumpTerminalTable(options);
+        if (terminals.find("terminal mac=") == std::string::npos) {
+            std::printf("[FAIL] debug dump missing terminal entry\n");
+            ok = false;
+        }
+        std::string bindings = debug_snapshot.dumpIfaceBindingTable(options);
+        if (bindings.find("binding kernel_ifindex") == std::string::npos) {
+            std::printf("[FAIL] debug binding dump missing header\n");
+            ok = false;
+        }
+        std::string prefixes = debug_snapshot.dumpIfacePrefixTable();
+        if (prefixes.find("iface kernel_ifindex") == std::string::npos) {
+            std::printf("[FAIL] debug prefix dump missing header\n");
+            ok = false;
+        }
+        std::string queues = debug_snapshot.dumpMacLookupQueues();
+        if (queues.find("mac_lookup") == std::string::npos) {
+            std::printf("[FAIL] debug queue dump missing header\n");
+            ok = false;
+        }
+        std::string locator = debug_snapshot.dumpMacLocatorState();
+        if (locator.find("mac_locator") == std::string::npos) {
+            std::printf("[FAIL] debug locator dump missing header\n");
+            ok = false;
+        }
+    }
+
     return ok;
 }
 

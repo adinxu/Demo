@@ -231,6 +231,14 @@ flowchart TD
   - 地址删除路径会调用 `monotonic_now` 更新 `last_seen`，使保留期从解绑时刻重新计时，避免因历史时间戳过期而在持锁逻辑之外提前被扫描线程删除。
   - **限制说明**：若终端进入 `IFACE_INVALID` 后迟迟没有新的报文或其它触发源抵达，即便后台地址等外部条件已经恢复可用，也只是刷新元数据而不会触发状态更新；条目会一直停留在 `IFACE_INVALID`，直至 `iface_invalid_holdoff_sec` 到期被淘汰。
 
+#### 调试导出 API
+
+- Stage 7 新增 `td_debug_dump_*` 系列函数，全部受 `terminal_manager.lock` 保护，保证快照过程中的结构一致性；导出逻辑统一使用 `td_debug_writer_t` 抽象写入目的地。
+- `td_debug_dump_terminal_table` 遍历 256 个桶并按照可选筛选项（状态、VLAN、ifindex、MAC 前缀、是否展开详细指标等）输出终端列表；采用 `debug_format_wall_clock` 结合单调时钟和壁钟格式化 `last_seen/last_probe`。
+- `td_debug_dump_iface_prefix_table` 与 `td_debug_dump_iface_binding_table` 分别导出接口前缀和绑定关系，便于排查 VLAN 虚接口状态、回程 IP 选取及绑定泄漏问题；后者支持 `expand_terminals` 展开终端详情。
+- `td_debug_dump_mac_lookup_queue`/`td_debug_dump_mac_locator_state` 提供 MAC 查表队列与桥接刷新版本的统一视图，帮助定位 `mac_locator_ops` 被动刷新与主动查询之间的序列。
+- `td_debug_dump_context_t` 与 `td_debug_dump_opts_t` 抽象了导出上下文与过滤条件，`td_debug_context_reset` 允许复用调用方分配的上下文结构；写入回调在设置 `ctx->had_error` 后可让上层停止继续输出。
+
 #### 数据结构关系
 
 以下类图基于 `terminal_manager.c` 中的结构定义，展示核心管理器、事件队列、接口索引与探测任务之间的关系。
@@ -373,6 +381,7 @@ classDiagram
 - `setIncrementReport`：注册 C++ 回调 `IncReportCb`，内部通过 `terminal_manager_set_event_sink` 绑定事件入口。
 - `getAllTerminalInfo`：调用 `terminal_manager_query_all` 生成快照，转换为 `MAC_IP_INFO`。
 - 拥有独立互斥锁 `g_inc_report_mutex` 保证回调注册的线程安全。
+- Stage 7 新增 `TerminalDebugSnapshot`（C++ 包装类）与 `TdDebugDumpOptions`（C++ 侧选项结构），通过 `td_debug_dump_*` 接口生成字符串快照；`string_writer_adapter` 充当中转，将 C 回调写入 `std::string` 并在异常/失败时标记 `td_debug_dump_context_t::had_error`。
 - **依赖**：使用 `terminal_manager_get_active` 获取全局管理器指针（由 `terminal_manager_create` 绑定）。
 
 ### 7. 主程序 `main/terminal_main.c`

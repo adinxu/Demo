@@ -7,10 +7,12 @@
 #include <inttypes.h>
 #include <net/if.h>
 #include <netinet/if_ether.h>
+#include <stdarg.h>
 #include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "td_logging.h"
 #include "td_time_utils.h"
@@ -176,6 +178,187 @@ static bool iface_prefix_remove(struct terminal_manager *mgr,
                                 struct in_addr network,
                                           struct in_addr address,
                                 uint8_t prefix_len);
+
+static uint64_t debug_timespec_diff_ms(const struct timespec *start,
+                                       const struct timespec *end) {
+    return timespec_diff_ms(start, end);
+}
+
+static void debug_format_wall_clock(const struct timespec *wall_now,
+                                    const struct timespec *mono_now,
+                                    const struct timespec *mono_then,
+                                    char *buf,
+                                    size_t buf_len) {
+    if (!buf || buf_len == 0) {
+        return;
+    }
+    buf[0] = '\0';
+    if (!wall_now || !mono_now || !mono_then) {
+        return;
+    }
+
+    struct timespec diff;
+    diff.tv_sec = mono_now->tv_sec - mono_then->tv_sec;
+    diff.tv_nsec = mono_now->tv_nsec - mono_then->tv_nsec;
+    if (diff.tv_nsec < 0) {
+        diff.tv_sec -= 1;
+        diff.tv_nsec += 1000000000L;
+    }
+    if (diff.tv_sec < 0) {
+        diff.tv_sec = 0;
+        diff.tv_nsec = 0;
+    }
+
+    struct timespec wall = *wall_now;
+    wall.tv_sec -= diff.tv_sec;
+    wall.tv_nsec -= diff.tv_nsec;
+    if (wall.tv_nsec < 0) {
+        wall.tv_sec -= 1;
+        wall.tv_nsec += 1000000000L;
+    }
+    if (wall.tv_sec < 0) {
+        wall.tv_sec = 0;
+        wall.tv_nsec = 0;
+    }
+
+    time_t wall_sec = wall.tv_sec;
+    struct tm tm_utc;
+    if (!gmtime_r(&wall_sec, &tm_utc)) {
+        return;
+    }
+    if (strftime(buf, buf_len, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) == 0) {
+        buf[0] = '\0';
+    }
+}
+
+static bool debug_mac_prefix_matches(const struct terminal_entry *entry,
+                                     const td_debug_dump_opts_t *opts) {
+    if (!entry || !opts || !opts->filter_by_mac_prefix) {
+        return true;
+    }
+    size_t len = opts->mac_prefix_len;
+    if (len == 0) {
+        return true;
+    }
+    if (len > ETH_ALEN) {
+        len = ETH_ALEN;
+    }
+    return memcmp(entry->key.mac, opts->mac_prefix, len) == 0;
+}
+
+static bool debug_entry_matches_opts(const struct terminal_entry *entry,
+                                     const td_debug_dump_opts_t *opts) {
+    if (!entry || !opts) {
+        return true;
+    }
+    if (opts->filter_by_state && entry->state != opts->state) {
+        return false;
+    }
+    if (opts->filter_by_vlan && entry->meta.vlan_id != opts->vlan_id) {
+        return false;
+    }
+    if (opts->filter_by_ifindex && entry->meta.ifindex != opts->ifindex) {
+        return false;
+    }
+    if (!debug_mac_prefix_matches(entry, opts)) {
+        return false;
+    }
+    return true;
+}
+
+static size_t mac_lookup_queue_length(const struct mac_lookup_task *head) {
+    size_t length = 0;
+    const struct mac_lookup_task *node = head;
+    while (node) {
+        length += 1;
+        node = node->next;
+    }
+    return length;
+}
+
+#define TD_DEBUG_LINE_STACK 512
+
+static int debug_emit_line(td_debug_writer_t writer,
+                           void *writer_ctx,
+                           td_debug_dump_context_t *ctx,
+                           const char *fmt,
+                           ...) {
+    if (!writer || !fmt) {
+        return -EINVAL;
+    }
+
+    char stack_buf[TD_DEBUG_LINE_STACK];
+    va_list args;
+    va_start(args, fmt);
+    int needed = vsnprintf(stack_buf, sizeof(stack_buf), fmt, args);
+    va_end(args);
+
+    if (needed < 0) {
+        if (ctx) {
+            ctx->had_error = true;
+        }
+        return -EIO;
+    }
+
+    if ((size_t)needed < sizeof(stack_buf)) {
+        writer(writer_ctx, stack_buf);
+        if (ctx) {
+            ctx->lines_emitted += 1;
+        }
+        return ctx && ctx->had_error ? -EIO : 0;
+    }
+
+    size_t heap_len = (size_t)needed + 1U;
+    char *heap_buf = (char *)malloc(heap_len);
+    if (!heap_buf) {
+        if (ctx) {
+            ctx->had_error = true;
+        }
+        return -ENOMEM;
+    }
+
+    va_start(args, fmt);
+    (void)vsnprintf(heap_buf, heap_len, fmt, args);
+    va_end(args);
+
+    writer(writer_ctx, heap_buf);
+    free(heap_buf);
+    if (ctx) {
+        ctx->lines_emitted += 1;
+    }
+    return ctx && ctx->had_error ? -EIO : 0;
+}
+
+void td_debug_writer_file(void *ctx, const char *line) {
+    struct td_debug_file_writer_ctx *file_ctx = (struct td_debug_file_writer_ctx *)ctx;
+    if (!file_ctx || !file_ctx->stream || !line) {
+        if (file_ctx && file_ctx->debug_ctx) {
+            file_ctx->debug_ctx->had_error = true;
+        }
+        return;
+    }
+
+    if (fputs(line, file_ctx->stream) == EOF) {
+        if (file_ctx->debug_ctx) {
+            file_ctx->debug_ctx->had_error = true;
+        }
+        return;
+    }
+
+    size_t len = strlen(line);
+    if (len == 0 || line[len - 1U] != '\n') {
+        if (fputc('\n', file_ctx->stream) == EOF) {
+            if (file_ctx->debug_ctx) {
+                file_ctx->debug_ctx->had_error = true;
+            }
+            return;
+        }
+    }
+
+    if (file_ctx->debug_ctx && ferror(file_ctx->stream)) {
+        file_ctx->debug_ctx->had_error = true;
+    }
+}
 
 static void monotonic_now(struct timespec *ts) {
     if (!ts) {
@@ -1736,4 +1919,405 @@ void terminal_manager_get_stats(struct terminal_manager *mgr,
     mgr->stats.current_terminals = mgr->terminal_count;
     *out = mgr->stats;
     pthread_mutex_unlock(&mgr->lock);
+}
+
+static int td_debug_prepare_context(td_debug_dump_context_t **ctx_ptr,
+                                    td_debug_dump_context_t *local_ctx,
+                                    const td_debug_dump_opts_t *opts) {
+    if (!ctx_ptr) {
+        return -EINVAL;
+    }
+    if (*ctx_ptr) {
+        (*ctx_ptr)->opts = opts;
+        (*ctx_ptr)->had_error = false;
+        (*ctx_ptr)->lines_emitted = 0U;
+        return 0;
+    }
+    if (!local_ctx) {
+        return -EINVAL;
+    }
+    td_debug_context_reset(local_ctx, opts);
+    *ctx_ptr = local_ctx;
+    return 0;
+}
+
+int td_debug_dump_terminal_table(struct terminal_manager *mgr,
+                                 const td_debug_dump_opts_t *opts,
+                                 td_debug_writer_t writer,
+                                 void *writer_ctx,
+                                 td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, opts) != 0) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    struct timespec mono_now;
+    struct timespec wall_now;
+    clock_gettime(CLOCK_MONOTONIC, &mono_now);
+    clock_gettime(CLOCK_REALTIME, &wall_now);
+
+    int rc = 0;
+
+    for (size_t i = 0; i < TERMINAL_BUCKET_COUNT && rc == 0; ++i) {
+        struct terminal_entry *entry = mgr->table[i];
+        if (!entry) {
+            continue;
+        }
+
+        size_t bucket_total = 0;
+        size_t bucket_filtered = 0;
+        for (struct terminal_entry *iter = entry; iter; iter = iter->next) {
+            bucket_total += 1;
+            if (debug_entry_matches_opts(iter, opts)) {
+                bucket_filtered += 1;
+            }
+        }
+
+        size_t collisions = bucket_total > 0 ? bucket_total - 1U : 0U;
+
+        rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "bucket index=%zu total=%zu filtered=%zu collisions=%zu\n",
+                             i,
+                             bucket_total,
+                             bucket_filtered,
+                             collisions);
+        if (rc != 0) {
+            break;
+        }
+
+        if (bucket_filtered == 0) {
+            continue;
+        }
+
+        for (struct terminal_entry *iter = entry; iter && rc == 0; iter = iter->next) {
+            if (!debug_entry_matches_opts(iter, opts)) {
+                continue;
+            }
+
+            char mac_buf[18];
+            char ip_buf[INET_ADDRSTRLEN];
+            format_terminal_identity(&iter->key, mac_buf, ip_buf);
+
+            char tx_ip_buf[INET_ADDRSTRLEN];
+            if (iter->tx_source_ip.s_addr != 0) {
+                inet_ntop(AF_INET, &iter->tx_source_ip, tx_ip_buf, sizeof(tx_ip_buf));
+            } else {
+                snprintf(tx_ip_buf, sizeof(tx_ip_buf), "-");
+            }
+
+            char last_seen_buf[32];
+            char last_probe_buf[32];
+            debug_format_wall_clock(&wall_now, &mono_now, &iter->last_seen, last_seen_buf, sizeof(last_seen_buf));
+            debug_format_wall_clock(&wall_now, &mono_now, &iter->last_probe, last_probe_buf, sizeof(last_probe_buf));
+
+            uint64_t last_seen_age_ms = debug_timespec_diff_ms(&iter->last_seen, &mono_now);
+            uint64_t last_probe_age_ms = debug_timespec_diff_ms(&iter->last_probe, &mono_now);
+
+            if (!iter->last_probe.tv_sec) {
+                last_probe_age_ms = 0;
+                last_probe_buf[0] = '\0';
+            }
+
+            const char *tx_iface = iter->tx_iface[0] ? iter->tx_iface : "<unset>";
+
+            if (opts && opts->verbose_metrics) {
+                rc = debug_emit_line(writer,
+                                     writer_ctx,
+                                     ctx_in,
+                                     "  terminal mac=%s ip=%s state=%s vlan=%d ifindex=%u tx_iface=%s tx_kernel_ifindex=%d tx_src=%s last_seen=%s age_ms=%" PRIu64 " last_probe=%s probe_age_ms=%" PRIu64 " failed_probes=%u refresh_enqueued=%d verify_enqueued=%d mac_version=%" PRIu64 "\n",
+                                     mac_buf,
+                                     ip_buf,
+                                     state_to_string(iter->state),
+                                     iter->meta.vlan_id,
+                                     iter->meta.ifindex,
+                                     tx_iface,
+                                     iter->tx_kernel_ifindex,
+                                     tx_ip_buf,
+                                     last_seen_buf[0] ? last_seen_buf : "",
+                                     last_seen_age_ms,
+                                     last_probe_buf[0] ? last_probe_buf : "",
+                                     last_probe_age_ms,
+                                     iter->failed_probes,
+                                     iter->mac_refresh_enqueued ? 1 : 0,
+                                     iter->mac_verify_enqueued ? 1 : 0,
+                                     iter->meta.mac_view_version);
+            } else {
+                rc = debug_emit_line(writer,
+                                     writer_ctx,
+                                     ctx_in,
+                                     "  terminal mac=%s ip=%s state=%s vlan=%d ifindex=%u tx_iface=%s last_seen=%s age_ms=%" PRIu64 "\n",
+                                     mac_buf,
+                                     ip_buf,
+                                     state_to_string(iter->state),
+                                     iter->meta.vlan_id,
+                                     iter->meta.ifindex,
+                                     tx_iface,
+                                     last_seen_buf[0] ? last_seen_buf : "",
+                                     last_seen_age_ms);
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+
+    return rc;
+}
+
+int td_debug_dump_iface_prefix_table(struct terminal_manager *mgr,
+                                     td_debug_writer_t writer,
+                                     void *writer_ctx,
+                                     td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, ctx ? ctx->opts : NULL) != 0) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    int rc = 0;
+    for (struct iface_record *record = mgr->iface_records; record && rc == 0; record = record->next) {
+        size_t prefix_count = 0;
+        size_t binding_count = 0;
+        for (struct iface_prefix_entry *p = record->prefixes; p; p = p->next) {
+            prefix_count += 1;
+        }
+        for (struct iface_binding_entry *b = record->bindings; b; b = b->next) {
+            binding_count += 1;
+        }
+
+        char ifname[IFNAMSIZ];
+        if (!if_indextoname((unsigned int)record->kernel_ifindex, ifname)) {
+            snprintf(ifname, sizeof(ifname), "if%d", record->kernel_ifindex);
+        }
+
+        rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "iface kernel_ifindex=%d name=%s prefixes=%zu bindings=%zu\n",
+                             record->kernel_ifindex,
+                             ifname,
+                             prefix_count,
+                             binding_count);
+        if (rc != 0) {
+            break;
+        }
+
+        for (struct iface_prefix_entry *p = record->prefixes; p && rc == 0; p = p->next) {
+            char network_buf[INET_ADDRSTRLEN];
+            char address_buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &p->network, network_buf, sizeof(network_buf));
+            inet_ntop(AF_INET, &p->address, address_buf, sizeof(address_buf));
+            rc = debug_emit_line(writer,
+                                 writer_ctx,
+                                 ctx_in,
+                                 "  prefix %s/%u address=%s\n",
+                                 network_buf,
+                                 p->prefix_len,
+                                 address_buf);
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return rc;
+}
+
+int td_debug_dump_iface_binding_table(struct terminal_manager *mgr,
+                                      const td_debug_dump_opts_t *opts,
+                                      td_debug_writer_t writer,
+                                      void *writer_ctx,
+                                      td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, opts) != 0) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    int rc = 0;
+    for (struct iface_record *record = mgr->iface_records; record && rc == 0; record = record->next) {
+        if (opts && opts->filter_by_ifindex && (uint32_t)record->kernel_ifindex != opts->ifindex) {
+            continue;
+        }
+
+        size_t binding_count = 0;
+        bool has_invalid = false;
+        struct terminal_entry *first_terminal = NULL;
+        for (struct iface_binding_entry *b = record->bindings; b; b = b->next) {
+            binding_count += 1;
+            if (b->terminal->state == TERMINAL_STATE_IFACE_INVALID) {
+                has_invalid = true;
+            }
+            if (!first_terminal) {
+                first_terminal = b->terminal;
+            }
+        }
+
+        char first_mac[18];
+        char first_ip[INET_ADDRSTRLEN];
+        if (first_terminal) {
+            format_terminal_identity(&first_terminal->key, first_mac, first_ip);
+        } else {
+            snprintf(first_mac, sizeof(first_mac), "-");
+            snprintf(first_ip, sizeof(first_ip), "-");
+        }
+
+        char ifname[IFNAMSIZ];
+        if (!if_indextoname((unsigned int)record->kernel_ifindex, ifname)) {
+            snprintf(ifname, sizeof(ifname), "if%d", record->kernel_ifindex);
+        }
+
+        rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "binding kernel_ifindex=%d name=%s terminals=%zu first_mac=%s first_ip=%s has_iface_invalid=%d\n",
+                             record->kernel_ifindex,
+                             ifname,
+                             binding_count,
+                             first_mac,
+                             first_ip,
+                             has_invalid ? 1 : 0);
+        if (rc != 0) {
+            break;
+        }
+
+        if (!opts || !opts->expand_terminals) {
+            continue;
+        }
+
+        for (struct iface_binding_entry *b = record->bindings; b && rc == 0; b = b->next) {
+            struct terminal_entry *terminal = b->terminal;
+            if (!debug_entry_matches_opts(terminal, opts)) {
+                continue;
+            }
+            char mac_buf[18];
+            char ip_buf[INET_ADDRSTRLEN];
+            format_terminal_identity(&terminal->key, mac_buf, ip_buf);
+            size_t bucket = hash_key(&terminal->key) % TERMINAL_BUCKET_COUNT;
+            rc = debug_emit_line(writer,
+                                 writer_ctx,
+                                 ctx_in,
+                                 "  terminal mac=%s ip=%s state=%s vlan=%d bucket=%zu\n",
+                                 mac_buf,
+                                 ip_buf,
+                                 state_to_string(terminal->state),
+                                 terminal->meta.vlan_id,
+                                 bucket);
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return rc;
+}
+
+int td_debug_dump_mac_lookup_queue(struct terminal_manager *mgr,
+                                   td_debug_writer_t writer,
+                                   void *writer_ctx,
+                                   td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, ctx ? ctx->opts : NULL) != 0) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    size_t refresh_len = mac_lookup_queue_length(mgr->mac_need_refresh_head);
+    size_t verify_len = mac_lookup_queue_length(mgr->mac_pending_verify_head);
+
+    int rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "mac_lookup refresh_queue=%zu verify_queue=%zu\n",
+                             refresh_len,
+                             verify_len);
+
+    size_t index = 0;
+    for (struct mac_lookup_task *task = mgr->mac_need_refresh_head; task && rc == 0; task = task->next) {
+        char mac_buf[18];
+        char ip_buf[INET_ADDRSTRLEN];
+        format_terminal_identity(&task->key, mac_buf, ip_buf);
+        rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "  refresh idx=%zu mac=%s ip=%s vlan=%d created_at=NA retry=NA\n",
+                             index,
+                             mac_buf,
+                             ip_buf,
+                             task->vlan_id);
+        index += 1;
+    }
+
+    index = 0;
+    for (struct mac_lookup_task *task = mgr->mac_pending_verify_head; task && rc == 0; task = task->next) {
+        char mac_buf[18];
+        char ip_buf[INET_ADDRSTRLEN];
+        format_terminal_identity(&task->key, mac_buf, ip_buf);
+        rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "  verify idx=%zu mac=%s ip=%s vlan=%d created_at=NA retry=NA\n",
+                             index,
+                             mac_buf,
+                             ip_buf,
+                             task->vlan_id);
+        index += 1;
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return rc;
+}
+
+int td_debug_dump_mac_locator_state(struct terminal_manager *mgr,
+                                    td_debug_writer_t writer,
+                                    void *writer_ctx,
+                                    td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, ctx ? ctx->opts : NULL) != 0) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    size_t refresh_len = mac_lookup_queue_length(mgr->mac_need_refresh_head);
+    size_t verify_len = mac_lookup_queue_length(mgr->mac_pending_verify_head);
+
+    int rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "mac_locator version=%" PRIu64 " subscribed=%d pending_refresh=%zu pending_verify=%zu\n",
+                             mgr->mac_locator_version,
+                             mgr->mac_locator_subscribed ? 1 : 0,
+                             refresh_len,
+                             verify_len);
+
+    pthread_mutex_unlock(&mgr->lock);
+    return rc;
 }

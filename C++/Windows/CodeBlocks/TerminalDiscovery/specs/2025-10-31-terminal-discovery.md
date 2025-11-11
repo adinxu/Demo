@@ -37,6 +37,7 @@
    - 不在初始化函数内注册信号处理、命令行参数或帮助信息解析，也不默认开启周期性日志输出，由外部守护进程统一调度。
    - 初始化完成后默认将事件管线绑定至内置日志回调，保证在未注册北向回调时也能通过日志观察终端变化；外部若需启用增量上报，可调用 `setIncrementReport` 注册唯一的 C++ 回调，内部再由桥接层负责触发 `terminal_manager_set_event_sink` 完成切换。
    - 初始化成功后需提供只读访问接口直接返回内部 `terminal_manager` 句柄，供嵌入方调用 `terminal_manager_get_stats` 等观测函数；同时额外提供访问接口返回 `app_context` 只读引用，作为后续扩展挂载点。两类接口均禁止外部替换或销毁内部资源。
+10. **调试可视化**：向外暴露一组只读调试函数，用于打印或导出核心数据结构快照（终端哈希桶、接口前缀表、接口绑定表、MAC 查表任务队列、`mac_need_refresh_`/`mac_pending_verify_*` 计数器以及 `mac_locator_version`），支持在不修改运行态状态机的前提下进行调试排障与结果验收。
 
 - **性能**：
    - 1k 终端负载时单核占用 <10%，并确保在现有硬件 ARP 限速机制基础上仍不丢包。
@@ -47,6 +48,28 @@
 - **可观测性**：输出结构化日志（级别-标签-消息），提供探测、响应、过期、队列丢弃、接口波动等计数器。所有保活定时、超时检查必须统一基于单调时钟，确保系统时间回拨或跳变不会影响状态推进。
       - 默认日志落地应包含标准可读的系统时间戳（wall clock，精确到秒），格式建议为 `YYYY-MM-DD HH:MM:SS`，以便与外部日志对齐；时间戳获取不需要依赖单调时钟，允许受 NTP 校时影响。
 - **可测试性**：提供平台无关的状态机单测，以及基于适配器 mock 的发现/保活/事件上报集成测试。
+
+## 调试与验证接口扩展
+- **输出形态**：新增 `td_debug_writer_t`（`void (*td_debug_writer_t)(void *ctx, const char *line)`）回调类型，并在 C 北向 API 层公开 `td_debug_dump_*` 系列函数；默认提供写入 `FILE*` 的适配器，便于快速将结果重定向至日志或标准输出。
+- **终端哈希快照**：`int td_debug_dump_terminal_table(const td_debug_dump_opts_t *opts, td_debug_writer_t writer, void *ctx);`
+   - 在持有 `terminal_manager->lock` 的读区间内遍历 256 个哈希桶，输出桶索引、元素数量、最大链深、冲突次数。
+   - 每个终端条目打印 MAC、IP、状态、所属 VLAN/ifindex、最近一次收包与探测时间（UTC 秒）、探测失败计数、事件队列挂起标记、绑定前缀 ID。
+   - `opts` 支持按状态、VLAN、ifindex、MAC 前缀过滤，并可开启 `verbose_metrics` 选项附带探测计数与事件统计。
+- **接口前缀表快照**：`int td_debug_dump_iface_prefix_table(td_debug_writer_t writer, void *ctx);`
+   - 输出每个 `iface_prefix_entry` 的 ifindex、IPv4 前缀（CIDR 记法）、掩码长度、引用计数、最近一次写操作时间戳。
+   - 若同一接口存在多个前缀，保持插入顺序并标注主前缀。
+- **接口绑定索引快照**：`int td_debug_dump_iface_binding_table(td_debug_writer_t writer, void *ctx);`
+   - 对 `iface_binding_entry` 打印 ifindex、关联终端数量、链表中首个终端的 MAC、是否包含 `IFACE_INVALID` 条目。
+   - 提供 `expand_terminals` 可选参数，用于展开完整终端列表并指明其所属哈希桶编号。
+- **MAC 查表任务队列**：`int td_debug_dump_mac_lookup_queue(td_debug_writer_t writer, void *ctx);`
+   - 输出当前待执行/执行中的 MAC 查表任务，包括 MAC、目标 VLAN/ifindex、创建时间、重试计数、状态标记。
+   - 同时打印 `mac_need_refresh_` 队列长度、`mac_pending_verify_success`/`mac_pending_verify_failure`/`mac_pending_verify_retry` 等计数器、最长排队时长。
+- **MAC 定位版本号**：`int td_debug_dump_mac_locator_state(td_debug_writer_t writer, void *ctx);`
+   - 输出 `mac_locator_version` 当前值、最近一次递增的触发原因（新增终端、查表成功、验证失败等）、关联终端数量。
+   - 若无待处理任务仍需输出 baseline，便于比对上下游版本。
+- **线程安全**：所有 `td_debug_dump_*` 函数仅在内部短时间持有读锁或复用管理器互斥，严禁在锁持有期间执行阻塞 IO；若调用方 `writer` 报错（通过上下文标记或 errno），需立即释放锁并返回负值。
+- **跨语言桥接**：C++ 北向层提供轻量包装，可将调试输出收集为 `std::string` 或写入 `std::ostream`，同时暴露 `TerminalDebugSnapshot` 帮助上层工具复用；保证新增 API 通过 `extern "C"` 导出并保持稳定 ABI。
+- **文档示例**：在 `doc/` 目录补充调试接口指南，给出典型调用示例、样例输出格式与排障建议；测试中覆盖最小/过滤/错误路径。
 
 ## 架构概览
 - **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
@@ -136,6 +159,7 @@
 - `iface_address_table`：哈希表 `ifindex -> prefix_list`，每个元素包含 IPv4 网络地址与掩码长度；所有修改在 `terminal_manager.lock` 下完成。
 - `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，用于在接口前缀变更时快速定位受影响终端。
 - 支持单链表遍历与时间轮/堆双实现，依据目标平台性能选择。
+- `td_debug_dump_context_t`：封装调试导出会话上下文（过滤条件、时间戳缓存、累计输出行数等），供各 `td_debug_dump_*` 函数复用，确保输出格式与生命周期一致。
 
 ## 任务拆解
 0. **Realtek Demo 验证**
@@ -164,6 +188,10 @@
    - 搭建性能基准，使用合成事件验证 1000 终端的时间行为。
 8. **文档**
    - 输出开发者指南，涵盖适配器契约、构建说明与测试执行方式。
+9. **调试接口实现**
+   - 实现 `td_debug_writer_t` 与默认 `FILE*` 包装函数。
+   - 编写 `td_debug_dump_terminal_table`、`td_debug_dump_iface_prefix_table`、`td_debug_dump_iface_binding_table`、`td_debug_dump_mac_lookup_queue`、`td_debug_dump_mac_locator_state` 及其过滤器逻辑，确保在 `terminal_manager` 锁保护下输出一致快照。
+   - 在单测与集成测试中覆盖正常路径、过滤参数、错误回调路径；补充 `doc/` 调试指南示例代码。
 
 ## 验收准则
 - 发现状态机与定时驱动逻辑的单测全部通过，并覆盖 `ACTIVE ↔ PROBING ↔ IFACE_INVALID`、终端保留 30 分钟、接口恢复场景。
@@ -173,6 +201,7 @@
 - 提供 Realtek 平台 300 终端 Demo 验证报告，包含测试步骤、网络测试仪配置、日志与瓶颈分析结论。
 - 日志为结构化格式，计数器可通过调试接口或日志输出查看。
 - 在 C/C++ 混合编译环境下完成 `getAllTerminalInfo` 与 `setIncrementReport` 接口的联调验收，验证全量查询完整性、增量回调实时性与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`ifindex` 字段。
+- 调试导出函数在运行态可输出终端哈希桶、接口前缀表、接口绑定索引、MAC 查表队列、`mac_need_refresh_`/`mac_pending_verify_*` 计数及 `mac_locator_version` 的一致快照；单测覆盖过滤与错误路径，文档示例与实际输出一致。
 
 ## 替代方案评估
 - 为每个终端创建线程执行保活（因扩展性差而否决）。

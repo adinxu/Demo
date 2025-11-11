@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <time.h>
 
 #include "adapter_api.h"
@@ -91,6 +92,55 @@ struct terminal_manager_stats {
     uint64_t current_terminals;
 };
 
+typedef void (*td_debug_writer_t)(void *ctx, const char *line);
+
+typedef struct td_debug_dump_opts {
+    bool filter_by_state;
+    terminal_state_t state;
+    bool filter_by_vlan;
+    int vlan_id;
+    bool filter_by_ifindex;
+    uint32_t ifindex;
+    bool filter_by_mac_prefix;
+    uint8_t mac_prefix[ETH_ALEN];
+    size_t mac_prefix_len;
+    bool verbose_metrics;
+    bool expand_terminals;
+} td_debug_dump_opts_t;
+
+typedef struct td_debug_dump_context {
+    const td_debug_dump_opts_t *opts;
+    size_t lines_emitted;
+    bool had_error;
+} td_debug_dump_context_t;
+
+static inline void td_debug_context_reset(td_debug_dump_context_t *ctx,
+                                          const td_debug_dump_opts_t *opts) {
+    if (!ctx) {
+        return;
+    }
+    ctx->opts = opts;
+    ctx->lines_emitted = 0U;
+    ctx->had_error = false;
+}
+
+struct td_debug_file_writer_ctx {
+    FILE *stream;
+    td_debug_dump_context_t *debug_ctx;
+};
+
+static inline void td_debug_file_writer_ctx_init(struct td_debug_file_writer_ctx *ctx,
+                                                 FILE *stream,
+                                                 td_debug_dump_context_t *debug_ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->stream = stream;
+    ctx->debug_ctx = debug_ctx;
+}
+
+void td_debug_writer_file(void *ctx, const char *line);
+
 struct terminal_manager;
 
 typedef struct terminal_address_update {
@@ -139,6 +189,33 @@ struct terminal_manager *terminal_manager_get_active(void);
 
 void terminal_manager_get_stats(struct terminal_manager *mgr,
                                 struct terminal_manager_stats *out);
+
+int td_debug_dump_terminal_table(struct terminal_manager *mgr,
+                                 const td_debug_dump_opts_t *opts,
+                                 td_debug_writer_t writer,
+                                 void *writer_ctx,
+                                 td_debug_dump_context_t *ctx);
+
+int td_debug_dump_iface_prefix_table(struct terminal_manager *mgr,
+                                     td_debug_writer_t writer,
+                                     void *writer_ctx,
+                                     td_debug_dump_context_t *ctx);
+
+int td_debug_dump_iface_binding_table(struct terminal_manager *mgr,
+                                      const td_debug_dump_opts_t *opts,
+                                      td_debug_writer_t writer,
+                                      void *writer_ctx,
+                                      td_debug_dump_context_t *ctx);
+
+int td_debug_dump_mac_lookup_queue(struct terminal_manager *mgr,
+                                   td_debug_writer_t writer,
+                                   void *writer_ctx,
+                                   td_debug_dump_context_t *ctx);
+
+int td_debug_dump_mac_locator_state(struct terminal_manager *mgr,
+                                    td_debug_writer_t writer,
+                                    void *writer_ctx,
+                                    td_debug_dump_context_t *ctx);
 
 #ifdef __cplusplus
 }

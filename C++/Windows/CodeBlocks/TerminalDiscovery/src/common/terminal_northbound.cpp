@@ -183,6 +183,39 @@ void default_event_logger(const terminal_event_record_t *records, size_t count, 
     }
 }
 
+struct StringWriterCtx {
+    std::string *buffer;
+    td_debug_dump_context_t *ctx;
+};
+
+void string_writer_adapter(void *ptr, const char *line) {
+    if (!ptr || !line) {
+        if (ptr) {
+            auto *state = static_cast<StringWriterCtx *>(ptr);
+            if (state->ctx) {
+                state->ctx->had_error = true;
+            }
+        }
+        return;
+    }
+
+    auto *state = static_cast<StringWriterCtx *>(ptr);
+    if (!state->buffer) {
+        if (state->ctx) {
+            state->ctx->had_error = true;
+        }
+        return;
+    }
+
+    try {
+        state->buffer->append(line);
+    } catch (...) {
+        if (state->ctx) {
+            state->ctx->had_error = true;
+        }
+    }
+}
+
 } // namespace
 
 extern "C" int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo) {
@@ -273,4 +306,114 @@ extern "C" int setIncrementReport(IncReportCb cb) {
     }
 
     return 0;
+}
+
+TerminalDebugSnapshot::TerminalDebugSnapshot(struct terminal_manager *manager) noexcept
+    : manager_(manager) {}
+
+bool TerminalDebugSnapshot::valid() const noexcept {
+    return manager_ != nullptr;
+}
+
+std::string TerminalDebugSnapshot::dumpTerminalTable(const TdDebugDumpOptions &options) const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_opts_t c_opts = options.to_c();
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, &c_opts);
+
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_terminal_table(manager_, &c_opts, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_terminal_table failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
+}
+
+std::string TerminalDebugSnapshot::dumpIfacePrefixTable() const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, nullptr);
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_iface_prefix_table(manager_, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_iface_prefix_table failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
+}
+
+std::string TerminalDebugSnapshot::dumpIfaceBindingTable(const TdDebugDumpOptions &options) const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_opts_t c_opts = options.to_c();
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, &c_opts);
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_iface_binding_table(manager_, &c_opts, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_iface_binding_table failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
+}
+
+std::string TerminalDebugSnapshot::dumpMacLookupQueues() const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, nullptr);
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_mac_lookup_queue(manager_, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_mac_lookup_queue failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
+}
+
+std::string TerminalDebugSnapshot::dumpMacLocatorState() const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, nullptr);
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_mac_locator_state(manager_, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_mac_locator_state failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
 }
