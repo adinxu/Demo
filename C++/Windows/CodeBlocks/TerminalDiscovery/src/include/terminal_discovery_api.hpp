@@ -41,13 +41,14 @@ struct TdDebugDumpOptions {
     bool filterByIfindex = false;
     std::uint32_t ifindex = 0;
     bool filterByMacPrefix = false;
-    std::array<std::uint8_t, ETH_ALEN> macPrefix{};
+    std::array<std::uint8_t, ETH_ALEN> macPrefix{{0}};
     std::size_t macPrefixLen = 0;
     bool verboseMetrics = false;
     bool expandTerminals = false;
 
     td_debug_dump_opts_t to_c() const {
-        td_debug_dump_opts_t opts{};
+    td_debug_dump_opts_t opts;
+    std::memset(&opts, 0, sizeof(opts));
         opts.filter_by_state = filterByState;
         opts.state = state;
         opts.filter_by_vlan = filterByVlan;
