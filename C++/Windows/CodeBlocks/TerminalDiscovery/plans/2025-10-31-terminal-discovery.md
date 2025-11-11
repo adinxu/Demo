@@ -99,13 +99,13 @@
    - 300 终端 Realtek Demo 回归；1k 终端压力测试记录 CPU/内存/丢包。
 6. ⏳ 验收输出：整理测试报告、回滚策略、性能曲线。
 
-### 阶段 6：守护进程初始化入口（待启动）
-1. 重构初始化契约：嵌入入口仅接收运行时配置结构体，定义返回码语义与配置覆写规则；移除外部事件回调参数，默认绑定内置日志回调以保证最小可观测性。
-2. 在 `src/main/terminal_main.c` 提取共享启动 helper，负责配置合并、`td_config_to_manager_config` 转换、`terminal_manager` 创建、Netlink 启动与适配器订阅/启动，CLI 与嵌入路径共用该流程。
-3. 暴露只读 accessor（`terminal_discovery_get_manager`/`terminal_discovery_get_app_context`）供嵌入方观测，同时确保 `setIncrementReport` 成为唯一增量上报入口；桥接层新增 `terminal_northbound_attach_default_sink` 负责默认日志模式，后续通过 `terminal_manager_set_event_sink` 切换至业务回调。
-4. 构建测试用例：基于现有 mock 覆盖默认日志模式、调用 `setIncrementReport` 后的事件切换、重复注册保护、适配器/Netlink 失败回滚与 accessor 可见性，确保无回调路径依旧安全。
-5. 更新文档：在 `doc/` 与 README 补充初始化流程、默认日志说明、使用 `setIncrementReport` 启用/停用上报及 C++ 日志回调示例，并保持与规范一致。
-6. 确认现有 `make test` 及新增测试全部通过，完成代码与文档交付。
+### 阶段 6：守护进程初始化入口（已完成）
+1. ✅ 重构初始化契约：`terminal_discovery_initialize` 仅接收运行时配置覆写，内置默认日志回调并在重复调用时返回 `-EALREADY`，与规范保持一致。
+2. ✅ 在 `src/main/terminal_main.c` 提取 `terminal_discovery_bootstrap` helper，共享 CLI 与嵌入启动流程，包括配置合并、管理器创建、Netlink 启动与适配器订阅。
+3. ✅ 暴露只读 accessor `terminal_discovery_get_manager`/`terminal_discovery_get_app_context`，并在 `terminal_discovery_api.hpp` 汇总北向 API，`terminal_northbound_attach_default_sink` 作为默认日志 sink 的唯一声明。
+4. ✅ 扩充 `tests/terminal_embedded_init_tests.c` 覆盖成功路径、重复初始化保护、事件 sink 切换与回滚流程，`make test` 已纳入执行。
+5. ✅ 更新 `doc/design/stage6_embedded_init.md` 与 `doc/design/src_overview.md`，描述嵌入式初始化、默认日志模式与回滚策略；README 无需新增条目。
+6. ✅ `make test`（包含嵌入初始化用例）和现有集成测试全部通过，确保代码与文档交付一致。
 
 ## 依赖与风险
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。
@@ -123,5 +123,5 @@
 - 由于平台差异，所有实机验证步骤需在 MIPS 目标环境手动执行，并记录操作过程与结果。
 
 ## 审批与下一步
-- 当前状态：阶段 4 配置、日志与文档已交付（截至 2025-11-04），相关成果见 `doc/design/stage4_observability.md` 及更新后的配置/文档模块。
-- 下一步：阶段 5 单测已启动，继续推进集成测试、北向验证以及实机/压力回归，并准备验收报告与回滚策略。
+- 当前状态：阶段 4 配置/日志文档与阶段 6 守护进程嵌入入口均已完成并交付，最新实现见 `doc/design/stage4_observability.md`、`doc/design/stage6_embedded_init.md` 及相关源码。
+- 下一步：阶段 5 仍在推进，需继续扩展集成测试、开展 Realtek 实机/压力验证，并整理验收报告与回滚策略。
