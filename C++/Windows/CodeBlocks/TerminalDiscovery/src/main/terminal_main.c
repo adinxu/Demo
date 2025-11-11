@@ -122,6 +122,8 @@ static bool parse_unsigned_value(const char *value, unsigned long long max, unsi
     return true;
 }
 
+static void log_manager_stats(struct terminal_manager *manager);
+
 static void handle_command(const char *command,
                            struct app_context *ctx,
                            struct td_runtime_config *runtime_cfg) {
