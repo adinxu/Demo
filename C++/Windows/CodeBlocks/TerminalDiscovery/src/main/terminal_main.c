@@ -236,7 +236,7 @@ static int terminal_discovery_bootstrap(const struct td_runtime_config *runtime_
                                         terminal_event_callback_fn event_cb,
                                         void *event_ctx,
                                         struct app_context *ctx) {
-    if (!runtime_cfg || !event_cb || !ctx) {
+    if (!runtime_cfg || !ctx) {
         return -EINVAL;
     }
 
@@ -297,7 +297,9 @@ static int terminal_discovery_bootstrap(const struct td_runtime_config *runtime_
     }
     ctx->netlink_listener = netlink_listener;
 
-    if (terminal_manager_set_event_sink(manager, event_cb, event_ctx) != 0) {
+    terminal_event_callback_fn effective_cb = event_cb ? event_cb : terminal_event_logger;
+
+    if (terminal_manager_set_event_sink(manager, effective_cb, event_ctx) != 0) {
         td_log_writef(TD_LOG_ERROR, "terminal_daemon", "failed to set event sink");
         terminal_discovery_cleanup(ctx);
         return -1;
@@ -491,7 +493,7 @@ int main(int argc, char **argv) {
     signal(SIGUSR1, handle_stats_signal);
 
     struct app_context ctx;
-    int bootstrap_rc = terminal_discovery_bootstrap(&runtime_cfg, terminal_event_logger, &ctx, &ctx);
+    int bootstrap_rc = terminal_discovery_bootstrap(&runtime_cfg, NULL, NULL, &ctx);
     if (bootstrap_rc != 0) {
         return EXIT_FAILURE;
     }
@@ -547,7 +549,7 @@ const struct app_context *terminal_discovery_get_app_context(void) {
 }
 
 int terminal_discovery_initialize(const struct terminal_discovery_init_params *params) {
-    if (!params || !params->event_callback) {
+    if (!params) {
         return -EINVAL;
     }
 
@@ -578,9 +580,12 @@ int terminal_discovery_initialize(const struct terminal_discovery_init_params *p
                   runtime_cfg.max_terminals,
                   runtime_cfg.stats_log_interval_sec);
 
+    terminal_event_callback_fn effective_callback = params->event_callback ? params->event_callback : terminal_event_logger;
+    void *effective_ctx = params->event_callback_ctx;
+
     int rc = terminal_discovery_bootstrap(&runtime_cfg,
-                                          params->event_callback,
-                                          params->event_callback_ctx,
+                                          effective_callback,
+                                          effective_ctx,
                                           &g_embedded_ctx);
     if (rc != 0) {
         terminal_discovery_cleanup(&g_embedded_ctx);

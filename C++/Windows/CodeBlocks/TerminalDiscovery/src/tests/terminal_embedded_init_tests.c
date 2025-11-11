@@ -46,6 +46,8 @@ struct stub_state {
     struct terminal_manager_config manager_cfg;
     terminal_event_callback_fn registered_callback;
     void *registered_ctx;
+    terminal_event_callback_fn last_nonnull_callback;
+    void *last_nonnull_ctx;
     struct td_adapter_packet_subscription last_subscription;
 };
 
@@ -161,6 +163,10 @@ int terminal_manager_set_event_sink(struct terminal_manager *mgr,
                                     void *callback_ctx) {
     (void)mgr;
     g_stub.set_sink_calls += 1;
+    if (callback) {
+        g_stub.last_nonnull_callback = callback;
+        g_stub.last_nonnull_ctx = callback_ctx;
+    }
     g_stub.registered_callback = callback;
     g_stub.registered_ctx = callback_ctx;
     if (g_stub.set_event_sink_result != 0) {
@@ -209,6 +215,8 @@ static void stub_reset(void) {
     g_stub.set_event_sink_result = 0;
     g_stub.fail_manager_create = false;
     memset(&g_stub.last_subscription, 0, sizeof(g_stub.last_subscription));
+    g_stub.last_nonnull_callback = NULL;
+    g_stub.last_nonnull_ctx = NULL;
     td_log_set_level(TD_LOG_NONE);
 }
 
@@ -233,25 +241,46 @@ static bool test_accessors_before_init(void) {
     return true;
 }
 
-static bool test_initialize_requires_callback(void) {
+static bool test_initialize_defaults_to_logger_when_callback_missing(void) {
     stub_reset();
+    g_stub.register_result = TD_ADAPTER_ERR_SYS;
 
     struct terminal_discovery_init_params params;
     memset(&params, 0, sizeof(params));
-    params.runtime_config = NULL;
     params.event_callback = NULL;
+    params.event_callback_ctx = &params; /* arbitrary sentinel */
 
     int rc = terminal_discovery_initialize(&params);
-    if (rc != -EINVAL) {
-        fprintf(stderr, "expected -EINVAL, got %d\n", rc);
+    if (rc != g_stub.register_result) {
+        fprintf(stderr, "expected %d, got %d\n", g_stub.register_result, rc);
         return false;
     }
-    if (g_stub.init_calls != 0U) {
-        fprintf(stderr, "expected init not called, got %u\n", g_stub.init_calls);
+    if (g_stub.init_calls != 1U) {
+        fprintf(stderr, "expected adapter init once, got %u\n", g_stub.init_calls);
+        return false;
+    }
+    if (g_stub.last_nonnull_callback == NULL) {
+        fprintf(stderr, "expected fallback callback to be registered\n");
+        return false;
+    }
+    if (g_stub.last_nonnull_callback == dummy_event_sink) {
+        fprintf(stderr, "fallback callback should differ from user sink\n");
+        return false;
+    }
+    if (g_stub.last_nonnull_ctx != params.event_callback_ctx) {
+        fprintf(stderr, "fallback should forward event ctx\n");
+        return false;
+    }
+    if (g_stub.set_sink_calls != 2U) {
+        fprintf(stderr, "expected sink set and reset once each, got %u\n", g_stub.set_sink_calls);
+        return false;
+    }
+    if (g_stub.register_calls != 1U) {
+        fprintf(stderr, "expected packet registration once, got %u\n", g_stub.register_calls);
         return false;
     }
     if (terminal_discovery_get_manager() != NULL || terminal_discovery_get_app_context() != NULL) {
-        fprintf(stderr, "accessors should remain NULL after parameter validation failure\n");
+        fprintf(stderr, "accessors should remain NULL after fallback initialization failure\n");
         return false;
     }
     return true;
@@ -515,7 +544,7 @@ int main(void) {
         bool (*fn)(void);
     } tests[] = {
         {"accessors_before_init", test_accessors_before_init},
-        {"requires_callback", test_initialize_requires_callback},
+        {"defaults_to_logger_when_callback_missing", test_initialize_defaults_to_logger_when_callback_missing},
         {"adapter_init_failure", test_initialize_adapter_init_failure},
         {"netlink_failure_cleanup", test_initialize_netlink_failure_triggers_cleanup},
         {"manager_create_failure", test_initialize_manager_create_failure},

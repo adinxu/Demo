@@ -12,7 +12,7 @@ struct app_context;
 
 struct terminal_discovery_init_params {
     const struct td_runtime_config *runtime_config; /* optional overrides; NULL to use defaults */
-    terminal_event_callback_fn event_callback;      /* required */
+    terminal_event_callback_fn event_callback;      /* optional; falls back to terminal_event_logger */
     void *event_callback_ctx;                       /* user context passed to callback */
 };
 

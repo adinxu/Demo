@@ -16,7 +16,7 @@
 | 字段 | 说明 |
 | ---- | ---- |
 | `runtime_config` | （可选）指向 `td_runtime_config` 的完整覆写。若为 `NULL`，函数自动加载默认值。调用方可先调用 `td_config_load_defaults`，再按需修改字段。结构体将按值拷贝，后续对原始内存的修改不会影响运行实例。 |
-| `event_callback` | （必填）增量事件回调，等效 `terminal_manager_set_event_sink` 所需的指针。缺失时返回 `-EINVAL` 并拒绝启动。 |
+| `event_callback` | （可选）增量事件回调，等效 `terminal_manager_set_event_sink` 所需的指针。若缺省则自动注册内置 `terminal_event_logger`，即使不上报也能在日志中观察事件走势。 |
 | `event_callback_ctx` | （可选）回调透传上下文，初始化期间会一同注册，清理时复位为 `NULL`。 |
 
 ### 初始化流程摘要
@@ -34,7 +34,7 @@
 
 | 返回值 | 场景 |
 | ------ | ---- |
-| `-EINVAL` | `params == NULL` 或缺少 `event_callback`。 |
+| `-EINVAL` | `params == NULL`。 |
 | `-EALREADY` | 进程内已成功调用一次初始化，拒绝重复启动。 |
 | `-EIO` | 默认配置加载失败（极少发生）。 |
 | `-ENOENT` | 指定的适配器不存在（由 `td_adapter_registry_find` 返回）。 |
@@ -64,6 +64,7 @@
    };
    int rc = terminal_discovery_initialize(&params);
    ```
+  若宿主暂不消费增量通知，可将 `event_callback` 留空，模块会自动注册 `terminal_event_logger` 在 INFO 级别输出事件日志，便于调试。
 2. 由于配置按值拷贝，初始化返回后无需保持 `cfg` 生命周期；仍可记录副本供调试。
 3. 若需要手动触发统计输出，可调用 `terminal_discovery_get_manager()` 获取管理器句柄，再结合 `terminal_manager_get_stats` 输出统计；亦可缓存 `terminal_discovery_get_app_context()` 结果以备扩展使用（返回指针仅供只读查询）。
 4. 当前版本默认与进程同生共死，未提供显式停止 API；宿主退出即可释放所有资源。
