@@ -78,7 +78,7 @@
 | 用例ID | 目标 | 前置条件 | 步骤 | 预期结果 |
 | --- | --- | --- | --- | --- |
 | H01 | SIGUSR1 即时统计 | 管理器正常运行 | 向宿主发送 `SIGUSR1` | 日志打印 `terminal_stats`，字段与 `terminal_manager_get_stats` 一致 |
-| H02 | 交互式监控 | 输入 `stats` | 长时间运行 | 按需在命令行打印统计信息，`dump *` 命令输出具体表项 |
+| H02 | 交互式监控 | 输入 `stats`、`show config`、`set keepalive 300` 等 | 长时间运行 | 按需在命令行打印统计/配置，`dump *` 命令输出具体表项，`set` 命令可调整运行时参数 |
 | H03 | 日志级别调整 | 调整 `runtime_cfg.log_level=TD_LOG_DEBUG` | 重新初始化 | DEBUG 日志包含配置合并、netlink 启动等细节 |
 
 ### I. 失败注入与恢复

@@ -84,6 +84,251 @@ static const char *state_to_string(terminal_state_t state) {
     }
 }
 
+static void print_prompt(void) {
+    fprintf(stdout, "td> ");
+    fflush(stdout);
+}
+
+static void show_runtime_config(const struct td_runtime_config *cfg) {
+    if (!cfg) {
+        return;
+    }
+
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_daemon",
+                  "config adapter=%s rx=%s tx=%s tx_interval_ms=%u keepalive=%us miss=%u holdoff=%us max=%u log_level=%d",
+                  cfg->adapter_name,
+                  cfg->rx_iface,
+                  cfg->tx_iface,
+                  cfg->tx_interval_ms,
+                  cfg->keepalive_interval_sec,
+                  cfg->keepalive_miss_threshold,
+                  cfg->iface_invalid_holdoff_sec,
+                  cfg->max_terminals,
+                  (int)cfg->log_level);
+}
+
+static bool parse_unsigned_value(const char *value, unsigned long long max, unsigned long long *out) {
+    if (!value || !out) {
+        return false;
+    }
+    errno = 0;
+    char *endptr = NULL;
+    unsigned long long parsed = strtoull(value, &endptr, 10);
+    if (errno != 0 || !endptr || *endptr != '\0' || parsed > max) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+static void handle_command(const char *command,
+                           struct app_context *ctx,
+                           struct td_runtime_config *runtime_cfg) {
+    if (!command || !ctx) {
+        return;
+    }
+
+    if (strcmp(command, "stats") == 0) {
+        log_manager_stats(ctx->manager);
+        return;
+    }
+
+    if (strcmp(command, "dump terminal") == 0) {
+        if (ctx->manager) {
+            td_debug_dump_context_t dump_ctx;
+            td_debug_context_reset(&dump_ctx, NULL);
+            td_debug_dump_terminal_table(ctx->manager,
+                                         NULL,
+                                         td_debug_writer_file,
+                                         stdout,
+                                         &dump_ctx);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (strcmp(command, "dump prefix") == 0) {
+        if (ctx->manager) {
+            td_debug_dump_context_t dump_ctx;
+            td_debug_context_reset(&dump_ctx, NULL);
+            td_debug_dump_iface_prefix_table(ctx->manager,
+                                             td_debug_writer_file,
+                                             stdout,
+                                             &dump_ctx);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (strcmp(command, "dump binding") == 0) {
+        if (ctx->manager) {
+            td_debug_dump_context_t dump_ctx;
+            td_debug_context_reset(&dump_ctx, NULL);
+            td_debug_dump_iface_binding_table(ctx->manager,
+                                             NULL,
+                                             td_debug_writer_file,
+                                             stdout,
+                                             &dump_ctx);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (strcmp(command, "dump mac queue") == 0) {
+        if (ctx->manager) {
+            td_debug_dump_context_t dump_ctx;
+            td_debug_context_reset(&dump_ctx, NULL);
+            td_debug_dump_mac_lookup_queue(ctx->manager,
+                                           td_debug_writer_file,
+                                           stdout,
+                                           &dump_ctx);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (strcmp(command, "dump mac state") == 0) {
+        if (ctx->manager) {
+            td_debug_dump_context_t dump_ctx;
+            td_debug_context_reset(&dump_ctx, NULL);
+            td_debug_dump_mac_locator_state(ctx->manager,
+                                            td_debug_writer_file,
+                                            stdout,
+                                            &dump_ctx);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (strcmp(command, "show config") == 0) {
+        show_runtime_config(runtime_cfg);
+        return;
+    }
+
+    if (strcmp(command, "help") == 0) {
+        td_log_writef(TD_LOG_INFO,
+                      "terminal_daemon",
+                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | show config | set <option> <value> | help");
+        return;
+    }
+
+    if (strncmp(command, "set ", 4) == 0) {
+        char workbuf[64];
+        snprintf(workbuf, sizeof(workbuf), "%s", command);
+
+        char *saveptr = NULL;
+        char *token = strtok_r(workbuf, " ", &saveptr); /* set */
+        (void)token;
+        char *key = strtok_r(NULL, " ", &saveptr);
+        char *value = strtok_r(NULL, " ", &saveptr);
+
+        if (!key || !value) {
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_daemon",
+                          "usage: set <keepalive|miss|holdoff|max|log-level> <value>");
+            return;
+        }
+
+        if (strcmp(key, "keepalive") == 0) {
+            unsigned long long parsed = 0ULL;
+            if (!parse_unsigned_value(value, UINT32_MAX, &parsed)) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "invalid keepalive value '%s'", value);
+                return;
+            }
+            if (parsed == 0ULL) {
+                parsed = TD_DEFAULT_KEEPALIVE_INTERVAL_SEC;
+            }
+            if (ctx->manager && terminal_manager_set_keepalive_interval(ctx->manager, (unsigned int)parsed) == 0) {
+                runtime_cfg->keepalive_interval_sec = (unsigned int)parsed;
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "keepalive interval updated to %us",
+                              runtime_cfg->keepalive_interval_sec);
+            }
+            return;
+        }
+
+        if (strcmp(key, "miss") == 0) {
+            unsigned long long parsed = 0ULL;
+            if (!parse_unsigned_value(value, UINT32_MAX, &parsed)) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "invalid miss threshold '%s'", value);
+                return;
+            }
+            if (parsed == 0ULL) {
+                parsed = TD_DEFAULT_KEEPALIVE_MISS_THRESHOLD;
+            }
+            if (ctx->manager && terminal_manager_set_keepalive_miss_threshold(ctx->manager, (unsigned int)parsed) == 0) {
+                runtime_cfg->keepalive_miss_threshold = (unsigned int)parsed;
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "keepalive miss threshold updated to %u",
+                              runtime_cfg->keepalive_miss_threshold);
+            }
+            return;
+        }
+
+        if (strcmp(key, "holdoff") == 0) {
+            unsigned long long parsed = 0ULL;
+            if (!parse_unsigned_value(value, UINT32_MAX, &parsed)) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "invalid holdoff value '%s'", value);
+                return;
+            }
+            if (parsed == 0ULL) {
+                parsed = TD_DEFAULT_IFACE_INVALID_HOLDOFF_SEC;
+            }
+            if (ctx->manager && terminal_manager_set_iface_invalid_holdoff(ctx->manager, (unsigned int)parsed) == 0) {
+                runtime_cfg->iface_invalid_holdoff_sec = (unsigned int)parsed;
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "iface invalid holdoff updated to %us",
+                              runtime_cfg->iface_invalid_holdoff_sec);
+            }
+            return;
+        }
+
+        if (strcmp(key, "max") == 0) {
+            unsigned long long parsed = 0ULL;
+            if (!parse_unsigned_value(value, UINT32_MAX, &parsed) || parsed == 0ULL) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "invalid max terminals '%s'", value);
+                return;
+            }
+            if (ctx->manager && terminal_manager_set_max_terminals(ctx->manager, (size_t)parsed) == 0) {
+                runtime_cfg->max_terminals = (unsigned int)parsed;
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "max terminals updated to %u",
+                              runtime_cfg->max_terminals);
+            }
+            return;
+        }
+
+        if (strcmp(key, "log-level") == 0) {
+            bool ok = false;
+            td_log_level_t level = td_log_level_from_string(value, &ok);
+            if (!ok) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "invalid log level '%s'", value);
+                return;
+            }
+            runtime_cfg->log_level = level;
+            td_log_set_level(level);
+            td_log_writef(TD_LOG_INFO, "terminal_daemon", "log level updated to %s", value);
+            return;
+        }
+
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_daemon",
+                      "unknown set option '%s'",
+                      key);
+        return;
+    }
+
+    td_log_writef(TD_LOG_WARN,
+                  "terminal_daemon",
+                  "unknown command '%s' (try 'help')",
+                  command);
+}
+
 static void log_manager_stats(struct terminal_manager *manager) {
     if (!manager) {
         return;
@@ -471,8 +716,7 @@ int main(int argc, char **argv) {
     td_log_writef(TD_LOG_INFO,
                   "terminal_daemon",
                   "interactive commands enabled (type 'help' for list)");
-    fprintf(stdout, "td> ");
-    fflush(stdout);
+    print_prompt();
 
     while (!g_should_stop) {
         FD_ZERO(&read_fds);
@@ -495,7 +739,7 @@ int main(int argc, char **argv) {
         }
 
         if (sel_rc > 0 && FD_ISSET(stdin_fd, &read_fds)) {
-            char command_buf[32];
+            char command_buf[64];
             if (!fgets(command_buf, sizeof(command_buf), stdin)) {
                 if (feof(stdin)) {
                     td_log_writef(TD_LOG_INFO, "terminal_daemon", "stdin closed; shutting down");
@@ -511,78 +755,12 @@ int main(int argc, char **argv) {
                 }
 
                 if (command_buf[0] == '\0') {
-                    fprintf(stdout, "td> ");
-                    fflush(stdout);
+                    print_prompt();
                     continue;
                 }
 
-                if (strcmp(command_buf, "stats") == 0) {
-                    log_manager_stats(ctx.manager);
-                } else if (strcmp(command_buf, "dump terminal") == 0) {
-                    if (ctx.manager) {
-                        td_debug_dump_context_t dump_ctx;
-                        td_debug_context_reset(&dump_ctx, NULL);
-                        td_debug_dump_terminal_table(ctx.manager,
-                                                     NULL,
-                                                     td_debug_writer_file,
-                                                     stdout,
-                                                     &dump_ctx);
-                        fflush(stdout);
-                    }
-                } else if (strcmp(command_buf, "dump prefix") == 0) {
-                    if (ctx.manager) {
-                        td_debug_dump_context_t dump_ctx;
-                        td_debug_context_reset(&dump_ctx, NULL);
-                        td_debug_dump_iface_prefix_table(ctx.manager,
-                                                         td_debug_writer_file,
-                                                         stdout,
-                                                         &dump_ctx);
-                        fflush(stdout);
-                    }
-                } else if (strcmp(command_buf, "dump binding") == 0) {
-                    if (ctx.manager) {
-                        td_debug_dump_context_t dump_ctx;
-                        td_debug_context_reset(&dump_ctx, NULL);
-                        td_debug_dump_iface_binding_table(ctx.manager,
-                                                          NULL,
-                                                          td_debug_writer_file,
-                                                          stdout,
-                                                          &dump_ctx);
-                        fflush(stdout);
-                    }
-                } else if (strcmp(command_buf, "dump mac queue") == 0) {
-                    if (ctx.manager) {
-                        td_debug_dump_context_t dump_ctx;
-                        td_debug_context_reset(&dump_ctx, NULL);
-                        td_debug_dump_mac_lookup_queue(ctx.manager,
-                                                       td_debug_writer_file,
-                                                       stdout,
-                                                       &dump_ctx);
-                        fflush(stdout);
-                    }
-                } else if (strcmp(command_buf, "dump mac state") == 0) {
-                    if (ctx.manager) {
-                        td_debug_dump_context_t dump_ctx;
-                        td_debug_context_reset(&dump_ctx, NULL);
-                        td_debug_dump_mac_locator_state(ctx.manager,
-                                                        td_debug_writer_file,
-                                                        stdout,
-                                                        &dump_ctx);
-                        fflush(stdout);
-                    }
-                } else if (strcmp(command_buf, "help") == 0) {
-                    td_log_writef(TD_LOG_INFO,
-                                  "terminal_daemon",
-                                  "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | help");
-                } else if (command_buf[0] != '\0') {
-                    td_log_writef(TD_LOG_WARN,
-                                  "terminal_daemon",
-                                  "unknown command '%s' (try 'help')",
-                                  command_buf);
-                }
-
-                fprintf(stdout, "td> ");
-                fflush(stdout);
+                handle_command(command_buf, &ctx, &runtime_cfg);
+                print_prompt();
             }
         }
 

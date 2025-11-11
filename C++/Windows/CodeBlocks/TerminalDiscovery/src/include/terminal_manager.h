@@ -190,6 +190,18 @@ struct terminal_manager *terminal_manager_get_active(void);
 void terminal_manager_get_stats(struct terminal_manager *mgr,
                                 struct terminal_manager_stats *out);
 
+int terminal_manager_set_keepalive_interval(struct terminal_manager *mgr,
+                                            unsigned int interval_sec);
+
+int terminal_manager_set_keepalive_miss_threshold(struct terminal_manager *mgr,
+                                                  unsigned int miss_threshold);
+
+int terminal_manager_set_iface_invalid_holdoff(struct terminal_manager *mgr,
+                                               unsigned int holdoff_sec);
+
+int terminal_manager_set_max_terminals(struct terminal_manager *mgr,
+                                       size_t max_terminals);
+
 int td_debug_dump_terminal_table(struct terminal_manager *mgr,
                                  const td_debug_dump_opts_t *opts,
                                  td_debug_writer_t writer,

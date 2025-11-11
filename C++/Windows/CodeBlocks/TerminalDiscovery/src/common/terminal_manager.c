@@ -1921,6 +1921,64 @@ void terminal_manager_get_stats(struct terminal_manager *mgr,
     pthread_mutex_unlock(&mgr->lock);
 }
 
+int terminal_manager_set_keepalive_interval(struct terminal_manager *mgr,
+                                            unsigned int interval_sec) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (interval_sec == 0U) {
+        interval_sec = TERMINAL_KEEPALIVE_INTERVAL_DEFAULT_SEC;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->cfg.keepalive_interval_sec = interval_sec;
+    pthread_mutex_unlock(&mgr->lock);
+    return 0;
+}
+
+int terminal_manager_set_keepalive_miss_threshold(struct terminal_manager *mgr,
+                                                  unsigned int miss_threshold) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (miss_threshold == 0U) {
+        miss_threshold = TERMINAL_KEEPALIVE_MISS_DEFAULT;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->cfg.keepalive_miss_threshold = miss_threshold;
+    pthread_mutex_unlock(&mgr->lock);
+    return 0;
+}
+
+int terminal_manager_set_iface_invalid_holdoff(struct terminal_manager *mgr,
+                                               unsigned int holdoff_sec) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (holdoff_sec == 0U) {
+        holdoff_sec = TERMINAL_IFACE_INVALID_HOLDOFF_DEFAULT_SEC;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->cfg.iface_invalid_holdoff_sec = holdoff_sec;
+    pthread_mutex_unlock(&mgr->lock);
+    return 0;
+}
+
+int terminal_manager_set_max_terminals(struct terminal_manager *mgr,
+                                       size_t max_terminals) {
+    if (!mgr || max_terminals == 0U) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->cfg.max_terminals = max_terminals;
+    mgr->max_terminals = max_terminals;
+    pthread_mutex_unlock(&mgr->lock);
+    return 0;
+}
+
 static int td_debug_prepare_context(td_debug_dump_context_t **ctx_ptr,
                                     td_debug_dump_context_t *local_ctx,
                                     const td_debug_dump_opts_t *opts) {
