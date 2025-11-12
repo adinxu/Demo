@@ -4,6 +4,7 @@
 #include "td_logging.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <ctype.h>
 #include <netinet/if_ether.h>
 #include <stdbool.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -64,6 +66,75 @@ static void probe_reset(struct probe_capture *capture) {
         return;
     }
     memset(capture, 0, sizeof(*capture));
+}
+
+struct sync_handler_state {
+    pthread_mutex_t lock;
+    size_t call_count;
+    size_t success_after;
+};
+
+static void sync_handler_state_init(struct sync_handler_state *state, size_t success_after) {
+    if (!state) {
+        return;
+    }
+    pthread_mutex_init(&state->lock, NULL);
+    state->call_count = 0U;
+    state->success_after = success_after;
+}
+
+static void sync_handler_state_destroy(struct sync_handler_state *state) {
+    if (!state) {
+        return;
+    }
+    pthread_mutex_destroy(&state->lock);
+}
+
+static size_t sync_handler_state_get(struct sync_handler_state *state) {
+    if (!state) {
+        return 0U;
+    }
+    pthread_mutex_lock(&state->lock);
+    size_t current = state->call_count;
+    pthread_mutex_unlock(&state->lock);
+    return current;
+}
+
+static void sync_handler_state_set_success_after(struct sync_handler_state *state, size_t value) {
+    if (!state) {
+        return;
+    }
+    pthread_mutex_lock(&state->lock);
+    state->success_after = value;
+    pthread_mutex_unlock(&state->lock);
+}
+
+static int sync_test_handler(void *ctx) {
+    struct sync_handler_state *state = (struct sync_handler_state *)ctx;
+    if (!state) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&state->lock);
+    state->call_count += 1U;
+    size_t current = state->call_count;
+    size_t threshold = state->success_after;
+    pthread_mutex_unlock(&state->lock);
+    return current >= threshold ? 0 : -EAGAIN;
+}
+
+static bool wait_for_call_count(struct sync_handler_state *state,
+                                size_t expected,
+                                unsigned int timeout_ms) {
+    const unsigned int step_ms = 10U;
+    unsigned int waited = 0U;
+    while (waited < timeout_ms) {
+        if (sync_handler_state_get(state) >= expected) {
+            return true;
+        }
+        usleep((useconds_t)step_ms * 1000U);
+        waited += step_ms;
+    }
+    return sync_handler_state_get(state) >= expected;
 }
 
 struct debug_capture {
@@ -839,6 +910,84 @@ done:
     return ok;
 }
 
+static bool test_address_sync_retry(void) {
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 10;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 10;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 16;
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            NULL,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for sync retry test\n");
+        return false;
+    }
+
+    struct sync_handler_state state;
+    sync_handler_state_init(&state, 3U);
+    terminal_manager_set_address_sync_handler(mgr, sync_test_handler, &state);
+
+    bool ok = true;
+
+    terminal_manager_request_address_sync(mgr);
+
+    if (!wait_for_call_count(&state, 1U, 200U)) {
+        fprintf(stderr, "expected first sync attempt within timeout\n");
+        ok = false;
+        goto done;
+    }
+    if (!wait_for_call_count(&state, 2U, 400U)) {
+        fprintf(stderr, "expected second sync attempt after failure\n");
+        ok = false;
+        goto done;
+    }
+    if (!wait_for_call_count(&state, 3U, 600U)) {
+        fprintf(stderr, "expected sync to succeed by third attempt\n");
+        ok = false;
+        goto done;
+    }
+
+    usleep(100000);
+    if (sync_handler_state_get(&state) != 3U) {
+        fprintf(stderr, "unexpected extra sync attempts after success\n");
+        ok = false;
+        goto done;
+    }
+
+    sync_handler_state_set_success_after(&state, 5U);
+    terminal_manager_request_address_sync(mgr);
+
+    if (!wait_for_call_count(&state, 4U, 200U)) {
+        fprintf(stderr, "expected retry sequence to restart on new request\n");
+        ok = false;
+        goto done;
+    }
+    if (!wait_for_call_count(&state, 5U, 400U)) {
+        fprintf(stderr, "expected second sequence to succeed\n");
+        ok = false;
+        goto done;
+    }
+
+    usleep(100000);
+    if (sync_handler_state_get(&state) != 5U) {
+        fprintf(stderr, "unexpected extra attempts after second success\n");
+        ok = false;
+    }
+
+done:
+    terminal_manager_set_address_sync_handler(mgr, NULL, NULL);
+    sync_handler_state_destroy(&state);
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
 static bool test_debug_dump_interfaces(void) {
     const int vlan_id = 310;
     const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
@@ -963,10 +1112,11 @@ int main(void) {
         {"default_log_timestamp", test_default_log_timestamp},
         {"terminal_add_and_event", test_terminal_add_and_event},
         {"gratuitous_arp_uses_target_ip", test_gratuitous_arp_uses_target_ip},
-    {"zero_ip_arp_is_ignored", test_zero_ip_arp_is_ignored},
+        {"zero_ip_arp_is_ignored", test_zero_ip_arp_is_ignored},
         {"probe_failure_removes_terminal", test_probe_failure_removes_terminal},
         {"iface_invalid_holdoff", test_iface_invalid_holdoff},
         {"ifindex_change_emits_mod", test_ifindex_change_emits_mod},
+        {"address_sync_retry", test_address_sync_retry},
         {"debug_dump_interfaces", test_debug_dump_interfaces},
     };
 

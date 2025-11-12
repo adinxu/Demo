@@ -150,6 +150,8 @@ typedef struct terminal_address_update {
     bool is_add;        /* true = add/update, false = remove */
 } terminal_address_update_t;
 
+typedef int (*terminal_address_sync_fn)(void *ctx);
+
 struct terminal_manager_config {
     unsigned int keepalive_interval_sec;
     unsigned int keepalive_miss_threshold;
@@ -174,6 +176,12 @@ void terminal_manager_on_timer(struct terminal_manager *mgr);
 
 void terminal_manager_on_address_update(struct terminal_manager *mgr,
                                         const terminal_address_update_t *update);
+
+void terminal_manager_set_address_sync_handler(struct terminal_manager *mgr,
+                                               terminal_address_sync_fn handler,
+                                               void *handler_ctx);
+
+void terminal_manager_request_address_sync(struct terminal_manager *mgr);
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
                                     terminal_event_callback_fn callback,

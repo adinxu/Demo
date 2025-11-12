@@ -129,7 +129,7 @@
 - **接口管理**：
    1. 仅关心三层虚接口（VLANIF）的上下线、IP 变更；二层 access/trunk 口的物理 up/down 不触发状态变更。
    2. 收到 Access 口报文、且无对应虚接口时终端保持发现状态但不保活；Trunk 口报文无需再次校验 permit 集合（ACL 已确保 VLAN 合法），仅在缺失对应 VLANIF 时按无虚接口逻辑处理。
-   3. 需监测虚接口 IP 的增删改（可通过 Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调）；核心引擎维护“可用接口地址表”（`ifindex -> {prefix}`）。该表实现为哈希表或动态数组，元素保存接口索引、前缀长度、网络地址（CIDR 表示）。
+   3. 需监测虚接口 IP 的增删改（可通过 Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调）；核心引擎维护“可用接口地址表”（`ifindex -> {prefix}`）。该表实现为哈希表或动态数组，元素保存接口索引、前缀长度、网络地址（CIDR 表示）。进程启动阶段必须先获取一次当前完整 IPv4 地址表并写入该结构（优先使用 Netlink `RTM_GETADDR` dump，无法获取时回退至 `getifaddrs` 等通用接口），保证在第一批终端报文到来前即可判断接口有效性；若初始化抓取失败需写入告警日志并维持重试钩子，同时保持终端按现有逻辑处于 `IFACE_INVALID`，以便覆盖确实未配置 IPv4 的设备。
    4. 为避免 IP 事件触发全量扫描，按 `ifindex` 维护反向索引（`ifindex -> terminal_entry list`）。索引可采用链表头数组或哈希表，节点即 `terminal_entry` 指针，维护时确保多重注册去重。`resolve_tx_interface` 成功后在索引中登记；若接口当前尚未出现在地址表或终端 IP 未命中前缀，则判定绑定失败，不会写入索引。接口地址集变化时仅遍历该 `ifindex` 对应终端并设为 `IFACE_INVALID`。
    5. 地址表与反向索引的读写均在持有 `terminal_manager.lock` 时进行；外部事件处理（Netlink 回调）进入核心引擎后需先获取此锁，保证与 `resolve_tx_interface`、终端状态机操作不存在竞态。为降低更新阻塞，可在锁内完成结构更新后再脱锁触发终端状态变更/事件队列。
 - **报文路径**：

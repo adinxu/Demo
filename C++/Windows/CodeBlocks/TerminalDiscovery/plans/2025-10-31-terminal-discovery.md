@@ -114,6 +114,12 @@
 3. ✅ 更新北向 C++ 桥接，提供面向 `std::string`/`std::ostream` 的轻量封装及 `TerminalDebugSnapshot` 工具类，便于外部守护进程在不中断主流程情况下获取快照；同时新增示例代码演示如何注册回调与调用调试接口。
 4. ✅ 扩展单元与集成测试：新增针对过滤参数、错误回调、空数据集与大规模哈希桶的断言；在现有测试框架中注入打桩 `writer` 捕获输出并校验关键字段。补充 `doc/` 下调试接口指南，记录常见排障场景与示例输出。
 
+### 阶段 8：启动阶段地址表同步（待执行）
+1. ⏳ 审核 `terminal_netlink`、`terminal_manager` 现有初始化流程及 `iface_address_table`/`iface_binding_index` 结构，明确首批接口地址注入位置与锁保护策略。
+2. ⏳ 实现 `td_iface_address_table_sync_initial()`：优先使用 Netlink `RTM_GETADDR` dump 获取当前 IPv4 地址表，失败时回退 `getifaddrs`，并复用增量更新解析代码，确保写入时持有管理器锁。
+3. ⏳ 在管理器/适配器启动序列中调用初次同步；若抓取失败，记录结构化告警并立即维持终端处于既有 `IFACE_INVALID` 判定路径，同时注册基于 `terminal_manager_worker` 的周期重试钩子，待重试成功后补齐地址表并触发一次接口检查。
+4. ⏳ 扩展单元/集成测试，覆盖初次同步成功、抓取失败保持 `IFACE_INVALID`、重试成功后恢复保活等场景，确保日志与状态转移符合规范。
+
 ## 依赖与风险
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。
 - Raw Socket 权限或平台安全策略可能禁止用户态插入 VLAN tag 或绑定虚接口，需要在部署前确认可行的发送策略。

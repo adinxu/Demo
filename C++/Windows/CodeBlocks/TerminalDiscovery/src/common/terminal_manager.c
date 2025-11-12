@@ -93,6 +93,7 @@ static struct terminal_manager *g_active_manager = NULL;
 static void bind_active_manager(struct terminal_manager *mgr);
 static void unbind_active_manager(struct terminal_manager *mgr);
 static void mac_locator_on_refresh(uint64_t version, void *ctx);
+static void terminal_manager_run_address_sync(struct terminal_manager *mgr);
 
 struct terminal_manager *terminal_manager_get_active(void) {
     pthread_mutex_lock(&g_active_manager_mutex);
@@ -132,6 +133,10 @@ struct terminal_manager {
     uint64_t mac_locator_version;
     bool mac_locator_subscribed;
     bool destroying;
+    terminal_address_sync_fn address_sync_cb;
+    void *address_sync_ctx;
+    bool address_sync_pending;
+    bool address_sync_in_progress;
 };
 
 static bool is_iface_available(const struct terminal_entry *entry);
@@ -1141,6 +1146,10 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->mac_locator_version = 0ULL;
     mgr->mac_locator_subscribed = false;
     mgr->destroying = false;
+    mgr->address_sync_cb = NULL;
+    mgr->address_sync_ctx = NULL;
+    mgr->address_sync_pending = false;
+    mgr->address_sync_in_progress = false;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         mgr->table[i] = NULL;
@@ -1523,6 +1532,38 @@ static bool is_iface_available(const struct terminal_entry *entry) {
     return entry && entry->tx_kernel_ifindex > 0 && entry->tx_source_ip.s_addr != 0;
 }
 
+static void terminal_manager_run_address_sync(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    terminal_address_sync_fn handler = NULL;
+    void *handler_ctx = NULL;
+
+    pthread_mutex_lock(&mgr->lock);
+    if (mgr->address_sync_pending && mgr->address_sync_cb && !mgr->address_sync_in_progress) {
+        mgr->address_sync_in_progress = true;
+        handler = mgr->address_sync_cb;
+        handler_ctx = mgr->address_sync_ctx;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    if (!handler) {
+        return;
+    }
+
+    int rc = handler(handler_ctx);
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->address_sync_in_progress = false;
+    if (rc == 0) {
+        mgr->address_sync_pending = false;
+    } else {
+        mgr->address_sync_pending = true;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
 static bool has_expired(const struct terminal_manager *mgr,
                         const struct terminal_entry *entry,
                         const struct timespec *now) {
@@ -1540,6 +1581,8 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     if (!mgr) {
         return;
     }
+
+    terminal_manager_run_address_sync(mgr);
 
     struct timespec now;
     monotonic_now(&now);
@@ -1846,6 +1889,44 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
     iface_record_prune_if_empty(slot);
 
     pthread_mutex_unlock(&mgr->lock);
+}
+
+void terminal_manager_set_address_sync_handler(struct terminal_manager *mgr,
+                                               terminal_address_sync_fn handler,
+                                               void *handler_ctx) {
+    if (!mgr) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->address_sync_cb = handler;
+    mgr->address_sync_ctx = handler_ctx;
+    if (!handler) {
+        mgr->address_sync_pending = false;
+        mgr->address_sync_in_progress = false;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+void terminal_manager_request_address_sync(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    bool should_signal = false;
+
+    pthread_mutex_lock(&mgr->lock);
+    if (mgr->address_sync_cb) {
+        mgr->address_sync_pending = true;
+        should_signal = true;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    if (should_signal) {
+        pthread_mutex_lock(&mgr->worker_lock);
+        pthread_cond_signal(&mgr->worker_cond);
+        pthread_mutex_unlock(&mgr->worker_lock);
+    }
 }
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,

@@ -67,6 +67,7 @@
 
 ### 定时扫描 `terminal_manager_on_timer`
 - 由后台线程或外部手动调用。
+- 在进入终端遍历之前，优先检查是否存在挂起的地址表同步请求；若有注册的回调，当前扫描周期会先触发同步，再继续处理终端状态机。
 - 每次扫描遍历所有哈希桶：
   1. `IFACE_INVALID` 且超过 `iface_invalid_holdoff_sec` 的终端被淘汰。
   2. 其他状态若与上次报文间隔超过 `keepalive_interval_sec`，触发一次保活：
@@ -84,6 +85,13 @@
   - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 ifindex 发生变化或终端被重新创建时才会触发对外事件。
   - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。
   - `main/terminal_main.c` 在管理器创建后启动 `terminal_netlink` 监听线程，直接调用该接口完成同步，无需额外的适配层事件桥接。
+
+### 地址初始同步与重试
+- 管理器暴露 `terminal_manager_set_address_sync_handler`/`terminal_manager_request_address_sync` 接口，供平台事件源注册同步回调并触发一次性或重复执行。
+- `terminal_netlink_start` 在监听线程创建前调用回调尝试拿到当前 IPv4 地址表：优先向内核发起 `RTM_GETADDR` dump，失败时回退到 `getifaddrs`。
+- 回调返回 0 代表本轮同步成功，管理器会清除挂起标记；返回非 0 则保留标记并由后台定时线程在后续周期继续尝试。
+- 同步失败不会影响终端当前状态，所有终端仍按照既有逻辑停留在 `IFACE_INVALID`；一旦稍后同步成功，地址表会立即填充，使得后续报文能够重新建立绑定并恢复活跃。
+- 回调实现负责记录具体日志（如回退到 `getifaddrs` 时输出 WARN），管理器仅提供调度节奏并确保回调在脱锁状态下执行。
 
 ### IFACE_INVALID 状态补充
 - 所有进入 `IFACE_INVALID` 的路径（如 `resolve_tx_interface` 返回失败、地址事件删除前缀）都会调用 `iface_binding_detach`，立即从 `iface_binding_index` 中移除终端并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`。若 MAC 查询失败并返回未知 ifindex，仅会把 `meta.ifindex` 重置为 0，状态仍保持不变，等待后续路径再次评估 `is_iface_available`。
@@ -112,6 +120,7 @@ Realtek 适配器提供 `mac_locator_ops->subscribe` 接口；`terminal_manager_
 - `terminal_manager_on_packet`：供适配器报文回调调用，线程安全。
 - `terminal_manager_on_address_update`：供地址事件订阅回调调用，线程安全。
 - `terminal_probe_fn`：由调用方实现，负责根据 `terminal_probe_request_t` 构造 `td_adapter_arp_request` 并发送。
+- `terminal_manager_set_address_sync_handler` / `terminal_manager_request_address_sync`：注册并调度 IPv4 地址表同步逻辑，适配层可在初始化失败时复用重试机制。
 
 ## 后续扩展点
 - Stage 3 将在当前基础上新增增量事件队列，继续消费 `terminal_entry` 中的 VLAN/ifindex 元数据；探测请求不再重复存储该信息。

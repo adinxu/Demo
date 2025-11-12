@@ -136,6 +136,7 @@ flowchart TD
     - 互斥量 `lock` 保护终端表，`worker_thread` 驱动定期扫描。
     - 事件队列 `terminal_event_queue` 存放北向变更通知。
     - 统计字段 `terminal_manager_stats`（Stage 4 新增）。
+    - 地址同步调度：保存注册回调 `address_sync_cb`、上下文 `address_sync_ctx`，并通过 `address_sync_pending`/`address_sync_in_progress` 标记控制执行节奏，确保同一时刻仅有一次同步在运行。
     - MAC 定位上下文：持有适配器提供的 `mac_locator_ops`，维护 `mac_need_refresh_head/tail` 与 `mac_pending_verify_head/tail` 队列、最新的 `mac_locator_version` 以及订阅标志 `mac_locator_subscribed`，用于跟踪桥接刷新状态。
   - `terminal_entry`
     - 记录 MAC/IP、状态机（`terminal_state_t`）、最近报文时间、探测信息和接口元数据。
@@ -151,13 +152,14 @@ flowchart TD
 - **关键函数**：
   - `terminal_manager_create/destroy`：初始化线程、绑定全局单例（`terminal_manager_get_active`）。
   - `terminal_manager_on_packet`：处理适配器上送的 ARP 数据；`apply_packet_binding` 更新 VLAN/ifindex 元数据并调用 `resolve_tx_interface`，在保留 VLAN ID 以支撑物理口发包的同时，获取可选的 VLANIF `kernel_ifindex` 与 `tx_source_ip` 用于构造 ARP；任一环节失败都会清空回退接口绑定并立刻将终端转入 `IFACE_INVALID`。
-  - `terminal_manager_on_timer`：由后台线程调用，负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
+  - `terminal_manager_on_timer`：由后台线程调用，在进入终端遍历与探测逻辑之前优先调度一次挂起的地址同步回调，然后负责保活探测、过期清理与队列出列；通过回调 `terminal_probe_fn` 执行 ARP 请求。
   - `terminal_manager_on_address_update`：由 netlink 监听器触发的虚接口 IPv4 前缀增删回调，维护可用地址表并触发 `IFACE_INVALID`。
   - `terminal_manager_maybe_dispatch_events`：批量投递事件到北向回调。
   - `terminal_manager_get_stats`：返回当前计数器快照。
+  - `terminal_manager_set_address_sync_handler` / `terminal_manager_request_address_sync`：注册平台侧地址同步回调，并在需要时挂起/重试初始 IPv4 地址表抓取。
   - `mac_locator_on_refresh` / `mac_lookup_execute`：订阅适配器 MAC 表刷新回调，基于版本号批量重建 ifindex 视图并在必要时排队 MOD 事件或累计 `event_dispatch_failures`。
 - **线程模型**：
-  - 后台 `worker_thread` 每 `scan_interval_ms` 唤醒执行 `terminal_manager_on_timer`。
+  - 后台 `worker_thread` 每 `scan_interval_ms` 唤醒执行 `terminal_manager_on_timer`，在扫描前负责触发一次挂起的地址同步。
   - 适配器 RX 线程在收到报文后调用 `terminal_manager_on_packet`（持 `lock`）。
   - 北向事件分发在脱锁后执行，避免长时间占用互斥量。
 
@@ -266,6 +268,10 @@ classDiagram
     +size_t terminal_count
     +size_t max_terminals
     +terminal_manager_stats stats
+    +terminal_address_sync_fn address_sync_cb
+    +void* address_sync_ctx
+    +bool address_sync_pending
+    +bool address_sync_in_progress
     +mac_lookup_task* mac_need_refresh_head
     +mac_lookup_task* mac_need_refresh_tail
     +mac_lookup_task* mac_pending_verify_head
@@ -363,7 +369,7 @@ classDiagram
 ```
 
 事件、接口索引与探测链路均在 `terminal_manager.lock` 保护下维护：
-- 事件队列节点在 `queue_event` 中申请并加入 `terminal_event_queue`，由 `terminal_manager_maybe_dispatch_events` 在脱锁后批量释放。
+- 地址同步状态（`address_sync_cb/address_sync_ctx/address_sync_pending/address_sync_in_progress`）在持锁环境下登记或复位，实际回调会在解锁后执行；`terminal_manager_on_timer` 在扫描开始前调用内部调度函数触发挂起同步，避免与终端遍历交织。
 - 事件队列节点在 `queue_event` 中申请并加入 `terminal_event_queue`，由 `terminal_manager_maybe_dispatch_events` 在脱锁后批量释放。
 - `terminal_manager_maybe_dispatch_events` 同时被 `terminal_manager_on_packet`、`terminal_manager_on_timer`、`mac_lookup_execute` 与显式的 `terminal_manager_flush_events` 调用；如果回调缺失或批量分配失败，会在释放节点的同时自增一次 `event_dispatch_failures`。
 - `iface_record` 与 `iface_binding_entry` 的增删由 `terminal_manager_on_address_update` 和 `resolve_tx_interface` 驱动，均在持锁状态下保持一致性。
@@ -374,6 +380,7 @@ classDiagram
 ### 5. Netlink 监听器 `common/terminal_netlink`
 - `terminal_netlink_start/stop`：管理基于 `NETLINK_ROUTE` 的后台线程，订阅 `RTM_NEWADDR/DELADDR` 并调用 `terminal_manager_on_address_update`。
 - 内部线程使用 `poll` 阻塞等待消息，解析 `ifaddrmsg` + `IFA_LOCAL/IFA_ADDRESS` 提取前缀信息，只处理 IPv4 事件。
+- 启动阶段会通过 `terminal_manager_set_address_sync_handler` 注册同步回调并立即请求一次地址抓取：优先向内核发起 `RTM_GETADDR` dump，若失败则回退到 `getifaddrs`，并统一记录 WARN 以便部署排查；返回非 0 时管理器会保留挂起标记，由 worker 线程在后续周期自动重试。
 - 在 `terminal_main.c` 中随管理器创建启动，销毁流程会优雅退出线程并关闭套接字。
 
 ### 6. 北向桥接 `common/terminal_northbound.cpp`
@@ -613,8 +620,8 @@ td_switch_mac_get_capacity"]
 | ---- | ---- | -------- | -------- |
 | 主线程 | `main()` | CLI 解析、初始化、信号监听、最终清理 | 使用信号处理器设置 `g_should_stop` 原子变量 |
 | 适配器 RX 线程 | `realtek_adapter` | `poll` + `recvmsg` 收取 ARP，并调用 `terminal_manager_on_packet` | 访问终端表时依赖 `terminal_manager` 的 `lock` |
-| 终端管理器 Worker | `terminal_manager_worker` | 定期扫描终端表、安排探测、淘汰终端 | `worker_lock` 控制线程休眠，核心操作持 `lock` |
-| Netlink 监听线程 | `terminal_netlink` | 订阅 `RTM_NEWADDR/DELADDR` 并更新地址表 | `terminal_netlink_listener.running` 原子标记线程退出；调用 `terminal_manager_on_address_update` 时获取管理器互斥锁 |
+| 终端管理器 Worker | `terminal_manager_worker` | 定期扫描终端表、安排探测、淘汰终端，并在扫描前触发挂起的地址同步回调 | `worker_lock` 控制线程休眠，核心操作持 `lock` |
+| Netlink 监听线程 | `terminal_netlink` | 订阅 `RTM_NEWADDR/DELADDR` 并更新地址表，启动时先尝试抓取现有 IPv4 前缀 | `terminal_netlink_listener.running` 原子标记线程退出；调用 `terminal_manager_on_address_update` 时获取管理器互斥锁 |
 | 北向回调上下文（非独立线程） | `terminal_manager_maybe_dispatch_events` | 由触发事件的线程在脱锁后同步调用外部回调 | 事件队列在 `lock` 下构建；回调执行期间不持锁 |
 | MAC 缓存线程 | `realtek_adapter` | 周期性刷新 `td_switch_mac_snapshot` 并触发 `mac_locator_on_refresh` | 刷新后回调在持锁状态下合并 `mac_lookup_task`，真正查表在脱锁环境执行 |
 
@@ -650,7 +657,7 @@ td_switch_mac_get_capacity"]
 2. **保活链路**：
   - Worker 线程 (`terminal_manager_on_timer`) -> 决定是否探测 -> `terminal_probe_handler` -> `realtek_adapter.send_arp` -> 网络。
 3. **地址事件链路**：
-  - Netlink 监听线程 (`terminal_netlink`) -> 解析 `RTM_NEWADDR/DELADDR` -> `terminal_manager_on_address_update` -> 更新地址表与反向索引。
+  - Netlink 监听线程 (`terminal_netlink`) -> 启动时先通过地址同步回调抓取当前 IPv4 前缀（`RTM_GETADDR` -> `getifaddrs` 回退） -> 解析实时 `RTM_NEWADDR/DELADDR` -> `terminal_manager_on_address_update` -> 更新地址表与反向索引；若初始抓取失败，后台 worker 会按照挂起标记持续触发重试直至成功。
 4. **查询接口**：
   - 北向 `getAllTerminalInfo` -> `terminal_manager_query_all` -> C++ 向量结果。
 5. **配置入口**：
