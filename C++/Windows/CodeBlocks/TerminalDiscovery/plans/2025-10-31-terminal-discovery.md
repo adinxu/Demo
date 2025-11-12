@@ -35,7 +35,7 @@
 2. ✅ Realtek 适配器：
    - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带的 ifindex 线索；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；默认在物理接口 `eth0` 的原始套接字中封装 802.1Q 头直接发包，优先采用请求内的 VLAN/接口信息生成帧；若驱动拒绝用户态 VLAN tag，则回退到绑定虚接口（如 `vlan1`），发送前仍会查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
-   - MAC 表拉取：在 demo 验证通过的基础上集成外部桥接模块提供的 C 接口（如 `td_switch_mac_snapshot`），由适配层显式触发容量查询与快照，周期性/按需复用调用侧维护的 `SwUcMacEntry` 数组，拉取并解析为内部 `ifindex/vlan` 映射供终端管理器检索；需要在适配层自行管理缓冲区容量、重试回退与错误日志，并确保桥接模块初始化失败时不会阻塞主线程。
+   - MAC 表拉取：在 demo 验证通过的基础上集成外部桥接模块提供的 C 接口（如 `td_switch_mac_snapshot`），由适配层显式触发容量查询与快照，周期性/按需复用调用侧维护的 `SwUcMacEntry` 数组，拉取并解析为内部 `ifindex/vlan` 映射供终端管理器检索；需要在适配层自行管理缓冲区容量、重试回退与错误日志，并确保桥接模块初始化失败时不会阻塞主线程。`realtek_mac_locator_lookup` 必须严格按照规范区分错误码：缓存未完成或刷新失败时返回 `TD_ADAPTER_ERR_NOT_READY`，未在 MAC 表命中时返回 `TD_ADAPTER_ERR_NOT_FOUND` 并附带 `ifindex=0`，避免终端管理器重复排队。
    - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；当前通过公共模块 `terminal_netlink` 在管理器创建后启动监听线程，保活节奏仍在终端引擎线程内统一调度。
    - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
 3. ✅ 公共组件：
@@ -93,6 +93,7 @@
    - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
    - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
    - Realtek MAC 表桥接：使用打桩接口模拟桥接 C API（如 `td_switch_mac_snapshot`）成功与失败，验证 ifindex 解析缓存、重试节奏与错误日志；同时确认调用侧缓冲区复用路径在容量不足、溢出提示等场景下的健壮性。
+   - MAC 定位错误码：针对 `realtek_mac_locator_lookup` 构建单元/集成测试覆盖 `NOT_READY` 与 `NOT_FOUND` 两种分支，确认终端管理器仅在前者情况下重新入队，并在后者保持 `ifindex=0` 且队列长度稳定。
    - 配置转换：对 `td_config_to_manager_config` 提供边界输入（0、极大值）确保默认兜底与错误码表现正确。
    - 统计日志：替换日志 sink，驱动 `g_should_dump_stats` 触发，确认 `terminal_stats` 字段完整性与节奏控制。
 5. ⏳ 实机/压力验证：

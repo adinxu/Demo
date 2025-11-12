@@ -1241,7 +1241,7 @@ static td_adapter_result_t realtek_mac_locator_lookup(td_adapter_t *handle,
             *version_out = version;
         }
         pthread_rwlock_unlock(&cache->map_lock);
-        return TD_ADAPTER_ERR_NOT_READY;
+        return TD_ADAPTER_ERR_NOT_FOUND;
     }
 
     return TD_ADAPTER_ERR_NOT_READY;

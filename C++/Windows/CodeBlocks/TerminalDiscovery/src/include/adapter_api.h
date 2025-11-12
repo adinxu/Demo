@@ -29,6 +29,7 @@ typedef enum {
     TD_ADAPTER_ERR_UNSUPPORTED = -5,
     TD_ADAPTER_ERR_BACKPRESSURE = -6,
     TD_ADAPTER_ERR_ALREADY = -7,
+    TD_ADAPTER_ERR_NOT_FOUND = -8,
 } td_adapter_result_t;
 
 typedef enum {

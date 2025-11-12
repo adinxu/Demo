@@ -97,6 +97,10 @@
    - `td_switch_mac_demo_dump` 已通过上述桥接接口完成端到端验证，后续 ifindex 获取策略与同步流程应以该 demo 的数据流为基准：终端发现模块通过 demo 辅助逻辑解析 MAC→ifindex 映射，并在核心实现中复用相同的缓冲区及容量缓存策略，确保与外部桥接模块的调用约定一致。
    - 桥接模块由外部团队以 C++ 源文件形式交付，与终端发现项目一同编译；为降低额外拷贝与内存占用，`td_switch_mac_snapshot` 直接返回 SDK 定义的 `SwUcMacEntry` 缓冲区，由调用方按照 `td_switch_mac_get_capacity` 预留的条目上限复用该结构；终端发现进程直接依赖 `SwUcMacEntry` 布局，在编译期包含必要的对齐定义，并通过文档约定补充字段语义。
    - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
+   - Realtek 适配器的 MAC 定位接口必须严格区分“缓存尚未就绪/刷新失败”与“未在 MAC 表中命中”两类场景：
+      - 缓存正在刷新、强制刷新失败或尚未初始化时返回 `TD_ADAPTER_ERR_NOT_READY`，终端管理器据此保持队列等待下一轮版本更新；
+      - 缓存可用但未命中目标 MAC/VLAN 时返回 `TD_ADAPTER_ERR_NOT_FOUND`，同时输出 `ifindex=0` 并保留当前版本号，禁止使用 `NOT_READY` 触发重复刷新；
+      - 相关语义需在 `realtek_mac_locator_lookup` 与后续桥接实现中保持一致，确保 `mac_need_refresh` 队列不会因错误码混用而无限膨胀。
 - **北向 API 约束**：
    - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
     - 需兼容外部团队既定的 C++ 类型定义：
