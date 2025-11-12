@@ -150,11 +150,16 @@ static void handle_command(const char *command,
         if (ctx->manager) {
             td_debug_dump_context_t dump_ctx;
             td_debug_context_reset(&dump_ctx, NULL);
-            td_debug_dump_terminal_table(ctx->manager,
-                                         NULL,
-                                         td_debug_writer_file,
-                                         stdout,
-                                         &dump_ctx);
+            struct td_debug_file_writer_ctx writer_ctx;
+            td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
+            int dump_rc = td_debug_dump_terminal_table(ctx->manager,
+                                                       NULL,
+                                                       td_debug_writer_file,
+                                                       &writer_ctx,
+                                                       &dump_ctx);
+            if (dump_rc != 0) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "dump terminal failed: %d", dump_rc);
+            }
             fflush(stdout);
         }
         return;
@@ -164,10 +169,15 @@ static void handle_command(const char *command,
         if (ctx->manager) {
             td_debug_dump_context_t dump_ctx;
             td_debug_context_reset(&dump_ctx, NULL);
-            td_debug_dump_iface_prefix_table(ctx->manager,
-                                             td_debug_writer_file,
-                                             stdout,
-                                             &dump_ctx);
+            struct td_debug_file_writer_ctx writer_ctx;
+            td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
+            int dump_rc = td_debug_dump_iface_prefix_table(ctx->manager,
+                                                           td_debug_writer_file,
+                                                           &writer_ctx,
+                                                           &dump_ctx);
+            if (dump_rc != 0) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "dump prefix failed: %d", dump_rc);
+            }
             fflush(stdout);
         }
         return;
@@ -177,11 +187,16 @@ static void handle_command(const char *command,
         if (ctx->manager) {
             td_debug_dump_context_t dump_ctx;
             td_debug_context_reset(&dump_ctx, NULL);
-            td_debug_dump_iface_binding_table(ctx->manager,
-                                             NULL,
-                                             td_debug_writer_file,
-                                             stdout,
-                                             &dump_ctx);
+            struct td_debug_file_writer_ctx writer_ctx;
+            td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
+            int dump_rc = td_debug_dump_iface_binding_table(ctx->manager,
+                                                            NULL,
+                                                            td_debug_writer_file,
+                                                            &writer_ctx,
+                                                            &dump_ctx);
+            if (dump_rc != 0) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "dump binding failed: %d", dump_rc);
+            }
             fflush(stdout);
         }
         return;
@@ -191,10 +206,15 @@ static void handle_command(const char *command,
         if (ctx->manager) {
             td_debug_dump_context_t dump_ctx;
             td_debug_context_reset(&dump_ctx, NULL);
-            td_debug_dump_mac_lookup_queue(ctx->manager,
-                                           td_debug_writer_file,
-                                           stdout,
-                                           &dump_ctx);
+            struct td_debug_file_writer_ctx writer_ctx;
+            td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
+            int dump_rc = td_debug_dump_mac_lookup_queue(ctx->manager,
+                                                         td_debug_writer_file,
+                                                         &writer_ctx,
+                                                         &dump_ctx);
+            if (dump_rc != 0) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "dump mac queue failed: %d", dump_rc);
+            }
             fflush(stdout);
         }
         return;
@@ -204,10 +224,15 @@ static void handle_command(const char *command,
         if (ctx->manager) {
             td_debug_dump_context_t dump_ctx;
             td_debug_context_reset(&dump_ctx, NULL);
-            td_debug_dump_mac_locator_state(ctx->manager,
-                                            td_debug_writer_file,
-                                            stdout,
-                                            &dump_ctx);
+            struct td_debug_file_writer_ctx writer_ctx;
+            td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
+            int dump_rc = td_debug_dump_mac_locator_state(ctx->manager,
+                                                          td_debug_writer_file,
+                                                          &writer_ctx,
+                                                          &dump_ctx);
+            if (dump_rc != 0) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "dump mac state failed: %d", dump_rc);
+            }
             fflush(stdout);
         }
         return;
