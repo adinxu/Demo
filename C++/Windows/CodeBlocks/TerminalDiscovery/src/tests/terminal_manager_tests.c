@@ -187,7 +187,8 @@ static void apply_address_update(struct terminal_manager *mgr,
 static void build_arp_packet(struct td_adapter_packet_view *packet,
                              struct ether_arp *arp,
                              const uint8_t mac[ETH_ALEN],
-                             const char *ip_text,
+                             const char *sender_ip_text,
+                             const char *target_ip_text,
                              int vlan_id,
                              uint32_t ifindex) {
     memset(arp, 0, sizeof(*arp));
@@ -197,8 +198,11 @@ static void build_arp_packet(struct td_adapter_packet_view *packet,
     arp->ea_hdr.ar_pln = 4;
     arp->ea_hdr.ar_op = htons(ARPOP_REQUEST);
     memcpy(arp->arp_sha, mac, ETH_ALEN);
-    uint32_t spa = inet_addr(ip_text);
+    uint32_t spa = sender_ip_text ? inet_addr(sender_ip_text) : 0U;
     memcpy(arp->arp_spa, &spa, sizeof(spa));
+
+    uint32_t tpa = target_ip_text ? inet_addr(target_ip_text) : 0U;
+    memcpy(arp->arp_tpa, &tpa, sizeof(tpa));
 
     memset(packet, 0, sizeof(*packet));
     packet->payload = (const uint8_t *)arp;
@@ -380,7 +384,7 @@ static bool test_terminal_add_and_event(void) {
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
-    build_arp_packet(&packet, &arp, mac, "192.0.2.10", vlan_id, 7);
+    build_arp_packet(&packet, &arp, mac, "192.0.2.10", "192.0.2.10", vlan_id, 7);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -427,6 +431,167 @@ done:
     return ok;
 }
 
+static bool test_gratuitous_arp_uses_target_ip(void) {
+    const int vlan_id = 150;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 16;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            NULL,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    apply_address_update(mgr, tx_kernel_ifindex, "172.16.1.1", 24, true);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x66, 0x77, 0x88, 0x99, 0xaa};
+    build_arp_packet(&packet,
+                     &arp,
+                     mac,
+                     "0.0.0.0",
+                     "172.16.1.55",
+                     vlan_id,
+                     9);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_ADD) {
+        fprintf(stderr, "expected one ADD event for gratuitous ARP, got %zu\n", events.count);
+        ok = false;
+        goto done;
+    }
+
+    char ip_buf[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &events.records[0].key.ip, ip_buf, sizeof(ip_buf))) {
+        fprintf(stderr, "inet_ntop failed\n");
+        ok = false;
+        goto done;
+    }
+
+    if (strcmp(ip_buf, "172.16.1.55") != 0) {
+        fprintf(stderr, "expected target IP to be recorded, saw %s\n", ip_buf);
+        ok = false;
+        goto done;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed\n");
+        ok = false;
+        goto done;
+    }
+    if (counter.count != 1) {
+        fprintf(stderr, "expected one terminal in query after gratuitous ARP\n");
+        ok = false;
+        goto done;
+    }
+
+    char query_ip_buf[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &counter.last_record.key.ip, query_ip_buf, sizeof(query_ip_buf))) {
+        fprintf(stderr, "inet_ntop failed for query record\n");
+        ok = false;
+        goto done;
+    }
+    if (strcmp(query_ip_buf, "172.16.1.55") != 0) {
+        fprintf(stderr, "expected query record to reflect target IP, saw %s\n", query_ip_buf);
+        ok = false;
+        goto done;
+    }
+
+done:
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_zero_ip_arp_is_ignored(void) {
+    const int vlan_id = 155;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 16;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            NULL,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    apply_address_update(mgr, tx_kernel_ifindex, "172.16.2.1", 24, true);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a};
+    build_arp_packet(&packet,
+                     &arp,
+                     mac,
+                     "0.0.0.0",
+                     "0.0.0.0",
+                     vlan_id,
+                     4);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 0) {
+        fprintf(stderr, "expected zero events for all-zero ARP, got %zu\n", events.count);
+        ok = false;
+        goto done;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed\n");
+        ok = false;
+        goto done;
+    }
+    if (counter.count != 0) {
+        fprintf(stderr, "expected no terminals after all-zero ARP\n");
+        ok = false;
+        goto done;
+    }
+
+done:
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
 static bool test_probe_failure_removes_terminal(void) {
     const int vlan_id = 200;
     const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
@@ -461,7 +626,7 @@ static bool test_probe_failure_removes_terminal(void) {
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
-    build_arp_packet(&packet, &arp, mac, "198.51.100.42", vlan_id, 11);
+    build_arp_packet(&packet, &arp, mac, "198.51.100.42", "198.51.100.42", vlan_id, 11);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -536,7 +701,7 @@ static bool test_iface_invalid_holdoff(void) {
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x00, 0xde, 0xad, 0xbe, 0xef, 0x01};
-    build_arp_packet(&packet, &arp, mac, "203.0.113.9", vlan_id, 3);
+    build_arp_packet(&packet, &arp, mac, "203.0.113.9", "203.0.113.9", vlan_id, 3);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -625,7 +790,7 @@ static bool test_ifindex_change_emits_mod(void) {
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
-    build_arp_packet(&packet, &arp, mac, "10.10.10.20", vlan_id, 1);
+    build_arp_packet(&packet, &arp, mac, "10.10.10.20", "10.10.10.20", vlan_id, 1);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -638,7 +803,7 @@ static bool test_ifindex_change_emits_mod(void) {
 
     capture_reset(&events);
 
-    build_arp_packet(&packet, &arp, mac, "10.10.10.20", vlan_id, 2);
+    build_arp_packet(&packet, &arp, mac, "10.10.10.20", "10.10.10.20", vlan_id, 2);
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
 
@@ -704,7 +869,7 @@ static bool test_debug_dump_interfaces(void) {
     struct ether_arp arp;
     struct td_adapter_packet_view packet;
     const uint8_t mac[ETH_ALEN] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee};
-    build_arp_packet(&packet, &arp, mac, "203.0.113.20", vlan_id, 5);
+    build_arp_packet(&packet, &arp, mac, "203.0.113.20", "203.0.113.20", vlan_id, 5);
 
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
@@ -797,6 +962,8 @@ int main(void) {
     } tests[] = {
         {"default_log_timestamp", test_default_log_timestamp},
         {"terminal_add_and_event", test_terminal_add_and_event},
+        {"gratuitous_arp_uses_target_ip", test_gratuitous_arp_uses_target_ip},
+    {"zero_ip_arp_is_ignored", test_zero_ip_arp_is_ignored},
         {"probe_failure_removes_terminal", test_probe_failure_removes_terminal},
         {"iface_invalid_holdoff", test_iface_invalid_holdoff},
         {"ifindex_change_emits_mod", test_ifindex_change_emits_mod},

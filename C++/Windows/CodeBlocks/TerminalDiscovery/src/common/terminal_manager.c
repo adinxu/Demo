@@ -1381,7 +1381,31 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     const struct ether_arp *arp = (const struct ether_arp *)packet->payload;
     struct terminal_key key;
     memcpy(key.mac, arp->arp_sha, ETH_ALEN);
-    memcpy(&key.ip.s_addr, arp->arp_spa, sizeof(key.ip.s_addr));
+
+    struct in_addr sender_ip;
+    struct in_addr target_ip;
+    memcpy(&sender_ip.s_addr, arp->arp_spa, sizeof(sender_ip.s_addr));
+    memcpy(&target_ip.s_addr, arp->arp_tpa, sizeof(target_ip.s_addr));
+
+    if (sender_ip.s_addr == 0U && target_ip.s_addr == 0U) {
+        td_log_writef(TD_LOG_DEBUG,
+                      "terminal_manager",
+                      "ignore arp with zero sender/target ip (mac=%02x:%02x:%02x:%02x:%02x:%02x)",
+                      key.mac[0],
+                      key.mac[1],
+                      key.mac[2],
+                      key.mac[3],
+                      key.mac[4],
+                      key.mac[5]);
+        return;
+    }
+
+    struct in_addr effective_ip = sender_ip;
+    if (sender_ip.s_addr == 0U && target_ip.s_addr != 0U) {
+        effective_ip = target_ip; /* Gratuitous ARP uses target IP as authoritative address. */
+    }
+
+    memcpy(&key.ip.s_addr, &effective_ip.s_addr, sizeof(key.ip.s_addr));
 
     size_t bucket = hash_key(&key) % TERMINAL_BUCKET_COUNT;
 

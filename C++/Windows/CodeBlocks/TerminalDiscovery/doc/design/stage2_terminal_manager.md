@@ -44,7 +44,7 @@
 
 ## 主要流程
 ### 报文学习 `terminal_manager_on_packet`
-1. 解析 ARP 报文中的 `arp_sha` 与 `arp_spa` 作为终端 key。
+1. 解析 ARP 报文中的 `arp_sha` 与 `arp_spa` 作为终端 key；当 `arp_spa` 为空（如免费 ARP/ARP Probe）时回退到 `arp_tpa`，避免将 `0.0.0.0` 记录为终端地址；若 `arp_spa` 与 `arp_tpa` 同时为 `0.0.0.0`，判定为异常报文直接丢弃，仅写入调试日志。
 2. 命中已有条目则刷新 `last_seen` 并重置 `failed_probes`；未命中创建新节点。
 4. `apply_packet_binding` 更新 `terminal_metadata` 后调用 `resolve_tx_interface`：
   - 根据 `vlan_iface_format` 生成 `vlanX` 等接口名，利用 `if_nametoindex` 解析出 VLANIF 以便查询地址资源；这些信息用于确定源 IP 与可用性，即便最终发包走物理口。

@@ -64,7 +64,7 @@
 
 ### 阶段 3：报文解码与事件上报（已完成）
 1. ✅ 报文解析：
-   - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；若暂未解析到 ifindex 时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。
+   - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；若暂未解析到 ifindex 时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。针对免费 ARP（sender IP 为空或 0.0.0.0）的情况，明确改用报文 `target IP` 更新终端 IPv4 地址，禁止继续记录无意义的 0.0.0.0；sender/target 同为 0.0.0.0 的报文视为异常并直接丢弃。
    - Realtek 平台结合 MAC 表缓存刷新 `terminal_metadata.ifindex`，若缓存命中失败则触发桥接 API 重拉，确保事件与北向查询对齐整机 ifindex。
    - 依赖 ACL 提供的 VLAN tag 判定终端归属；若地址表查不到对应前缀或无法再构造有效 ARP（例如 VLANIF 被移除 IPv4 或迁移网段），即转入 `IFACE_INVALID`，后续在地址恢复或报文再次到达时重新探测。
 2. ✅ 事件队列：
