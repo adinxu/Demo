@@ -135,6 +135,12 @@ static void handle_command(const char *command,
         return;
     }
 
+    if (strcmp(command, "exit") == 0 || strcmp(command, "quit") == 0) {
+        td_log_writef(TD_LOG_INFO, "terminal_daemon", "CLI requested shutdown");
+        g_should_stop = SIGINT;
+        return;
+    }
+
     if (strcmp(command, "stats") == 0) {
         log_manager_stats(ctx->manager);
         return;
@@ -215,7 +221,7 @@ static void handle_command(const char *command,
     if (strcmp(command, "help") == 0) {
         td_log_writef(TD_LOG_INFO,
                       "terminal_daemon",
-                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | show config | set <option> <value> | help");
+                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | show config | set <option> <value> | exit | quit | help");
         return;
     }
 
@@ -769,7 +775,9 @@ int main(int argc, char **argv) {
                 }
 
                 handle_command(command_buf, &ctx, &runtime_cfg);
-                print_prompt();
+                if (!g_should_stop) {
+                    print_prompt();
+                }
             }
         }
 
