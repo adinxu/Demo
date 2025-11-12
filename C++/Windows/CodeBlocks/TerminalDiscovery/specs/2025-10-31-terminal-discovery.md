@@ -1,0 +1,223 @@
+# 终端发现代理规范
+
+## 问题陈述与背景
+- 交付一个可复用的 C 终端发现代理，能够运行在异构交换机操作系统上（首期锁定 Realtek SDK，后续覆盖 Netforward/Linux 等变体）。
+- 通过过路的二层报文识别终端、维护存活状态，并以最小的特定平台代码将终端状态暴露给交换设备的上层模块。
+- 现有 Realtek 平台已完成 ACL 适配，可持续上送 ARP 报文，不再需要终端发现模块额外确保 copy-to-CPU 能力。
+
+## 目标
+- 通过检查二层控制报文发现终端（当前聚焦 ARP，可扩展至 DHCP 等协议）。
+- 通过主动探测与定时淘汰维护每个终端的生命周期，兼顾访问/聚合口与虚接口的联动。
+- 引入可插拔的适配层，隔离 Realtek 等平台的硬件/内核差异，便于后续拓展至 Netforward、通用 Linux Raw Socket 模式。
+- 提供可编程查询接口和实时增量通知，满足网络管理系统的消费需求。
+- 在 ARM64、MIPS、x86 等不同 CPU 体系和报文收发架构间保持可移植性，并在 Realtek 平台率先完成 300 终端 Demo 验证。
+- 提供可嵌入外部守护进程的初始化入口，满足多平台统一集成和生命周期托管。
+
+## 非目标
+- 本阶段不实现完整的 DHCP/ND 嗅探能力。
+- 不管理三层路由逻辑，也不直接操控 FIB/ARP 表，除非与终端跟踪相关。
+- 不提供 UI/CLI 集成，仅关注后端接口。
+
+## 功能性需求
+1. **终端发现**：仅处理接收到的 ARP 广播、免费 ARP、单播回复等（本机发送的 ARP 已在适配层过滤），按 VLAN/接口识别终端；后续需可扩展至 DHCP 报文。
+2. **保活机制**：每个终端每 120 秒发送一次单播 ARP request；连续三次无响应则删除终端。终端与其首次或最近一次有效报文对应的三层虚接口/VLAN 建立绑定，保活报文必须从该虚接口发出，确保与发现路径保持一致；若该接口缺失可用 IPv4（如接口 down、IP 被删除或迁移至不同网段导致无法拼装 ARP），则视为保活通道失效并进入接口无效流程。
+3. **接口感知**：追踪三层 VLAN 接口生命周期（创建/删除/上下线、IP 变更），接口无效时暂停保活。
+4. **Access/Trunk 逻辑**：当前平台 ACL 已保证送达内核的报文携带真实 VLAN tag，且该 VLAN 必然已在本机存在；因此无需额外查询 Access/Trunk 配置数据，仅依据报文内 VLAN 决定终端归属。仍需在缺失对应 VLANIF 时按三层 Down 逻辑处理。
+5. **拓扑边界场景**：当关联的三层接口 down、VLAN 缺少虚接口或出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）时保留 30 分钟，期间不发送保活；恢复后转入探测态。
+6. **平台适配**：为不同平台提供独立适配器实现，部署时按平台选择单个适配器运行（不在同一进程内并行多个适配器）。
+7. **事件上报**：
+   - 提供实时增量变更通知，注册回调后立即推送发现的终端变化。
+   - 支持查询当前终端表的全量快照，并确保增量上报状态与查询快照一致。
+8. **可配置项**：
+   - 可配置终端保活周期、最大终端数量（200、300、500、1000 等档位）。
+   - 启动时按配置选择唯一的平台适配器；为该适配器定义必要的端口/VLAN 过滤参数。
+9. **守护进程集成**：
+   - 在 `src/main/terminal_main.c` 提供一个默认不被自动调用的初始化函数，供外部守护进程在自身生命周期内显式触发启动；模块自进程启动后常驻，除非宿主进程退出不会主动关闭。
+   - 初始化函数通过显式参数接收宿主进程提供的运行时配置（结构体或等效封装）；在调用 `td_config_to_manager_config` 之前按字段级安全覆盖 `td_runtime_config`，确保不同平台的动态输入被正确合并，并对非法/缺失值返回可诊断的错误。
+   - 不在初始化函数内注册信号处理、命令行参数或帮助信息解析，也不默认开启周期性日志输出，由外部守护进程统一调度。
+   - 初始化完成后默认将事件管线绑定至内置日志回调，保证在未注册北向回调时也能通过日志观察终端变化；外部若需启用增量上报，可调用 `setIncrementReport` 注册唯一的 C++ 回调，内部再由桥接层负责触发 `terminal_manager_set_event_sink` 完成切换。
+   - 初始化成功后需提供只读访问接口直接返回内部 `terminal_manager` 句柄，供嵌入方调用 `terminal_manager_get_stats` 等观测函数；同时额外提供访问接口返回 `app_context` 只读引用，作为后续扩展挂载点。两类接口均禁止外部替换或销毁内部资源。
+10. **调试可视化**：向外暴露一组只读调试函数，用于打印或导出核心数据结构快照（终端哈希桶、接口前缀表、接口绑定表、MAC 查表任务队列、`mac_need_refresh_`/`mac_pending_verify_*` 计数器以及 `mac_locator_version`），支持在不修改运行态状态机的前提下进行调试排障与结果验收。
+
+- **性能**：
+   - 1k 终端负载时单核占用 <10%，并确保在现有硬件 ARP 限速机制基础上仍不丢包。
+   - 清晰量化 200、300、500、1000 终端档位的 CPU/内存曲线，作为不同设备能力的基准值。
+- **能力验证**：在 Realtek 平台先行完成 300 终端规模的 Demo 验证，确认收发链路、保活节奏与上报机制满足指标。
+- **可靠性**：确保无终端泄漏；并发访问需线程安全，接口状态波动时保证状态机一致性。
+- **可移植性**：核心逻辑仅依赖 POSIX 类原语与适配器回调，平台特性封装在适配层。
+- **可观测性**：输出结构化日志（级别-标签-消息），提供探测、响应、过期、队列丢弃、接口波动等计数器。所有保活定时、超时检查必须统一基于单调时钟，确保系统时间回拨或跳变不会影响状态推进。
+      - 默认日志落地应包含标准可读的系统时间戳（wall clock，精确到秒），格式建议为 `YYYY-MM-DD HH:MM:SS`，以便与外部日志对齐；时间戳获取不需要依赖单调时钟，允许受 NTP 校时影响。
+- **可测试性**：提供平台无关的状态机单测，以及基于适配器 mock 的发现/保活/事件上报集成测试。
+
+## 调试与验证接口扩展
+- **输出形态**：新增 `td_debug_writer_t`（`void (*td_debug_writer_t)(void *ctx, const char *line)`）回调类型，并在 C 北向 API 层公开 `td_debug_dump_*` 系列函数；默认提供写入 `FILE*` 的适配器，便于快速将结果重定向至日志或标准输出。
+- **终端哈希快照**：`int td_debug_dump_terminal_table(const td_debug_dump_opts_t *opts, td_debug_writer_t writer, void *ctx);`
+   - 在持有 `terminal_manager->lock` 的读区间内遍历 256 个哈希桶，输出桶索引、元素数量、最大链深、冲突次数。
+   - 每个终端条目打印 MAC、IP、状态、所属 VLAN/ifindex、最近一次收包与探测时间（UTC 秒）、探测失败计数、事件队列挂起标记、绑定前缀 ID。
+   - `opts` 支持按状态、VLAN、ifindex、MAC 前缀过滤，并可开启 `verbose_metrics` 选项附带探测计数与事件统计。
+- **接口前缀表快照**：`int td_debug_dump_iface_prefix_table(td_debug_writer_t writer, void *ctx);`
+   - 输出每个 `iface_prefix_entry` 的 ifindex、IPv4 前缀（CIDR 记法）、掩码长度、引用计数、最近一次写操作时间戳。
+   - 若同一接口存在多个前缀，保持插入顺序并标注主前缀。
+- **接口绑定索引快照**：`int td_debug_dump_iface_binding_table(td_debug_writer_t writer, void *ctx);`
+   - 对 `iface_binding_entry` 打印 ifindex、关联终端数量、链表中首个终端的 MAC、是否包含 `IFACE_INVALID` 条目。
+   - 提供 `expand_terminals` 可选参数，用于展开完整终端列表并指明其所属哈希桶编号。
+- **MAC 查表任务队列**：`int td_debug_dump_mac_lookup_queue(td_debug_writer_t writer, void *ctx);`
+   - 输出当前待执行/执行中的 MAC 查表任务，包括 MAC、目标 VLAN/ifindex、创建时间、重试计数、状态标记。
+   - 同时打印 `mac_need_refresh_` 队列长度、`mac_pending_verify_success`/`mac_pending_verify_failure`/`mac_pending_verify_retry` 等计数器、最长排队时长。
+- **MAC 定位版本号**：`int td_debug_dump_mac_locator_state(td_debug_writer_t writer, void *ctx);`
+   - 输出 `mac_locator_version` 当前值、最近一次递增的触发原因（新增终端、查表成功、验证失败等）、关联终端数量。
+   - 若无待处理任务仍需输出 baseline，便于比对上下游版本。
+- **线程安全**：所有 `td_debug_dump_*` 函数仅在内部短时间持有读锁或复用管理器互斥，严禁在锁持有期间执行阻塞 IO；若调用方 `writer` 报错（通过上下文标记或 errno），需立即释放锁并返回负值。
+- **跨语言桥接**：C++ 北向层提供轻量包装，可将调试输出收集为 `std::string` 或写入 `std::ostream`，同时暴露 `TerminalDebugSnapshot` 帮助上层工具复用；保证新增 API 通过 `extern "C"` 导出并保持稳定 ABI。
+- **文档示例**：在 `doc/` 目录补充调试接口指南，给出典型调用示例、样例输出格式与排障建议；测试中覆盖最小/过滤/错误路径。
+
+## 架构概览
+- **核心服务层**：处理终端表、定时器、状态转换和报表生成的跨平台模块。
+- **平台适配接口（PAI）**：抽象报文收发、接口事件等平台差异。
+   - 必备回调：`adapter_init`、`register_packet_rx`、`send_arp`、`query_iface`、`log_write`；构建或启动期间确定单个适配器实例并贯穿运行期。
+   - 若后续平台报文携带 CPU tag，则可从中直接解析整机 ifindex；Realtek 平台事件统一上报 ifindex（仍使用 32 位无符号整数），不再使用 port/lport 表述。
+   - 参考实现：`realtek_adapter`（原生 Raw Socket + BPF）、`netforward_adapter`、`linux_rawsock_adapter`。
+   - Realtek 适配器在初始化时直接监听物理口（如 `eth0`）收包，依赖平台已有 ACL 规则保障 ARP 上送；上行报文通过 VLAN 虚接口（如 `vlan1`）发出。
+- **事件总线**：内部队列负责聚合终端变更并立即投递给上报子系统。
+- **API 接口**：提供 `terminal_query_all`、`terminal_subscribe`、`terminal_config_set` 等 C API；内部实现需兼容外部团队计划提供的 C++ API。
+
+## 参考实现提示
+- **Realtek 参考代码约束**：
+   - 可参考 `src/ref/realtek/loop_protect.c` 的线程、互斥量等 OSA 抽象，但实现可自行选择 POSIX 线程/锁等通用原语，无需强绑 OSA 框架。
+   - 复用 Raw Socket + BPF 过滤模型，确保适配器初始化时设置专用过滤器以截获目标广播报文。
+   - 事件循环可按功能设计（如 epoll、poll 或自定义调度），不强制依赖 `loop_protect_epoll_loop` 实现。
+   - 报文发送推荐直接在物理口（例如 `eth0`）的 Raw Socket 上封装 802.1Q 头部完成 VLAN tag 后下发，无需为不同 VLAN 反复绑定对应的虚接口；若目标平台不允许用户态插入 VLAN tag，再回退到绑定虚接口（例如 `vlan1`）的模式。
+   - 报文接收侧需监听物理网卡 `eth0`，结合 BPF 过滤筛选关心的报文。
+   - 在 Realtek 平台使用 Raw Socket 绑定 `eth0` 收包时，`recvmsg` 返回的 `ifindex` 恒为 `eth0` 的索引；该值仅用于日志或入向定位，不能直接用于选择后续 ARP 发送接口，保活发包仍需依据终端绑定的 VLAN 信息。
+   - Realtek 平台无法依赖 CPU tag 直接获得整机 ifindex，需要借助外部团队提供的 C++ 封装拉取整机二层转发表，按终端 MAC 查找逻辑口，再结合接口类型换算出 ifindex 用于事件上报与北向 `TerminalInfo`。
+   - 底层 `libswitchapp.so` 的调用（例如 `createSwitch`、`getDevUcMacAddress`）统一由外部团队提供的桥接模块完成，现已交付并在 `src/demo/td_switch_mac_demo.c` 中完成联调验证。模块在装载阶段自行完成一次性 `createSwitch` 初始化并缓存返回的 `SwitchDev*`；对外至少导出两个 C 接口：`int td_switch_mac_snapshot(SwUcMacEntry *buf, uint32_t *out_count)`（命名可调整）与 `int td_switch_mac_get_capacity(uint32_t *out_capacity)`。后者仅调用缓存的 `SwitchDev*` 上的 `getDevMacMaxSize` 获取设备可容纳的最大 MAC 表项数；前者基于同一 `SwitchDev*` 调用 `getDevUcMacAddress` 获取当前快照，其中 `out_count` 仅作为**纯输出参数**携带实际条目数量，调用前无需填充任何容量提示，也不会被 SDK 视作“请求条目数”。实现可参考 `src/ref/realtek/mgmt_switch_mac.c` 中 `getDevMacMaxSize`/`getDevUcMacAddress` 的使用方式，同时确保外部模块内部负责引用计数与线程安全；需注意 Realtek SDK 的 `getDevUcMacAddress` 不会校验缓冲区长度，因此桥接模块本身不得在 `td_switch_mac_snapshot` 内部分配临时内存，而是依赖调用方先通过 `td_switch_mac_get_capacity` 获得容量后预先准备（并可静态复用）`SwUcMacEntry` 缓冲区；桥接模块仅在该缓冲区内填充数据，并保证返回的条目数量不超过调用方提供的容量。终端发现进程直接复用 SDK 定义的 `SwUcMacEntry` 结构，不再为兼容而进行结构转换，仅对 `attr` 等字段值进行解释。开发容器中由于无法引入 Realtek SDK 对应的 `libswitchapp.so` 及依赖环境，默认提供打桩实现覆盖上述两个接口：
+       - 打桩实现位于工程源码中，以弱符号（`__attribute__((weak))`）形式导出 `td_switch_mac_get_capacity`/`td_switch_mac_snapshot`，返回固定容量（默认 1024）与可预测的若干示例条目；真实桥接模块参与链接时可自动覆盖弱符号，无需修改调用方。
+       - 打桩逻辑将所有日志写入标准输出，并允许通过环境变量（例如 `TD_SWITCH_MAC_STUB_COUNT`）调整返回条目的数量；调用方传入的缓冲区不足或参数非法时会返回负错误码并打印提示，便于本地调试。
+       - 当 SDK 真正接入生产环境时，需在构建脚本中确保真实桥接对象或静态库排在链接顺序前端（或直接禁用打桩文件编译），以便覆盖弱符号并恢复与外部模块一致的行为。
+   - `td_switch_mac_demo_dump` 已通过上述桥接接口完成端到端验证，后续 ifindex 获取策略与同步流程应以该 demo 的数据流为基准：终端发现模块通过 demo 辅助逻辑解析 MAC→ifindex 映射，并在核心实现中复用相同的缓冲区及容量缓存策略，确保与外部桥接模块的调用约定一致。
+   - 桥接模块由外部团队以 C++ 源文件形式交付，与终端发现项目一同编译；为降低额外拷贝与内存占用，`td_switch_mac_snapshot` 直接返回 SDK 定义的 `SwUcMacEntry` 缓冲区，由调用方按照 `td_switch_mac_get_capacity` 预留的条目上限复用该结构；终端发现进程直接依赖 `SwUcMacEntry` 布局，在编译期包含必要的对齐定义，并通过文档约定补充字段语义。
+   - 交叉编译建议使用 `mips-rtl83xx-linux-` 工具链前缀（如 `mips-rtl83xx-linux-gcc`），保持与现网 Realtek 平台环境一致；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
+   - Realtek 适配器的 MAC 定位接口必须严格区分“缓存尚未就绪/刷新失败”与“未在 MAC 表中命中”两类场景：
+      - 缓存正在刷新、强制刷新失败或尚未初始化时返回 `TD_ADAPTER_ERR_NOT_READY`，终端管理器据此保持队列等待下一轮版本更新；
+      - 缓存可用但未命中目标 MAC/VLAN 时返回 `TD_ADAPTER_ERR_NOT_FOUND`，同时输出 `ifindex=0` 并保留当前版本号，禁止使用 `NOT_READY` 触发重复刷新；
+      - 相关语义需在 `realtek_mac_locator_lookup` 与后续桥接实现中保持一致，确保 `mac_need_refresh` 队列不会因错误码混用而无限膨胀。
+- **北向 API 约束**：
+   - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
+    - 需兼容外部团队既定的 C++ 类型定义：
+   - `struct TerminalInfo { std::string mac; std::string ip; uint32_t ifindex; ModifyTag tag; };`
+   - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
+   - `typedef void IncReportCb(const MAC_IP_INFO &info);`
+    - 导出函数接口保持如下签名：
+   - `int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo);`
+       - `int setIncrementReport(IncReportCb cb);`
+   - 增量回调载荷包含 MAC、IP、ifindex 与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
+   - C 入口层通过 `extern "C"` 封装桥接至 C++ 实现，禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
+   - `MAC_IP_INFO` 中元素的扩展字段若需新增，必须保持向后兼容并在接口文档中声明。
+   - `setIncrementReport` 只允许在初始化阶段调用一次，再次调用时必须返回错误码提醒调用方重复注册。
+   - 北向桥接提供 `terminal_northbound_attach_default_sink`，在未注册业务回调时为管理器挂接默认日志 sink；调用方若后续调用 `setIncrementReport`，桥接层会替换事件管线并开始推送增量数据。
+   - 模块无需维护用于重置上报状态的单例指针；回调注册成功后保持实时推送行为即可。
+   - 若回调异常或违反非阻塞约定，模块需记录结构化日志，并在必要时触发一次空 `MAC_IP_INFO` 的告警回调提醒上层处理。
+
+## 详细行为
+- **初始化与嵌入**：
+   1. 在 `src/main/terminal_main.c` 定义守护进程可调用的初始化函数（命名遵循 `terminal_discovery_*` 约定），函数默认不会被 `main` 入口主动调用，需由宿主进程在自身启动阶段显式触发。
+   2. 初始化函数读取 `td_runtime_config` 默认值后，读取传入的显式参数结构体，对其中合法字段应用覆写，再调用 `td_config_to_manager_config` 生成最终运行配置；每个字段的合并需具备边界检查和缺省回退。
+   3. 初始化函数内仅负责构建 `terminal_manager`、选择适配器并启动核心线程，不注册信号处理器、不解析命令行参数，也不设置周期性日志输出；宿主进程如需这些能力需自行实现。
+   4. 初始化完成后由北向桥接调用 `terminal_northbound_attach_default_sink` 绑定默认日志回调，保证外部未注册增量上报时仍能通过日志观察终端事件；当北向调用 `setIncrementReport(cb)` 时，桥接层负责替换事件 sink 并将批次推送给该回调。
+   5. 默认日志回调实现位于 C++ 桥接层，内置格式保持 `event=<TAG> mac=<MAC> ip=<IP> ifindex=<IDX>` 输出，支持 `setIncrementReport` 运行期在“仅日志”与“业务上报”模式之间切换；若外部未再次注册，事件管线维持最新一次回调配置。
+   6. 模块在守护进程生命周期内保持运行；停机与资源回收由宿主进程负责，通常与进程退出同生共死。
+- **接口管理**：
+   1. 仅关心三层虚接口（VLANIF）的上下线、IP 变更；二层 access/trunk 口的物理 up/down 不触发状态变更。
+   2. 收到 Access 口报文、且无对应虚接口时终端保持发现状态但不保活；Trunk 口报文无需再次校验 permit 集合（ACL 已确保 VLAN 合法），仅在缺失对应 VLANIF 时按无虚接口逻辑处理。
+   3. 需监测虚接口 IP 的增删改（可通过 Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调）；核心引擎维护“可用接口地址表”（`ifindex -> {prefix}`）。该表实现为哈希表或动态数组，元素保存接口索引、前缀长度、网络地址（CIDR 表示）。
+   4. 为避免 IP 事件触发全量扫描，按 `ifindex` 维护反向索引（`ifindex -> terminal_entry list`）。索引可采用链表头数组或哈希表，节点即 `terminal_entry` 指针，维护时确保多重注册去重。`resolve_tx_interface` 成功后在索引中登记；若接口当前尚未出现在地址表或终端 IP 未命中前缀，则判定绑定失败，不会写入索引。接口地址集变化时仅遍历该 `ifindex` 对应终端并设为 `IFACE_INVALID`。
+   5. 地址表与反向索引的读写均在持有 `terminal_manager.lock` 时进行；外部事件处理（Netlink 回调）进入核心引擎后需先获取此锁，保证与 `resolve_tx_interface`、终端状态机操作不存在竞态。为降低更新阻塞，可在锁内完成结构更新后再脱锁触发终端状态变更/事件队列。
+- **报文路径**：
+    1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
+    2. 引擎归一化 VLAN/接口上下文，更新或创建 `terminal_entry` 状态，并入队变更事件；Realtek 平台默认收包不携带 CPU tag。处理免费 ARP（sender IP 为 0.0.0.0 或缺省）的场景时，以报文中的 target IP 作为终端 IPv4 地址来源，禁止继续记录 0.0.0.0 作为终端地址；sender/target 同时为 0.0.0.0 的异常报文应直接丢弃并写日志。
+   3. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 ifindex（无论来自 CPU tag 还是外部查询），并据此完成事件变更检测；保活发包仍基于内核接口信息。
+     4. 发送路径依据终端最近一次有效报文关联的三层上下文构造 ARP request，在用户态封装 `ethhdr + vlan_header + ether_arp` 后直接通过物理接口（如 `eth0`）发送；无需为每个 VLAN 重新绑定虚接口，只要写入正确的 VLAN ID 即可保持与发现路径一致。
+        - 若目标平台拒绝用户态插入 VLAN tag，则回退到绑定虚接口（如 `vlan1`）的发送方式。Stage0 Raw Socket demo 已验证 Realtek 平台支持物理口带 VLAN tag 的直出策略，需在 demo 与适配器实现中默认采用该模式并保留回退逻辑。
+     5. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
+- **终端状态机**：
+   - `(收到报文) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`。
+         - `ACTIVE → IFACE_INVALID`：接口 down、出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）或 VLAN 无虚接口；`IFACE_INVALID` 保留 30 分钟后删除。
+   - `IFACE_INVALID → PROBING`：接口 up、IP 改为同网段或新增虚接口时复活。
+   - `PROBING → ACTIVE`：收到回应即恢复活跃。
+- **保活循环**：
+   - 独立定时线程负责保活与过期扫描；Realtek 适配器需按 100ms 间隔分散发包，防止突发。
+   - 发送保活前必须确认终端仍绑定可用的三层虚接口/VLAN，并沿着发现报文的接口发送 ARP（若接口失效则转入 `IFACE_INVALID` 处理流程）。
+   - 探测失败计数递增；第三次失败后移除条目并发出删除事件。
+- **事件上报**：
+   - 增量事件在内部队列中形成批次后立即分发；终端新增、删除、属性变更（仅 ifindex 发生变化时产生 `MOD`）分别入队。
+   - 事件载荷使用 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag），供外层转换为 `MAC_IP_INFO`。
+   - 全量查询返回当前快照，原始顺序由内部遍历决定；需要排序的上层可自行处理。
+- **并发模型**：
+   - 终端核心数据使用读写锁保护；定时线程与报文线程的写操作通过串行化任务队列执行。
+   - 上报线程消费事件队列并即时批量下发通知；查询与配置接口需串行化访问，避免竞态。
+
+## 数据结构模型
+- `terminal_manager_t`：持有终端链表/堆、互斥锁、定时线程、运行标志等；负责调度保活与对外接口。
+- `terminal_entry_t`：记录 MAC、IP、状态、上次收到报文时间、上次探测时间、探测失败计数、平台元数据（含 VLAN、ifindex 等）、链表指针。
+- `metadata_t`：封装平台相关字段（如 ifindex、vlan 等），便于不同适配器扩展。
+- `iface_address_table`：哈希表 `ifindex -> prefix_list`，每个元素包含 IPv4 网络地址与掩码长度；所有修改在 `terminal_manager.lock` 下完成。
+- `iface_binding_index`：反向索引 `ifindex -> terminal_entry*` 链表，用于在接口前缀变更时快速定位受影响终端。
+- 支持单链表遍历与时间轮/堆双实现，依据目标平台性能选择。
+- `td_debug_dump_context_t`：封装调试导出会话上下文（过滤条件、时间戳缓存、累计输出行数等），供各 `td_debug_dump_*` 函数复用，确保输出格式与生命周期一致。
+
+## 任务拆解
+0. **Realtek Demo 验证**
+   - 使用网络测试仪构造至少 300 个虚拟终端，验证现有 Raw Socket 收发链路、保活探测与实时上报流程满足性能与稳定性要求。
+   - 记录测试方法、日志与瓶颈观察结论，作为后续方案设计与编码的输入。
+1. **平台适配框架**
+   - 定义 `adapter_api.h` 接口及默认 POSIX 工具。
+   - 实现 Realtek 适配器骨架：使用可移植的线程/锁与事件循环抽象（POSIX 或平台特有实现均可），结合 Raw Socket+BPF 过滤；发送路径在 VLAN 虚接口（如 `vlan1`）上通过 Raw Socket 构造并下发 ARP 请求，无需使用 SDK 报文发送库。
+2. **终端核心引擎**
+   - 编写终端数据结构、生命周期状态机与锁策略。
+   - 集成时间轮或小根堆调度器，驱动探测与过期。
+3. **报文解码模块**
+   - 解析 ARP 帧，提取 VLAN/接口上下文，做输入校验并通知发现引擎。
+   - 预留扩展挂钩，以支持未来的 DHCP。
+4. **上报与 API 层**
+   - 实现实时的变更通知队列。
+   - 提供同步查询接口，返回的快照保持遍历顺序。
+   - 定义输出载荷契约：内部 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag）转换为携带 `tag` 字段的 `MAC_IP_INFO` 单向量，并撰写桥接文档。
+5. **配置与 CLI 钩子**
+   - 提供配置结构体/环境加载器，用于适配器选择、探测间隔、终端阈值。
+6. **日志与遥测**
+   - 集成分级日志宏；暴露探测、响应、过期等计数器。
+7. **测试体系**
+   - 编写状态机单测（ACTIVE↔PROBING↔IFACE_INVALID）。
+   - 构建适配器 mock 测试覆盖发现、探测成功/失败、接口波动等场景。
+   - 搭建性能基准，使用合成事件验证 1000 终端的时间行为。
+8. **文档**
+   - 输出开发者指南，涵盖适配器契约、构建说明与测试执行方式。
+9. **调试接口实现**
+   - 实现 `td_debug_writer_t` 与默认 `FILE*` 包装函数。
+   - 编写 `td_debug_dump_terminal_table`、`td_debug_dump_iface_prefix_table`、`td_debug_dump_iface_binding_table`、`td_debug_dump_mac_lookup_queue`、`td_debug_dump_mac_locator_state` 及其过滤器逻辑，确保在 `terminal_manager` 锁保护下输出一致快照。
+   - 在单测与集成测试中覆盖正常路径、过滤参数、错误回调路径；补充 `doc/` 调试指南示例代码。
+
+## 验收准则
+- 发现状态机与定时驱动逻辑的单测全部通过，并覆盖 `ACTIVE ↔ PROBING ↔ IFACE_INVALID`、终端保留 30 分钟、接口恢复场景。
+- 基于 mock 的集成测试覆盖发现、保活成功/失败、接口上下线恢复、实时批量、Trunk/Access VLAN 判定等场景。
+- 实验环境验证 Realtek 适配器的 ARP 收发链路，确认 VLAN tag 解析、Raw Socket 发送与 100ms 发包分散策略有效。
+- 在参考硬件上进行 1000 终端的 CPU 剖析，满足性能目标，并形成 200/300/500/1000 档位的资源报告。
+- 提供 Realtek 平台 300 终端 Demo 验证报告，包含测试步骤、网络测试仪配置、日志与瓶颈分析结论。
+- 日志为结构化格式，计数器可通过调试接口或日志输出查看。
+- 在 C/C++ 混合编译环境下完成 `getAllTerminalInfo` 与 `setIncrementReport` 接口的联调验收，验证全量查询完整性、增量回调实时性与异常保护行为，并确认回调输出仅包含 `mac`、`ip`、`ifindex` 字段。
+- 调试导出函数在运行态可输出终端哈希桶、接口前缀表、接口绑定索引、MAC 查表队列、`mac_need_refresh_`/`mac_pending_verify_*` 计数及 `mac_locator_version` 的一致快照；单测覆盖过滤与错误路径，文档示例与实际输出一致。
+
+## 替代方案评估
+- 为每个终端创建线程执行保活（因扩展性差而否决）。
+- 利用内核态 eBPF 实现 ARP 嗅探（因可移植性成本高而暂缓）。
+
+## 未决问题
+- Realtek 平台上，当 trunk 口混合存在未建虚接口的 VLAN 时的报文行为需在实验室确认。
+- 无 VLANIF 时广播/单播 ARP copy-to-CPU 行为已由平台 ACL 保障，终端发现模块无需额外确认。
+- Netforward、通用 Linux 平台的接口事件获取机制尚未确定，需要在适配器设计时补齐。
+- 若未来 `TerminalInfo` 需要扩展字段，需与系统集成团队确认版本策略并保持 `MAC_IP_INFO` 兼容性。
+
+## 发布与回退策略
+- 通过运行时配置开关控制特性，禁用适配器初始化即可回退。
+- 回退时停止服务并移除钩子，运行态缓存之外无持久状态。
+- 遥测：监控探测计数与上报队列长度，以捕捉潜在回归。
