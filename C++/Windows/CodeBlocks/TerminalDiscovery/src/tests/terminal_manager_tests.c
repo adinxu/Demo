@@ -474,6 +474,13 @@ static bool test_terminal_add_and_event(void) {
         goto done;
     }
 
+    if (events.records[0].prev_ifindex != 0U) {
+        fprintf(stderr, "expected prev_ifindex 0 for ADD event, got %u\n",
+                events.records[0].prev_ifindex);
+        ok = false;
+        goto done;
+    }
+
     struct query_counter counter = {0};
     if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
         fprintf(stderr, "query_all failed\n");
@@ -880,12 +887,19 @@ static bool test_ifindex_change_emits_mod(void) {
 
     bool ok = true;
     if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_MOD) {
-    fprintf(stderr, "expected MOD event on ifindex change, got %zu\n", events.count);
+        fprintf(stderr, "expected MOD event on ifindex change, got %zu\n", events.count);
         ok = false;
         goto done;
     }
     if (events.records[0].ifindex != 2U) {
         fprintf(stderr, "expected ifindex 2 in MOD event, got %u\n", events.records[0].ifindex);
+        ok = false;
+        goto done;
+    }
+
+    if (events.records[0].prev_ifindex != 1U) {
+        fprintf(stderr, "expected prev_ifindex 1 in MOD event, got %u\n",
+                events.records[0].prev_ifindex);
         ok = false;
         goto done;
     }

@@ -145,7 +145,8 @@ static void event_queue_push(struct terminal_event_queue *queue, struct terminal
 static void queue_event(struct terminal_manager *mgr,
                         terminal_event_tag_t tag,
                         const struct terminal_key *key,
-                        const struct terminal_metadata *meta);
+                        const struct terminal_metadata *meta,
+                        uint32_t prev_ifindex);
 static void queue_add_event(struct terminal_manager *mgr,
                             const struct terminal_entry *entry);
 static void queue_remove_event(struct terminal_manager *mgr,
@@ -541,7 +542,8 @@ static void free_event_queue(struct terminal_event_queue *queue) {
 static void queue_event(struct terminal_manager *mgr,
                         terminal_event_tag_t tag,
                         const struct terminal_key *key,
-                        const struct terminal_metadata *meta) {
+                        const struct terminal_metadata *meta,
+                        uint32_t prev_ifindex) {
     if (!mgr || !mgr->event_cb || !key) {
         return;
     }
@@ -557,6 +559,7 @@ static void queue_event(struct terminal_manager *mgr,
     } else {
         node->record.ifindex = 0U;
     }
+    node->record.prev_ifindex = prev_ifindex;
     node->record.tag = tag;
     event_queue_push(&mgr->events, node);
 }
@@ -566,7 +569,7 @@ static void queue_add_event(struct terminal_manager *mgr,
     if (!mgr || !entry) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, &entry->meta);
+    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, &entry->meta, 0U);
 }
 
 static void queue_remove_event(struct terminal_manager *mgr,
@@ -574,7 +577,7 @@ static void queue_remove_event(struct terminal_manager *mgr,
     if (!mgr || !snapshot) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, &snapshot->meta);
+    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, &snapshot->meta, 0U);
 }
 
 static void queue_modify_event_if_ifindex_changed(struct terminal_manager *mgr,
@@ -588,7 +591,11 @@ static void queue_modify_event_if_ifindex_changed(struct terminal_manager *mgr,
     if (before_ifindex == after_ifindex) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+    queue_event(mgr,
+                TERMINAL_EVENT_TAG_MOD,
+                &entry->key,
+                &entry->meta,
+                before_ifindex);
 }
 
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr) {
@@ -1318,7 +1325,11 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
         entry->meta.ifindex = ifindex;
         entry->meta.mac_view_version = version;
         if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
-            queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+            queue_event(mgr,
+                        TERMINAL_EVENT_TAG_MOD,
+                        &entry->key,
+                        &entry->meta,
+                        before_ifindex);
         }
         pthread_mutex_unlock(&mgr->lock);
         return;
@@ -1333,7 +1344,11 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
             }
         }
         if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
-            queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+            queue_event(mgr,
+                        TERMINAL_EVENT_TAG_MOD,
+                        &entry->key,
+                        &entry->meta,
+                        before_ifindex);
         }
     } else {
         if (rc == TD_ADAPTER_ERR_NOT_READY) {
@@ -1987,6 +2002,7 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
                 memcpy(records[idx].key.mac, entry->key.mac, ETH_ALEN);
                 records[idx].key.ip = entry->key.ip;
                 records[idx].ifindex = entry->meta.ifindex;
+                records[idx].prev_ifindex = 0U;
                 records[idx].tag = TERMINAL_EVENT_TAG_ADD;
             }
             ++idx;

@@ -71,6 +71,7 @@ typedef enum {
 typedef struct terminal_event_record {
     struct terminal_key key;
     uint32_t ifindex; /* 0 when unknown; logical port identifier */
+    uint32_t prev_ifindex; /* 0 when unavailable; previous logical port for MOD events */
     terminal_event_tag_t tag;
 } terminal_event_record_t;
 

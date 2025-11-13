@@ -68,13 +68,19 @@
    - Realtek 平台结合 MAC 表缓存刷新 `terminal_metadata.ifindex`，若缓存命中失败则触发桥接 API 重拉，确保事件与北向查询对齐整机 ifindex。
    - 依赖 ACL 提供的 VLAN tag 判定终端归属；若地址表查不到对应前缀或无法再构造有效 ARP（例如 VLANIF 被移除 IPv4 或迁移网段），即转入 `IFACE_INVALID`，后续在地址恢复或报文再次到达时重新探测。
 2. ✅ 事件队列：
-   - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
+   - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/ifindex/prev_ifindex + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
    - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。
 3. ✅ 北向接口：
    - 新增 `terminal_manager_set_event_sink`、`terminal_manager_query_all`、`terminal_manager_flush_events`，由本项目导出 `getAllTerminalInfo`/`setIncrementReport`，外部团队提供非阻塞的 `IncReportCb`。
-   - 查询阶段生成 `terminal_event_record_t` 数组后脱锁回调；订阅阶段在初始化时注册后即刻推送首批事件，并在桥接层将记录映射为携带 `ifindex` 与 `tag` 字段的 `MAC_IP_INFO` 单向量。
+   - 查询阶段生成 `terminal_event_record_t` 数组后脱锁回调；订阅阶段在初始化时注册后即刻推送首批事件，并在桥接层将记录映射为携带 `ifindex/prev_ifindex` 与 `tag` 字段的 `MAC_IP_INFO` 单向量。
 4. ✅ 文档：
    - `doc/design/stage3_event_pipeline.md` 说明事件链路设计、实时上报策略、关键数据结构与并发模型，便于后续维护与扩展。
+5. ✅ 事件字段升级：
+   - 在 `terminal_manager` 内部记录端口切换时的 `prev_ifindex`，并在 `queue_event`/`terminal_manager_query_all` 输出结构中暴露该字段。
+   - 扩展 `terminal_event_record_t` 及相关结构以携带 `prev_ifindex`，在 `MOD` 事件时提供旧端口信息；更新 `MAC_IP_INFO`/`TerminalInfo` 桥接层映射与增量回调打桩，确保非 `MOD` 事件旧端口置 0。
+   - 调整 `getAllTerminalInfo` 快照与查询路径，保证历史端口字段在全量输出中同步可见，并与事件载荷保持一致。
+   - 扩展 `terminal_manager_tests`、`terminal_integration_tests` 覆盖端口切换场景，验证增量回调与全量查询同时携带新旧 ifindex。
+   - 更新设计/接口文档与示例，通知北向团队完成回调消费方兼容性验证。
 
 ### 阶段 4：配置、日志与文档（已完成）
 1. ✅ 配置体系：扩展 `td_config` 支持终端保活间隔、失败阈值、最大终端数量等参数；引擎统一从配置体系读取，暂不依赖环境变量。
@@ -87,7 +93,7 @@
    - ✅ 已实现日志时间戳断言（`test_default_log_timestamp`），通过重定向标准错误验证默认 sink 输出格式。
 2. ✅ 集成测试：新增 `terminal_integration_tests`，基于打桩 netlink/ARP 流程验证 `ADD/DEL` 事件、统计数据和重复注册保护。
 3. ✅ 北向测试：
-   - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex` 数值）与重复注册告警。
+   - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex/prev_ifindex` 数值）与重复注册告警。
    - 后续若需并发访问覆盖，可在现有桩环境扩展多线程情景。
 4. ✳️ 打桩测试扩展方向：
    - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
@@ -114,11 +120,12 @@
 3. ✅ 更新北向 C++ 桥接，提供面向 `std::string`/`std::ostream` 的轻量封装及 `TerminalDebugSnapshot` 工具类，便于外部守护进程在不中断主流程情况下获取快照；同时新增示例代码演示如何注册回调与调用调试接口。
 4. ✅ 扩展单元与集成测试：新增针对过滤参数、错误回调、空数据集与大规模哈希桶的断言；在现有测试框架中注入打桩 `writer` 捕获输出并校验关键字段。补充 `doc/` 下调试接口指南，记录常见排障场景与示例输出。
 
-### 阶段 8：启动阶段地址表同步（待执行）
+### 阶段 8：启动阶段地址表同步（已完成）
 1. ⏳ 审核 `terminal_netlink`、`terminal_manager` 现有初始化流程及 `iface_address_table`/`iface_binding_index` 结构，明确首批接口地址注入位置与锁保护策略。
 2. ⏳ 实现 `td_iface_address_table_sync_initial()`：优先使用 Netlink `RTM_GETADDR` dump 获取当前 IPv4 地址表，失败时回退 `getifaddrs`，并复用增量更新解析代码，确保写入时持有管理器锁。
-3. ⏳ 在管理器/适配器启动序列中调用初次同步；若抓取失败，记录结构化告警并立即维持终端处于既有 `IFACE_INVALID` 判定路径，同时注册基于 `terminal_manager_worker` 的周期重试钩子，待重试成功后补齐地址表并触发一次接口检查。
-4. ⏳ 扩展单元/集成测试，覆盖初次同步成功、抓取失败保持 `IFACE_INVALID`、重试成功后恢复保活等场景，确保日志与状态转移符合规范。
+3. ✅ 在管理器/适配器启动序列中调用初次同步；若抓取失败，记录结构化告警并立即维持终端处于既有 `IFACE_INVALID` 判定路径，同时注册基于 `terminal_manager_worker` 的周期重试钩子，待重试成功后补齐地址表并触发一次接口检查。
+4. ✅ 扩展单元/集成测试，覆盖初次同步成功、抓取失败保持 `IFACE_INVALID`、重试成功后恢复保活等场景，确保日志与状态转移符合规范。
+
 
 ## 依赖与风险
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。

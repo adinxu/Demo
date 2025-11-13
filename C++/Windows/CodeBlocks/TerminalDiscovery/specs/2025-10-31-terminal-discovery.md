@@ -28,6 +28,7 @@
 7. **事件上报**：
    - 提供实时增量变更通知，注册回调后立即推送发现的终端变化。
    - 支持查询当前终端表的全量快照，并确保增量上报状态与查询快照一致。
+   - 当终端因端口变更触发 `MOD` 事件时，增量载荷需同时携带新旧 ifindex；其余事件类型旧端口值填 0 作为占位，便于北向通用处理。
 8. **可配置项**：
    - 可配置终端保活周期、最大终端数量（200、300、500、1000 等档位）。
    - 启动时按配置选择唯一的平台适配器；为该适配器定义必要的端口/VLAN 过滤参数。
@@ -104,13 +105,13 @@
 - **北向 API 约束**：
    - 本项目提供 `getAllTerminalInfo` 与 `setIncrementReport` 的 C 导出实现，对外暴露为稳定 ABI；外部团队实现 `IncReportCb` 并承诺在被调用时不阻塞。
     - 需兼容外部团队既定的 C++ 类型定义：
-   - `struct TerminalInfo { std::string mac; std::string ip; uint32_t ifindex; ModifyTag tag; };`
+   - `struct TerminalInfo { std::string mac; std::string ip; uint32_t ifindex; uint32_t prev_ifindex; ModifyTag tag; };`
    - `typedef std::vector<TerminalInfo> MAC_IP_INFO;`
    - `typedef void IncReportCb(const MAC_IP_INFO &info);`
     - 导出函数接口保持如下签名：
    - `int getAllTerminalInfo(MAC_IP_INFO &allTerIpInfo);`
        - `int setIncrementReport(IncReportCb cb);`
-   - 增量回调载荷包含 MAC、IP、ifindex 与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
+   - 增量回调载荷包含 MAC、IP、ifindex、prev_ifindex 与变更标签，对应内部 `terminal_event_record_t` 的 `ADD/DEL/MOD` 标签；当标签为 `MOD` 时必须提供非 0 的 `prev_ifindex` 指出端口原值，其余标签下该字段填 0；调用侧需按标签填充 `MAC_IP_INFO` 中元素的 `tag` 字段。
    - C 入口层通过 `extern "C"` 封装桥接至 C++ 实现，禁止跨 ABI 抛出异常，所有异常在桥接层内部捕获并写日志。
    - `MAC_IP_INFO` 中元素的扩展字段若需新增，必须保持向后兼容并在接口文档中声明。
    - `setIncrementReport` 只允许在初始化阶段调用一次，再次调用时必须返回错误码提醒调用方重复注册。
@@ -150,7 +151,7 @@
    - 探测失败计数递增；第三次失败后移除条目并发出删除事件。
 - **事件上报**：
    - 增量事件在内部队列中形成批次后立即分发；终端新增、删除、属性变更（仅 ifindex 发生变化时产生 `MOD`）分别入队。
-   - 事件载荷使用 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag），供外层转换为 `MAC_IP_INFO`。
+   - 事件载荷使用 `terminal_event_record_t`（MAC/IP/ifindex/prev_ifindex + ModifyTag），其中 `prev_ifindex` 记录端口变更前的值，仅在 `MOD` 事件有效，其余事件填 0 以维持结构一致，供外层转换为 `MAC_IP_INFO`。
    - 全量查询返回当前快照，原始顺序由内部遍历决定；需要排序的上层可自行处理。
 - **并发模型**：
    - 终端核心数据使用读写锁保护；定时线程与报文线程的写操作通过串行化任务队列执行。

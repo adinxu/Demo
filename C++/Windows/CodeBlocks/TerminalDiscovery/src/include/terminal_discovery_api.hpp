@@ -21,6 +21,7 @@ struct TerminalInfo {
     std::string mac;
     std::string ip;
     std::uint32_t ifindex;
+    std::uint32_t prev_ifindex;
     ModifyTag tag;
 };
 

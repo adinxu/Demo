@@ -143,7 +143,7 @@ flowchart TD
     - `terminal_metadata.ifindex` 与 `mac_view_version` 存储最近一次 MAC 表查表结果，`mac_refresh_enqueued/mac_verify_enqueued` 标志避免重复排队。
   - 缓存最近一次可用的发包上下文：`tx_iface/tx_kernel_ifindex`（仅在需要回退到 VLAN 虚接口时填充）以及 `tx_source_ip`（默认取自可用 VLANIF 的 IPv4，供物理口发包使用）。
   - `terminal_event_record_t`
-    - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。
+    - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。结构包含 `ifindex` 与 `prev_ifindex`，其中 `prev_ifindex` 仅在 `MOD` 事件中携带端口切换前的逻辑索引，其余事件固定为 `0`。
     - 仅当外部注册了事件回调时才会通过 `queue_event` 生成节点；`event_cb == NULL` 时函数直接返回，避免无意义的内存分配，未消费的批次会在统计中累计到 `event_dispatch_failures`。
   - `mac_lookup_task`
     - 封装 MAC 查表请求（终端 key、VLAN、校验标志），由 `mac_need_refresh` 与 `mac_pending_verify` 队列驱动，最终在解锁后批量执行；`verify == true` 表示该任务源自版本刷新后的二次校验，需确认现有 `ifindex` 是否仍与桥表一致，失败时会按照 `mac_lookup_apply_result` 中的逻辑清空旧端口并触发 `MOD` 事件。
@@ -386,7 +386,7 @@ classDiagram
 ### 6. 北向桥接 `common/terminal_northbound.cpp`
 - 向外导出稳定 ABI：`getAllTerminalInfo`、`setIncrementReport`。
 - `setIncrementReport`：注册 C++ 回调 `IncReportCb`，内部通过 `terminal_manager_set_event_sink` 绑定事件入口。
-- `getAllTerminalInfo`：调用 `terminal_manager_query_all` 生成快照，转换为 `MAC_IP_INFO`。
+- `getAllTerminalInfo`：调用 `terminal_manager_query_all` 生成快照，转换为携带 `ifindex/prev_ifindex` 与 ModifyTag 的 `MAC_IP_INFO`。
 - 拥有独立互斥锁 `g_inc_report_mutex` 保证回调注册的线程安全。
 - Stage 7 新增 `TerminalDebugSnapshot`（C++ 包装类）与 `TdDebugDumpOptions`（C++ 侧选项结构），通过 `td_debug_dump_*` 接口生成字符串快照；`string_writer_adapter` 充当中转，将 C 回调写入 `std::string` 并在异常/失败时标记 `td_debug_dump_context_t::had_error`。
 - **依赖**：使用 `terminal_manager_get_active` 获取全局管理器指针（由 `terminal_manager_create` 绑定）。
@@ -401,7 +401,7 @@ classDiagram
 -  6. 收到 SIGINT/SIGTERM 或 CLI `exit|quit` 后依次停止适配器、销毁管理器、输出 shutdown 日志。
 - 主循环结合 `handle_stats_signal` 与交互式命令行监听处理：接收 `stats`、`dump terminal/prefix/binding/mac queue/mac state`、`show config` 等指令即时输出快照；支持 `set keepalive|miss|holdoff|max|log-level <value>` 动态调整运行参数（内部调用 `terminal_manager_set_*` 与 `td_log_set_level`），输入 `exit`/`quit` 可直接请求退出，`help` 可查看命令列表，提示符 `td>` 表示可继续输入。
 - `terminal_probe_handler`：实现 `terminal_probe_fn`，按请求中的 VLAN ID 与 `source_ip` 构造物理口 ARP 帧；默认优先走物理接口（例如 `eth0`），仅当 `tx_iface_valid` 标记存在且物理口发送失败时才尝试回退到 VLAN 虚接口。
-- 默认日志 sink：由 `terminal_northbound_attach_default_sink` 挂接，输出 `event=<TAG> mac=<MAC> ip=<IP> ifindex=<IDX>` 格式的 INFO 日志，便于在缺少北向监听器时验证事件流。
+- 默认日志 sink：由 `terminal_northbound_attach_default_sink` 挂接，输出 `event=<TAG> mac=<MAC> ip=<IP> ifindex=<IDX> prev_ifindex=<PREV>` 格式的 INFO 日志，便于在缺少北向监听器时验证事件流。
 - CLI 支持配置适配器名、接口、保活参数、容量阈值、日志级别等，并提供 `exit|quit` 以终止守护进程。
 - 通过 `adapter_log_bridge` 将适配器内部日志回落至 `td_logging`。
 
