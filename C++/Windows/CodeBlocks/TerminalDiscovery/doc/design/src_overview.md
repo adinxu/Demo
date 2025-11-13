@@ -399,7 +399,7 @@ classDiagram
   4. 将适配器报文回调绑定至 `terminal_manager_on_packet`。
 -  5. 启动适配器并进入主循环（等待信号或 CLI 指令退出）。
 -  6. 收到 SIGINT/SIGTERM 或 CLI `exit|quit` 后依次停止适配器、销毁管理器、输出 shutdown 日志。
-- 主循环结合 `handle_stats_signal` 与交互式命令行监听处理：接收 `stats`、`dump terminal/prefix/binding/mac queue/mac state`、`show config` 等指令即时输出快照；支持 `set keepalive|miss|holdoff|max|log-level <value>` 动态调整运行参数（内部调用 `terminal_manager_set_*` 与 `td_log_set_level`），输入 `exit`/`quit` 可直接请求退出，`help` 可查看命令列表，提示符 `td>` 表示可继续输入。
+- 主循环结合 `handle_stats_signal` 与交互式命令行监听处理：接收 `stats`、`dump terminal/prefix/binding/mac queue/mac state`、`show config` 等指令即时输出快照；支持 `set keepalive|miss|holdoff|max|log-level <value>` 动态调整运行参数（内部调用 `terminal_manager_set_*` 与 `td_log_set_level`），并新增 `ignore-vlan add <vid>` / `ignore-vlan remove <vid>` / `ignore-vlan clear` 三条命令用于在线维护收包时的忽略 VLAN 列表；`show config` 现仅调用 `terminal_manager_log_config` 输出 `terminal_config` 组件日志（包含 `ignored_vlans=[...]` 等管理器快照字段）；输入 `exit`/`quit` 可直接请求退出，`help` 可查看命令列表，提示符 `td>` 表示可继续输入。
 - `terminal_probe_handler`：实现 `terminal_probe_fn`，按请求中的 VLAN ID 与 `source_ip` 构造物理口 ARP 帧；默认优先走物理接口（例如 `eth0`），仅当 `tx_iface_valid` 标记存在且物理口发送失败时才尝试回退到 VLAN 虚接口。
 - 默认日志 sink：由 `terminal_northbound_attach_default_sink` 挂接，输出 `event=<TAG> mac=<MAC> ip=<IP> ifindex=<IDX> prev_ifindex=<PREV>` 格式的 INFO 日志，便于在缺少北向监听器时验证事件流。
 - CLI 支持配置适配器名、接口、保活参数、容量阈值、日志级别等，并提供 `exit|quit` 以终止守护进程。

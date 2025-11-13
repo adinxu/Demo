@@ -93,23 +93,53 @@ static void print_prompt(void) {
     fflush(stdout);
 }
 
-static void show_runtime_config(const struct td_runtime_config *cfg) {
+static bool runtime_config_has_ignored_vlan(const struct td_runtime_config *cfg, unsigned int vlan_id) {
     if (!cfg) {
+        return false;
+    }
+
+    for (size_t i = 0; i < cfg->ignored_vlan_count; ++i) {
+        if (cfg->ignored_vlans[i] == vlan_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void format_ignored_vlan_list(const struct td_runtime_config *cfg,
+                                     char *buffer,
+                                     size_t buffer_len) {
+    if (!buffer || buffer_len == 0) {
         return;
     }
 
-    td_log_writef(TD_LOG_INFO,
-                  "terminal_daemon",
-                  "config adapter=%s rx=%s tx=%s tx_interval_ms=%u keepalive=%us miss=%u holdoff=%us max=%u log_level=%d",
-                  cfg->adapter_name,
-                  cfg->rx_iface,
-                  cfg->tx_iface,
-                  cfg->tx_interval_ms,
-                  cfg->keepalive_interval_sec,
-                  cfg->keepalive_miss_threshold,
-                  cfg->iface_invalid_holdoff_sec,
-                  cfg->max_terminals,
-                  (int)cfg->log_level);
+    if (!cfg || cfg->ignored_vlan_count == 0) {
+        snprintf(buffer, buffer_len, "none");
+        return;
+    }
+
+    size_t pos = 0;
+    int written = snprintf(buffer + pos, buffer_len - pos, "[");
+    if (written < 0 || (size_t)written >= buffer_len - pos) {
+        buffer[buffer_len - 1] = '\0';
+        return;
+    }
+    pos += (size_t)written;
+
+    for (size_t i = 0; i < cfg->ignored_vlan_count; ++i) {
+        written = snprintf(buffer + pos,
+                           buffer_len - pos,
+                           "%s%u",
+                           (i == 0) ? "" : ",",
+                           (unsigned int)cfg->ignored_vlans[i]);
+        if (written < 0 || (size_t)written >= buffer_len - pos) {
+            buffer[buffer_len - 1] = '\0';
+            return;
+        }
+        pos += (size_t)written;
+    }
+
+    snprintf(buffer + pos, buffer_len - pos, "]");
 }
 
 static bool parse_unsigned_value(const char *value, unsigned long long max, unsigned long long *out) {
@@ -239,14 +269,187 @@ static void handle_command(const char *command,
     }
 
     if (strcmp(command, "show config") == 0) {
-        show_runtime_config(runtime_cfg);
+        if (ctx->manager) {
+            terminal_manager_log_config(ctx->manager);
+        }
         return;
     }
 
     if (strcmp(command, "help") == 0) {
         td_log_writef(TD_LOG_INFO,
                       "terminal_daemon",
-                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | show config | set <option> <value> | exit | quit | help");
+                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | show config | set <option> <value> | ignore-vlan add <vid> | ignore-vlan remove <vid> | ignore-vlan clear | exit | quit | help");
+        return;
+    }
+
+    if (strncmp(command, "ignore-vlan", 11) == 0 && (command[11] == '\0' || command[11] == ' ')) {
+        char workbuf[64];
+        snprintf(workbuf, sizeof(workbuf), "%s", command);
+
+        char *saveptr = NULL;
+        (void)strtok_r(workbuf, " ", &saveptr); /* ignore-vlan */
+        char *action = strtok_r(NULL, " ", &saveptr);
+        if (!action) {
+            td_log_writef(TD_LOG_WARN,
+                          "terminal_daemon",
+                          "usage: ignore-vlan add <vid> | ignore-vlan remove <vid> | ignore-vlan clear");
+            return;
+        }
+
+        if (strcmp(action, "add") == 0) {
+            char *value = strtok_r(NULL, " ", &saveptr);
+            if (!value) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "usage: ignore-vlan add <vid>");
+                return;
+            }
+
+            unsigned long long parsed = 0ULL;
+            if (!parse_unsigned_value(value, 4094ULL, &parsed) || parsed == 0ULL) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "ignore-vlan add expects VID 1-4094");
+                return;
+            }
+
+            unsigned int vlan = (unsigned int)parsed;
+            if (runtime_config_has_ignored_vlan(runtime_cfg, vlan)) {
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "ignore-vlan add skipped, vlan %u already present",
+                              vlan);
+                return;
+            }
+
+            int cfg_rc = td_config_add_ignored_vlan(runtime_cfg, vlan);
+            if (cfg_rc == -ENOSPC) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "ignore-vlan list full (max %u)",
+                              (unsigned int)TD_MAX_IGNORED_VLANS);
+                return;
+            }
+            if (cfg_rc != 0) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "failed to add vlan %u to runtime config (rc=%d)",
+                              vlan,
+                              cfg_rc);
+                return;
+            }
+
+            int mgr_rc = terminal_manager_add_ignored_vlan(ctx->manager, (uint16_t)vlan);
+            if (mgr_rc != 0) {
+                td_config_remove_ignored_vlan(runtime_cfg, vlan);
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "failed to add vlan %u to manager (rc=%d)",
+                              vlan,
+                              mgr_rc);
+                return;
+            }
+
+            char ignored_buf[TD_MAX_IGNORED_VLANS * 6 + 8];
+            memset(ignored_buf, 0, sizeof(ignored_buf));
+            format_ignored_vlan_list(runtime_cfg, ignored_buf, sizeof(ignored_buf));
+            td_log_writef(TD_LOG_INFO,
+                          "terminal_daemon",
+                          "ignore-vlan add applied: vlan=%u list=%s",
+                          vlan,
+                          ignored_buf);
+            return;
+        }
+
+        if (strcmp(action, "remove") == 0) {
+            char *value = strtok_r(NULL, " ", &saveptr);
+            if (!value) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "usage: ignore-vlan remove <vid>");
+                return;
+            }
+
+            unsigned long long parsed = 0ULL;
+            if (!parse_unsigned_value(value, 4094ULL, &parsed) || parsed == 0ULL) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "ignore-vlan remove expects VID 1-4094");
+                return;
+            }
+
+            unsigned int vlan = (unsigned int)parsed;
+            if (!runtime_config_has_ignored_vlan(runtime_cfg, vlan)) {
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "ignore-vlan remove skipped, vlan %u not present",
+                              vlan);
+                return;
+            }
+
+            int cfg_rc = td_config_remove_ignored_vlan(runtime_cfg, vlan);
+            if (cfg_rc != 0) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "failed to remove vlan %u from runtime config (rc=%d)",
+                              vlan,
+                              cfg_rc);
+                return;
+            }
+
+            int mgr_rc = terminal_manager_remove_ignored_vlan(ctx->manager, (uint16_t)vlan);
+            if (mgr_rc != 0) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "manager failed to remove vlan %u (rc=%d)",
+                              vlan,
+                              mgr_rc);
+            }
+
+            char ignored_buf[TD_MAX_IGNORED_VLANS * 6 + 8];
+            memset(ignored_buf, 0, sizeof(ignored_buf));
+            format_ignored_vlan_list(runtime_cfg, ignored_buf, sizeof(ignored_buf));
+            td_log_writef(TD_LOG_INFO,
+                          "terminal_daemon",
+                          "ignore-vlan remove applied: vlan=%u list=%s",
+                          vlan,
+                          ignored_buf);
+            return;
+        }
+
+        if (strcmp(action, "clear") == 0) {
+            char *value = strtok_r(NULL, " ", &saveptr);
+            if (value && strcmp(value, "all") != 0) {
+                td_log_writef(TD_LOG_WARN,
+                              "terminal_daemon",
+                              "usage: ignore-vlan clear [all]");
+                return;
+            }
+
+            if (runtime_cfg->ignored_vlan_count == 0) {
+                td_log_writef(TD_LOG_INFO,
+                              "terminal_daemon",
+                              "ignore-vlan list already empty");
+                return;
+            }
+
+            td_config_clear_ignored_vlans(runtime_cfg);
+            terminal_manager_clear_ignored_vlans(ctx->manager);
+
+            char ignored_buf[TD_MAX_IGNORED_VLANS * 6 + 8];
+            memset(ignored_buf, 0, sizeof(ignored_buf));
+            format_ignored_vlan_list(runtime_cfg, ignored_buf, sizeof(ignored_buf));
+            td_log_writef(TD_LOG_INFO,
+                          "terminal_daemon",
+                          "ignore-vlan list cleared: list=%s",
+                          ignored_buf);
+            return;
+        }
+
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_daemon",
+                      "unknown ignore-vlan action '%s'",
+                      action);
         return;
     }
 
@@ -591,6 +794,7 @@ static void print_usage(FILE *stream) {
             "  --keepalive-miss COUNT    Probe failure threshold (default: 3)\n"
             "  --iface-holdoff SEC       Holdoff after iface invalid (default: 1800)\n"
             "  --max-terminals COUNT     Maximum tracked terminals (default: 1000)\n"
+            "  --ignore-vlan VID         Ignore ARP seen on VLAN VID (repeatable)\n"
             "  --stats-interval SEC      Stats log interval seconds, 0 disables (default: 0)\n"
             "  --log-level LEVEL         Log level trace|debug|info|warn|error|none (default: info)\n"
             "  --help                    Show this help message\n",
@@ -647,6 +851,7 @@ int main(int argc, char **argv) {
         {"keepalive-miss", required_argument, NULL, 'm'},
         {"iface-holdoff", required_argument, NULL, 'H'},
         {"max-terminals", required_argument, NULL, 'M'},
+        {"ignore-vlan", required_argument, NULL, 'I'},
         {"stats-interval", required_argument, NULL, 'S'},
         {"log-level", required_argument, NULL, 'l'},
         {"help", no_argument, NULL, 'h'},
@@ -703,6 +908,36 @@ int main(int argc, char **argv) {
                 return EXIT_FAILURE;
             }
             break;
+        case 'I':
+        {
+            unsigned int parsed_vlan = 0;
+            if (parse_unsigned_option("--ignore-vlan", optarg, &parsed_vlan) != 0) {
+                return EXIT_FAILURE;
+            }
+            if (parsed_vlan == 0 || parsed_vlan > 4094U) {
+                fprintf(stderr,
+                        "%s: ignore-vlan must be between 1 and 4094\n",
+                        g_program_name);
+                return EXIT_FAILURE;
+            }
+            int add_rc = td_config_add_ignored_vlan(&runtime_cfg, parsed_vlan);
+            if (add_rc == -ENOSPC) {
+                fprintf(stderr,
+                        "%s: ignore-vlan list supports at most %u entries\n",
+                        g_program_name,
+                        (unsigned int)TD_MAX_IGNORED_VLANS);
+                return EXIT_FAILURE;
+            }
+            if (add_rc != 0) {
+                fprintf(stderr,
+                        "%s: failed to add ignore-vlan %u (rc=%d)\n",
+                        g_program_name,
+                        parsed_vlan,
+                        add_rc);
+                return EXIT_FAILURE;
+            }
+            break;
+        }
         case 'l':
         {
             bool ok = false;

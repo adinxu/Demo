@@ -10,6 +10,10 @@
 
 #include "adapter_api.h"
 
+#ifndef TD_MAX_IGNORED_VLANS
+#define TD_MAX_IGNORED_VLANS 32U
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -160,6 +164,8 @@ struct terminal_manager_config {
     unsigned int scan_interval_ms;
     const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
     size_t max_terminals;
+    uint16_t ignored_vlans[TD_MAX_IGNORED_VLANS];
+    size_t ignored_vlan_count;
 };
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
@@ -210,6 +216,16 @@ int terminal_manager_set_iface_invalid_holdoff(struct terminal_manager *mgr,
 
 int terminal_manager_set_max_terminals(struct terminal_manager *mgr,
                                        size_t max_terminals);
+
+int terminal_manager_add_ignored_vlan(struct terminal_manager *mgr,
+                                      uint16_t vlan_id);
+
+int terminal_manager_remove_ignored_vlan(struct terminal_manager *mgr,
+                                         uint16_t vlan_id);
+
+void terminal_manager_clear_ignored_vlans(struct terminal_manager *mgr);
+
+void terminal_manager_log_config(struct terminal_manager *mgr);
 
 int td_debug_dump_terminal_table(struct terminal_manager *mgr,
                                  const td_debug_dump_opts_t *opts,

@@ -509,6 +509,203 @@ done:
     return ok;
 }
 
+static bool test_terminal_packet_on_ignored_vlan(void) {
+    const int vlan_id = 200;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 16;
+    cfg.ignored_vlan_count = 1;
+    cfg.ignored_vlans[0] = (uint16_t)vlan_id;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            NULL,
+                                                            probe_callback,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager with ignored vlan\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    apply_address_update(mgr, tx_kernel_ifindex, "198.51.100.1", 24, true);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    build_arp_packet(&packet, &arp, mac, "198.51.100.10", "198.51.100.10", vlan_id, 9);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 0) {
+        fprintf(stderr, "expected no events for ignored vlan, got %zu\n", events.count);
+        ok = false;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed\n");
+        ok = false;
+    } else if (counter.count != 0) {
+        fprintf(stderr, "expected zero terminals for ignored vlan, got %zu\n", counter.count);
+        ok = false;
+    }
+
+    struct terminal_manager_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    terminal_manager_get_stats(mgr, &stats);
+    if (stats.terminals_discovered != 0 || stats.events_dispatched != 0) {
+        fprintf(stderr,
+                "unexpected stats for ignored vlan: discovered=%" PRIu64 " dispatched=%" PRIu64 "\n",
+                stats.terminals_discovered,
+                stats.events_dispatched);
+        ok = false;
+    }
+
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_terminal_ignored_vlan_runtime_update(void) {
+    const int vlan_id = 250;
+    const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 16;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            NULL,
+                                                            probe_callback,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for runtime ignore vlan test\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    apply_address_update(mgr, tx_kernel_ifindex, "198.51.100.1", 24, true);
+
+    if (terminal_manager_add_ignored_vlan(mgr, (uint16_t)vlan_id) != 0) {
+        fprintf(stderr, "failed to add ignored vlan at runtime\n");
+        terminal_manager_destroy(mgr);
+        return false;
+    }
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    build_arp_packet(&packet, &arp, mac, "198.51.100.20", "198.51.100.20", vlan_id, 9);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 0) {
+        fprintf(stderr, "expected no events while vlan ignored, got %zu\n", events.count);
+        ok = false;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed while vlan ignored\n");
+        ok = false;
+    } else if (counter.count != 0) {
+        fprintf(stderr, "expected zero terminals while vlan ignored, got %zu\n", counter.count);
+        ok = false;
+    }
+
+    struct terminal_manager_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    terminal_manager_get_stats(mgr, &stats);
+    if (stats.terminals_discovered != 0 || stats.events_dispatched != 0) {
+        fprintf(stderr,
+                "unexpected stats while vlan ignored: discovered=%" PRIu64 " dispatched=%" PRIu64 "\n",
+                stats.terminals_discovered,
+                stats.events_dispatched);
+        ok = false;
+    }
+
+    if (terminal_manager_remove_ignored_vlan(mgr, (uint16_t)vlan_id) != 0) {
+        fprintf(stderr, "failed to remove ignored vlan at runtime\n");
+        ok = false;
+        goto done;
+    }
+
+    capture_reset(&events);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_ADD) {
+        fprintf(stderr, "expected one ADD event after removing ignore, got %zu\n", events.count);
+        ok = false;
+        goto done;
+    }
+
+    struct query_counter counter_after = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter_after) != 0) {
+        fprintf(stderr, "query_all failed after removing ignore\n");
+        ok = false;
+        goto done;
+    }
+    if (counter_after.count != 1) {
+        fprintf(stderr, "expected one terminal after removing ignore, got %zu\n", counter_after.count);
+        ok = false;
+        goto done;
+    }
+
+    memset(&stats, 0, sizeof(stats));
+    terminal_manager_get_stats(mgr, &stats);
+    if (stats.terminals_discovered != 1 || stats.current_terminals != 1) {
+        fprintf(stderr,
+                "unexpected stats after removing ignore: discovered=%" PRIu64 " current=%" PRIu64 "\n",
+                stats.terminals_discovered,
+                stats.current_terminals);
+        ok = false;
+    }
+
+    int rc = terminal_manager_add_ignored_vlan(mgr, (uint16_t)(vlan_id + 1));
+    if (rc != 0) {
+        fprintf(stderr, "failed to add secondary vlan before clear (rc=%d)\n", rc);
+        ok = false;
+        goto done;
+    }
+    terminal_manager_clear_ignored_vlans(mgr);
+    rc = terminal_manager_remove_ignored_vlan(mgr, (uint16_t)(vlan_id + 1));
+    if (rc != -ENOENT) {
+        fprintf(stderr, "expected -ENOENT after clear, got %d\n", rc);
+        ok = false;
+    }
+
+done:
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
 static bool test_gratuitous_arp_uses_target_ip(void) {
     const int vlan_id = 150;
     const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
@@ -1125,6 +1322,8 @@ int main(void) {
     } tests[] = {
         {"default_log_timestamp", test_default_log_timestamp},
         {"terminal_add_and_event", test_terminal_add_and_event},
+        {"terminal_packet_on_ignored_vlan", test_terminal_packet_on_ignored_vlan},
+        {"terminal_ignored_vlan_runtime_update", test_terminal_ignored_vlan_runtime_update},
         {"gratuitous_arp_uses_target_ip", test_gratuitous_arp_uses_target_ip},
         {"zero_ip_arp_is_ignored", test_zero_ip_arp_is_ignored},
         {"probe_failure_removes_terminal", test_probe_failure_removes_terminal},

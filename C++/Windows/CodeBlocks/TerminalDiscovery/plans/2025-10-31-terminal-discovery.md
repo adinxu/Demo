@@ -81,12 +81,14 @@
    - 调整 `getAllTerminalInfo` 快照与查询路径，保证历史端口字段在全量输出中同步可见，并与事件载荷保持一致。
    - 扩展 `terminal_manager_tests`、`terminal_integration_tests` 覆盖端口切换场景，验证增量回调与全量查询同时携带新旧 ifindex。
    - 更新设计/接口文档与示例，通知北向团队完成回调消费方兼容性验证。
+6. ✳️ VLAN 忽略过滤：在 `td_config`/`terminal_manager` 中引入 `ignored_vlans` 判定逻辑，命中时记录 DEBUG 日志后直接返回，避免无关 VLAN 干扰事件队列；同时补充设计文档说明。
 
 ### 阶段 4：配置、日志与文档（已完成）
 1. ✅ 配置体系：扩展 `td_config` 支持终端保活间隔、失败阈值、最大终端数量等参数；引擎统一从配置体系读取，暂不依赖环境变量。
 2. ✅ 日志与指标：引入核心模块结构化日志标签（如 `terminal_manager`, `event_queue`），暴露探测计数、失败数、接口波动等指标，预留对接外部采集的入口，并确保全部基于单调时钟；主程序新增 `--stats-interval`（默认 0，即禁用周期性输出，可指定秒数开启），并支持 `SIGUSR1` 触发即时 `terminal_stats` 快照。
    - ✅ `td_log_writef` 默认格式追加 `YYYY-MM-DD HH:MM:SS` 级别的系统时间戳（wall clock），同时保留自定义 sink 兼容性并新增相应单测。
 3. ✅ 文档：补充阶段 2+ 核心引擎设计说明、API 参考与构建部署指南，同步最新 `MAC_IP_INFO`/`TerminalInfo` 字段约束。
+4. ✳️ 配置扩展：在 `td_config`/CLI 中新增 `ignored_vlans`（支持 `--ignore-vlan <vid>` 多次传入、内部去重与上限校验），并在管理器配置结构体中落地，可选开关默认关闭。
 
 ### 阶段 5：测试与验收（进行中）
 1. ✅ 单元测试：新增 `terminal_discovery_tests` 覆盖状态机（探测失败淘汰、接口失效保留期、ifindex 变更上报）与事件分发，命令 `make test` 可在 x86 环境快速执行。
@@ -95,6 +97,7 @@
 3. ✅ 北向测试：
    - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex/prev_ifindex` 数值）与重复注册告警。
    - 后续若需并发访问覆盖，可在现有桩环境扩展多线程情景。
+   - ✳️ 新增忽略 VLAN 覆盖：在单元/集成测试中注入被忽略的 VLAN 报文，断言不会生成终端/事件并记录过滤日志。
 4. ✳️ 打桩测试扩展方向：
    - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
    - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
@@ -146,4 +149,4 @@
 
 ## 审批与下一步
 - 当前状态：阶段 4 配置/日志文档与阶段 6 守护进程嵌入入口均已完成并交付，最新实现见 `doc/design/stage4_observability.md`、`doc/design/stage6_embedded_init.md` 及相关源码。
-- 下一步：继续推进阶段 5（扩展集成测试、开展 Realtek 实机/压力验证、整理验收报告），为后续交付准备验收材料与性能数据。
+- 下一步：在阶段 3/4 中落地 `ignored_vlans` 配置与 CLI 解析、完成对应单元/集成测试，然后继续推进阶段 5（扩展集成测试、开展 Realtek 实机/压力验证、整理验收报告），为后续交付准备验收材料与性能数据。

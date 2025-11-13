@@ -94,6 +94,11 @@ static void bind_active_manager(struct terminal_manager *mgr);
 static void unbind_active_manager(struct terminal_manager *mgr);
 static void mac_locator_on_refresh(uint64_t version, void *ctx);
 static void terminal_manager_run_address_sync(struct terminal_manager *mgr);
+static bool vlan_is_ignored(const struct terminal_manager *mgr, int vlan_id);
+static void format_ignored_vlan_array(const uint16_t *vlans,
+                                      size_t count,
+                                      char *buffer,
+                                      size_t buffer_len);
 
 struct terminal_manager *terminal_manager_get_active(void) {
     pthread_mutex_lock(&g_active_manager_mutex);
@@ -1099,6 +1104,26 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
         return NULL;
     }
 
+    if (cfg->ignored_vlan_count > TD_MAX_IGNORED_VLANS) {
+        td_log_writef(TD_LOG_ERROR,
+                      "terminal_manager",
+                      "ignored vlan count %zu exceeds limit %u",
+                      cfg->ignored_vlan_count,
+                      (unsigned int)TD_MAX_IGNORED_VLANS);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < cfg->ignored_vlan_count; ++i) {
+        uint16_t vlan = cfg->ignored_vlans[i];
+        if (vlan == 0 || vlan > 4094U) {
+            td_log_writef(TD_LOG_ERROR,
+                          "terminal_manager",
+                          "ignored vlan %u out of range",
+                          (unsigned int)vlan);
+            return NULL;
+        }
+    }
+
     struct terminal_manager *mgr = calloc(1, sizeof(*mgr));
     if (!mgr) {
         return NULL;
@@ -1435,6 +1460,15 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 
     pthread_mutex_lock(&mgr->lock);
 
+    if (vlan_is_ignored(mgr, packet->vlan_id)) {
+        pthread_mutex_unlock(&mgr->lock);
+        td_log_writef(TD_LOG_DEBUG,
+                      "terminal_manager",
+                      "ignored packet on vlan=%d",
+                      packet->vlan_id);
+        return;
+    }
+
     bool track_events = mgr->event_cb != NULL;
     bool newly_created = false;
     terminal_snapshot_t before_snapshot;
@@ -1577,6 +1611,20 @@ static void terminal_manager_run_address_sync(struct terminal_manager *mgr) {
         mgr->address_sync_pending = true;
     }
     pthread_mutex_unlock(&mgr->lock);
+}
+
+static bool vlan_is_ignored(const struct terminal_manager *mgr, int vlan_id) {
+    if (!mgr || vlan_id < 0 || mgr->cfg.ignored_vlan_count == 0) {
+        return false;
+    }
+
+    uint16_t vlan = (uint16_t)vlan_id;
+    for (size_t i = 0; i < mgr->cfg.ignored_vlan_count; ++i) {
+        if (mgr->cfg.ignored_vlans[i] == vlan) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool has_expired(const struct terminal_manager *mgr,
@@ -2098,6 +2146,147 @@ int terminal_manager_set_max_terminals(struct terminal_manager *mgr,
     mgr->max_terminals = max_terminals;
     pthread_mutex_unlock(&mgr->lock);
     return 0;
+}
+
+int terminal_manager_add_ignored_vlan(struct terminal_manager *mgr,
+                                      uint16_t vlan_id) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (vlan_id == 0U || vlan_id > 4094U) {
+        return -ERANGE;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    for (size_t i = 0; i < mgr->cfg.ignored_vlan_count; ++i) {
+        if (mgr->cfg.ignored_vlans[i] == vlan_id) {
+            pthread_mutex_unlock(&mgr->lock);
+            return 0;
+        }
+    }
+
+    if (mgr->cfg.ignored_vlan_count >= TD_MAX_IGNORED_VLANS) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -ENOSPC;
+    }
+
+    mgr->cfg.ignored_vlans[mgr->cfg.ignored_vlan_count++] = vlan_id;
+    pthread_mutex_unlock(&mgr->lock);
+    return 0;
+}
+
+int terminal_manager_remove_ignored_vlan(struct terminal_manager *mgr,
+                                         uint16_t vlan_id) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (vlan_id == 0U || vlan_id > 4094U) {
+        return -ERANGE;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    for (size_t i = 0; i < mgr->cfg.ignored_vlan_count; ++i) {
+        if (mgr->cfg.ignored_vlans[i] == vlan_id) {
+            size_t remaining = mgr->cfg.ignored_vlan_count - i - 1;
+            if (remaining > 0) {
+                memmove(&mgr->cfg.ignored_vlans[i],
+                        &mgr->cfg.ignored_vlans[i + 1],
+                        remaining * sizeof(mgr->cfg.ignored_vlans[0]));
+            }
+            mgr->cfg.ignored_vlan_count -= 1;
+            mgr->cfg.ignored_vlans[mgr->cfg.ignored_vlan_count] = 0U;
+            pthread_mutex_unlock(&mgr->lock);
+            return 0;
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return -ENOENT;
+}
+
+void terminal_manager_clear_ignored_vlans(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    if (mgr->cfg.ignored_vlan_count > 0) {
+        memset(mgr->cfg.ignored_vlans, 0, sizeof(mgr->cfg.ignored_vlans));
+        mgr->cfg.ignored_vlan_count = 0;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+static void format_ignored_vlan_array(const uint16_t *vlans,
+                                      size_t count,
+                                      char *buffer,
+                                      size_t buffer_len) {
+    if (!buffer || buffer_len == 0) {
+        return;
+    }
+
+    if (!vlans || count == 0) {
+        snprintf(buffer, buffer_len, "none");
+        return;
+    }
+
+    size_t pos = 0;
+    int written = snprintf(buffer + pos, buffer_len - pos, "[");
+    if (written < 0 || (size_t)written >= buffer_len - pos) {
+        buffer[buffer_len - 1] = '\0';
+        return;
+    }
+    pos += (size_t)written;
+
+    for (size_t i = 0; i < count; ++i) {
+        written = snprintf(buffer + pos,
+                           buffer_len - pos,
+                           "%s%u",
+                           (i == 0) ? "" : ",",
+                           (unsigned int)vlans[i]);
+        if (written < 0 || (size_t)written >= buffer_len - pos) {
+            buffer[buffer_len - 1] = '\0';
+            return;
+        }
+        pos += (size_t)written;
+    }
+
+    snprintf(buffer + pos, buffer_len - pos, "]");
+}
+
+void terminal_manager_log_config(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    struct terminal_manager_config cfg_snapshot;
+    memset(&cfg_snapshot, 0, sizeof(cfg_snapshot));
+
+    pthread_mutex_lock(&mgr->lock);
+    cfg_snapshot = mgr->cfg;
+    pthread_mutex_unlock(&mgr->lock);
+
+    char ignored_buf[TD_MAX_IGNORED_VLANS * 6 + 8];
+    memset(ignored_buf, 0, sizeof(ignored_buf));
+    format_ignored_vlan_array(cfg_snapshot.ignored_vlans,
+                              cfg_snapshot.ignored_vlan_count,
+                              ignored_buf,
+                              sizeof(ignored_buf));
+
+    const char *iface_format = cfg_snapshot.vlan_iface_format ? cfg_snapshot.vlan_iface_format : "<default>";
+
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_config",
+                  "keepalive=%us miss=%u holdoff=%us scan=%ums max=%zu vlan_iface_format=%s ignored_vlans=%s",
+                  cfg_snapshot.keepalive_interval_sec,
+                  cfg_snapshot.keepalive_miss_threshold,
+                  cfg_snapshot.iface_invalid_holdoff_sec,
+                  cfg_snapshot.scan_interval_ms,
+                  cfg_snapshot.max_terminals,
+                  iface_format,
+                  ignored_buf);
 }
 
 static int td_debug_prepare_context(td_debug_dump_context_t **ctx_ptr,
