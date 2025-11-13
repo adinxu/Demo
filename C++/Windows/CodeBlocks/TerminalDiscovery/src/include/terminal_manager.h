@@ -227,6 +227,8 @@ void terminal_manager_clear_ignored_vlans(struct terminal_manager *mgr);
 
 void terminal_manager_log_config(struct terminal_manager *mgr);
 
+void terminal_manager_log_stats(struct terminal_manager *mgr);
+
 int td_debug_dump_terminal_table(struct terminal_manager *mgr,
                                  const td_debug_dump_opts_t *opts,
                                  td_debug_writer_t writer,

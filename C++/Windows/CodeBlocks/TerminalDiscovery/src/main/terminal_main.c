@@ -156,8 +156,6 @@ static bool parse_unsigned_value(const char *value, unsigned long long max, unsi
     return true;
 }
 
-static void log_manager_stats(struct terminal_manager *manager);
-
 static void handle_command(const char *command,
                            struct app_context *ctx,
                            struct td_runtime_config *runtime_cfg) {
@@ -172,7 +170,7 @@ static void handle_command(const char *command,
     }
 
     if (strcmp(command, "stats") == 0) {
-        log_manager_stats(ctx->manager);
+        terminal_manager_log_stats(ctx->manager);
         return;
     }
 
@@ -567,33 +565,6 @@ static void handle_command(const char *command,
                   "terminal_daemon",
                   "unknown command '%s' (try 'help')",
                   command);
-}
-
-static void log_manager_stats(struct terminal_manager *manager) {
-    if (!manager) {
-        return;
-    }
-
-    struct terminal_manager_stats stats;
-    memset(&stats, 0, sizeof(stats));
-    terminal_manager_get_stats(manager, &stats);
-
-    td_log_writef(TD_LOG_INFO,
-                  "terminal_stats",
-                  "current=%" PRIu64 " discovered=%" PRIu64 " removed=%" PRIu64
-                  " probes=%" PRIu64 " probe_failures=%" PRIu64
-                  " capacity_drops=%" PRIu64
-                  " events=%" PRIu64 " dispatch_failures=%" PRIu64
-                  " addr_updates=%" PRIu64,
-                  stats.current_terminals,
-                  stats.terminals_discovered,
-                  stats.terminals_removed,
-                  stats.probes_scheduled,
-                  stats.probe_failures,
-                  stats.capacity_drops,
-                  stats.events_dispatched,
-                  stats.event_dispatch_failures,
-                  stats.address_update_events);
 }
 
 #endif /* TD_DISABLE_APP_MAIN */
@@ -1043,24 +1014,24 @@ int main(int argc, char **argv) {
 
         if (g_should_dump_stats) {
             g_should_dump_stats = 0;
-            log_manager_stats(ctx.manager);
+            terminal_manager_log_stats(ctx.manager);
         }
 
         if (runtime_cfg.stats_log_interval_sec > 0) {
             if (++stats_elapsed_sec >= runtime_cfg.stats_log_interval_sec) {
                 stats_elapsed_sec = 0;
-                log_manager_stats(ctx.manager);
+                terminal_manager_log_stats(ctx.manager);
             }
         }
     }
 
     if (g_should_dump_stats) {
         g_should_dump_stats = 0;
-        log_manager_stats(ctx.manager);
+        terminal_manager_log_stats(ctx.manager);
     }
 
     td_log_writef(TD_LOG_INFO, "terminal_daemon", "signal %d received, shutting down", g_should_stop);
-    log_manager_stats(ctx.manager);
+    terminal_manager_log_stats(ctx.manager);
 
     terminal_discovery_cleanup(&ctx);
 

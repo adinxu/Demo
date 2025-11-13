@@ -2289,6 +2289,33 @@ void terminal_manager_log_config(struct terminal_manager *mgr) {
                   ignored_buf);
 }
 
+void terminal_manager_log_stats(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    struct terminal_manager_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    terminal_manager_get_stats(mgr, &stats);
+
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_stats",
+                  "current=%" PRIu64 " discovered=%" PRIu64 " removed=%" PRIu64
+                  " probes=%" PRIu64 " probe_failures=%" PRIu64
+                  " capacity_drops=%" PRIu64
+                  " events=%" PRIu64 " dispatch_failures=%" PRIu64
+                  " addr_updates=%" PRIu64,
+                  stats.current_terminals,
+                  stats.terminals_discovered,
+                  stats.terminals_removed,
+                  stats.probes_scheduled,
+                  stats.probe_failures,
+                  stats.capacity_drops,
+                  stats.events_dispatched,
+                  stats.event_dispatch_failures,
+                  stats.address_update_events);
+}
+
 static int td_debug_prepare_context(td_debug_dump_context_t **ctx_ptr,
                                     td_debug_dump_context_t *local_ctx,
                                     const td_debug_dump_opts_t *opts) {
