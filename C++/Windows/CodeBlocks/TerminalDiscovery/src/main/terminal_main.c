@@ -214,11 +214,14 @@ static void handle_command(const char *command,
     if (strcmp(command, "dump binding") == 0) {
         if (ctx->manager) {
             td_debug_dump_context_t dump_ctx;
-            td_debug_context_reset(&dump_ctx, NULL);
+            td_debug_dump_opts_t dump_opts;
+            memset(&dump_opts, 0, sizeof(dump_opts));
+            dump_opts.expand_terminals = true;
+            td_debug_context_reset(&dump_ctx, &dump_opts);
             struct td_debug_file_writer_ctx writer_ctx;
             td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
             int dump_rc = td_debug_dump_iface_binding_table(ctx->manager,
-                                                            NULL,
+                                                            &dump_opts,
                                                             td_debug_writer_file,
                                                             &writer_ctx,
                                                             &dump_ctx);

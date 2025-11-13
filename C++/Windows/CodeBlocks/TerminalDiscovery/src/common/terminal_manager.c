@@ -2449,15 +2449,17 @@ int td_debug_dump_terminal_table(struct terminal_manager *mgr,
                 rc = debug_emit_line(writer,
                                      writer_ctx,
                                      ctx_in,
-                                     "  terminal mac=%s ip=%s state=%s vlan=%d ifindex=%u tx_iface=%s last_seen=%s age_ms=%" PRIu64 "\n",
+                                     "  terminal mac=%s ip=%s state=%s vlan=%d ifindex=%u last_seen=%s age_ms=%" PRIu64 " last_probe=%s probe_age_ms=%" PRIu64 " failed_probes=%u\n",
                                      mac_buf,
                                      ip_buf,
                                      state_to_string(iter->state),
                                      iter->meta.vlan_id,
                                      iter->meta.ifindex,
-                                     tx_iface,
                                      last_seen_buf[0] ? last_seen_buf : "",
-                                     last_seen_age_ms);
+                                     last_seen_age_ms,
+                                     last_probe_buf[0] ? last_probe_buf : "",
+                                     last_probe_age_ms,
+                                     iter->failed_probes);
             }
         }
     }
