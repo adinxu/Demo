@@ -58,6 +58,7 @@
    - 仅监测虚接口 IPv4 地址的新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调），在 `terminal_manager` 内维护 `iface_address_table`（`kernel_ifindex -> prefix_list`）和反向索引 `iface_binding_index`（`kernel_ifindex -> terminal_entry*` 列表）。
    - `resolve_tx_interface` 先确认 `if_nametoindex` 或 selector 返回的 `kernel_ifindex > 0`，再校验终端 IP 是否命中地址表中的任意前缀；否则清空绑定并立即置为 `IFACE_INVALID`。
    - 地址表变更时仅遍历该 `kernel_ifindex` 对应的终端，将其设为 `IFACE_INVALID` 并等待后续报文或地址恢复重新探测。保活发送上下文仍依据终端绑定的 VLAN 元数据与物理接口配置组合，而非直接复用收包返回的逻辑 ifindex。
+   - 监听到绑定 VLANIF 删除最后一个有效 IPv4 时，立即清空终端的 `tx_kernel_ifindex/tx_source_ip`，输出结构化日志并将终端置为 `IFACE_INVALID` 保留；当同一接口重新添加与终端同网段的 IPv4 后，在地址表更新钩子中触发恢复流程，将其推进到 `PROBING` 并安排下一轮保活。
 5. ✅ 并发与锁：
    - 哈希桶访问由主互斥保护，探测回调在 worker 锁外执行，杜绝回调 re-entry 死锁。
 6. ✅ 文档：`doc/design/stage2_terminal_manager.md` 描述线程模型、接口解析策略与配置参数取值。
@@ -67,6 +68,7 @@
    - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；若暂未解析到 ifindex 时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。针对免费 ARP（sender IP 为空或 0.0.0.0）的情况，明确改用报文 `target IP` 更新终端 IPv4 地址，禁止继续记录无意义的 0.0.0.0；sender/target 同为 0.0.0.0 的报文视为异常并直接丢弃。
    - Realtek 平台结合 MAC 表缓存刷新 `terminal_metadata.ifindex`，若缓存命中失败则触发桥接 API 重拉，确保事件与北向查询对齐整机 ifindex。
    - 依赖 ACL 提供的 VLAN tag 判定终端归属；若地址表查不到对应前缀或无法再构造有效 ARP（例如 VLANIF 被移除 IPv4 或迁移网段），即转入 `IFACE_INVALID`，后续在地址恢复或报文再次到达时重新探测。
+   - 当 VLANIF 重新获得有效 IPv4 时，事件队列需及时触发一次 `IFACE_INVALID → PROBING` 的状态变更（或 `MOD`/`ADD` 视上下文而定），并补充相应结构化日志，保证北向能够感知恢复并在下一轮保活重新探测。
 2. ✅ 事件队列：
    - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/ifindex/prev_ifindex + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
    - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。
@@ -98,6 +100,8 @@
    - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex/prev_ifindex` 数值）与重复注册告警。
    - 后续若需并发访问覆盖，可在现有桩环境扩展多线程情景。
    - ✳️ 新增忽略 VLAN 覆盖：在单元/集成测试中注入被忽略的 VLAN 报文，断言不会生成终端/事件并记录过滤日志。
+   - ✳️ 跨 VLAN 迁移覆盖：构造“先在缺失 VLANIF 的 VLAN 被发现→拔插到具备或缺失 VLANIF 的新 VLAN”用例，校验终端刷新 VLAN 元数据、`MOD` 事件载荷与保活恢复/停保活逻辑。
+   - ✳️ IPv4 恢复覆盖：模拟 VLANIF 删除 IPv4 后终端进入 `IFACE_INVALID`，再补回同网段 IPv4，确认重新绑定 `tx_kernel_ifindex/tx_source_ip`、状态推进以及事件/日志均符合规范。
 4. ✳️ 打桩测试扩展方向：
    - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
    - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
