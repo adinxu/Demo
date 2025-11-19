@@ -39,6 +39,7 @@ typedef struct __SwUcMacEntry {
 
 int td_switch_mac_get_capacity(uint32_t *out_capacity);
 int td_switch_mac_snapshot(SwUcMacEntry *entries, uint32_t *out_count);
+int td_switch_mac_get_ifindex_by_vid(SwUcMacEntry *entry);
 
 #ifdef __cplusplus
 }
