@@ -66,6 +66,10 @@
 - **MAC 查表任务队列**：`int td_debug_dump_mac_lookup_queue(td_debug_writer_t writer, void *ctx);`
    - 输出当前待执行/执行中的 MAC 查表任务，包括 MAC、目标 VLAN/ifindex、创建时间、重试计数、状态标记。
    - 同时打印 `mac_need_refresh_` 队列长度、`mac_pending_verify_success`/`mac_pending_verify_failure`/`mac_pending_verify_retry` 等计数器、最长排队时长。
+- **Pending VLAN 队列快照**：`int td_debug_dump_pending_vlan_table(const td_debug_dump_opts_t *opts, td_debug_writer_t writer, void *ctx);`
+   - 遍历 `pending_vlans[4096]` 桶数组，统计已占用桶数与挂起终端总数，便于快速判断异常规模。
+   - 每个非空 VLAN 桶输出 `vlan=<vid> entries=<count>` 概要；若 `opts->expand_pending_vlans` 为真，则逐项展开终端详情（MAC、IP、当前状态、`pending_vlan_id`）。
+   - 保持与其他 dump 函数一致的错误处理：`writer` 报错立即中止并返回负值；内部持有 `terminal_manager.lock` 期间不允许阻塞 IO。
 - **MAC 定位版本号**：`int td_debug_dump_mac_locator_state(td_debug_writer_t writer, void *ctx);`
    - 输出 `mac_locator_version` 当前值、最近一次递增的触发原因（新增终端、查表成功、验证失败等）、关联终端数量。
    - 若无待处理任务仍需输出 baseline，便于比对上下游版本。

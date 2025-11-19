@@ -2866,6 +2866,124 @@ int td_debug_dump_iface_binding_table(struct terminal_manager *mgr,
     return rc;
 }
 
+int td_debug_dump_pending_vlan_table(struct terminal_manager *mgr,
+                                     const td_debug_dump_opts_t *opts,
+                                     td_debug_writer_t writer,
+                                     void *writer_ctx,
+                                     td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, opts) != 0) {
+        return -EINVAL;
+    }
+
+    size_t filtered_counts[TD_PENDING_VLAN_CAPACITY];
+    size_t total_counts[TD_PENDING_VLAN_CAPACITY];
+    memset(filtered_counts, 0, sizeof(filtered_counts));
+    memset(total_counts, 0, sizeof(total_counts));
+
+    pthread_mutex_lock(&mgr->lock);
+
+    size_t matched_buckets = 0;
+    size_t matched_entries = 0;
+
+    /* Collect per-VLAN counts so the summary line can be emitted before details. */
+    for (int vlan = TD_MIN_VLAN_ID; vlan <= TD_MAX_VLAN_ID; ++vlan) {
+        struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan);
+        if (!bucket || !bucket->head) {
+            continue;
+        }
+        if (opts && opts->filter_by_vlan && opts->vlan_id != vlan) {
+            continue;
+        }
+
+        size_t bucket_total = 0;
+        size_t bucket_filtered = 0;
+        for (struct pending_vlan_entry *node = bucket->head; node; node = node->next) {
+            struct terminal_entry *entry = node->terminal;
+            if (!entry) {
+                continue;
+            }
+            bucket_total += 1;
+            if (!opts || debug_entry_matches_opts(entry, opts)) {
+                bucket_filtered += 1;
+            }
+        }
+
+        if (bucket_filtered == 0) {
+            continue;
+        }
+
+        filtered_counts[vlan] = bucket_filtered;
+        total_counts[vlan] = bucket_total;
+        matched_buckets += 1;
+        matched_entries += bucket_filtered;
+    }
+
+    int rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "pending_vlans buckets=%zu terminals=%zu\n",
+                             matched_buckets,
+                             matched_entries);
+
+    if (rc == 0 && matched_entries > 0) {
+        for (int vlan = TD_MIN_VLAN_ID; vlan <= TD_MAX_VLAN_ID && rc == 0; ++vlan) {
+            size_t bucket_filtered = filtered_counts[vlan];
+            if (bucket_filtered == 0) {
+                continue;
+            }
+            size_t bucket_total = total_counts[vlan];
+            rc = debug_emit_line(writer,
+                                 writer_ctx,
+                                 ctx_in,
+                                 "pending vlan=%d entries=%zu total=%zu\n",
+                                 vlan,
+                                 bucket_filtered,
+                                 bucket_total);
+            if (rc != 0) {
+                break;
+            }
+
+            if (opts && opts->expand_pending_vlans) {
+                struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan);
+                if (!bucket) {
+                    continue;
+                }
+                for (struct pending_vlan_entry *node = bucket->head; node && rc == 0; node = node->next) {
+                    struct terminal_entry *entry = node->terminal;
+                    if (!entry) {
+                        continue;
+                    }
+                    if (opts && !debug_entry_matches_opts(entry, opts)) {
+                        continue;
+                    }
+                    char mac_buf[18];
+                    char ip_buf[INET_ADDRSTRLEN];
+                    format_terminal_identity(&entry->key, mac_buf, ip_buf);
+                    rc = debug_emit_line(writer,
+                                         writer_ctx,
+                                         ctx_in,
+                                         "  terminal mac=%s ip=%s state=%s pending_vlan=%d meta_vlan=%d ifindex=%u\n",
+                                         mac_buf,
+                                         ip_buf,
+                                         state_to_string(entry->state),
+                                         entry->pending_vlan_id,
+                                         entry->meta.vlan_id,
+                                         entry->meta.ifindex);
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return rc;
+}
+
 int td_debug_dump_mac_lookup_queue(struct terminal_manager *mgr,
                                    td_debug_writer_t writer,
                                    void *writer_ctx,

@@ -269,6 +269,28 @@ static void handle_command(const char *command,
         return;
     }
 
+    if (strcmp(command, "dump pending vlan") == 0) {
+        if (ctx->manager) {
+            td_debug_dump_context_t dump_ctx;
+            td_debug_dump_opts_t dump_opts;
+            memset(&dump_opts, 0, sizeof(dump_opts));
+            dump_opts.expand_pending_vlans = true;
+            td_debug_context_reset(&dump_ctx, &dump_opts);
+            struct td_debug_file_writer_ctx writer_ctx;
+            td_debug_file_writer_ctx_init(&writer_ctx, stdout, &dump_ctx);
+            int dump_rc = td_debug_dump_pending_vlan_table(ctx->manager,
+                                                           &dump_opts,
+                                                           td_debug_writer_file,
+                                                           &writer_ctx,
+                                                           &dump_ctx);
+            if (dump_rc != 0) {
+                td_log_writef(TD_LOG_WARN, "terminal_daemon", "dump pending vlan failed: %d", dump_rc);
+            }
+            fflush(stdout);
+        }
+        return;
+    }
+
     if (strcmp(command, "show config") == 0) {
         if (ctx->manager) {
             terminal_manager_log_config(ctx->manager);
@@ -279,7 +301,7 @@ static void handle_command(const char *command,
     if (strcmp(command, "help") == 0) {
         td_log_writef(TD_LOG_INFO,
                       "terminal_daemon",
-                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | show config | set <option> <value> | ignore-vlan add <vid> | ignore-vlan remove <vid> | ignore-vlan clear | exit | quit | help");
+                      "commands: stats | dump terminal | dump prefix | dump binding | dump mac queue | dump mac state | dump pending vlan | show config | set <option> <value> | ignore-vlan add <vid> | ignore-vlan remove <vid> | ignore-vlan clear | exit | quit | help");
         return;
     }
 

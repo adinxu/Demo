@@ -130,7 +130,7 @@
 1. ✅ 设计 `td_debug_writer_t` 及 `td_debug_dump_opts_t/td_debug_dump_context_t` 数据结构，确保在核心锁范围内的调用不会引入阻塞 IO，并定义默认的 `FILE*` 写入包装。
 2. ✅ 在 `terminal_manager` 内实现 `td_debug_dump_terminal_table`、`td_debug_dump_iface_prefix_table`、`td_debug_dump_iface_binding_table`、`td_debug_dump_mac_lookup_queue`、`td_debug_dump_mac_locator_state`，支持按状态/VLAN/ifindex/MAC 前缀过滤以及输出行数统计，并确保在 `writer` 返回错误时及时释放锁并上报错误码。
 3. ✅ 更新北向 C++ 桥接，提供面向 `std::string`/`std::ostream` 的轻量封装及 `TerminalDebugSnapshot` 工具类，便于外部守护进程在不中断主流程情况下获取快照；同时新增示例代码演示如何注册回调与调用调试接口。
-4. ✅ 扩展单元与集成测试：新增针对过滤参数、错误回调、空数据集与大规模哈希桶的断言；在现有测试框架中注入打桩 `writer` 捕获输出并校验关键字段。补充 `doc/` 下调试接口指南，记录常见排障场景与示例输出。
+4. ✅ 扩展单元与集成测试：补齐 `td_debug_dump_pending_vlan_table` 实现，串联 CLI `dump pending vlan` 与 C++ `TerminalDebugSnapshot::dumpPendingVlanTable`，并在单元/集成测试及调试文档中覆盖 pending VLAN 场景与展开输出示例。
 
 ### 阶段 8：启动阶段地址表同步（已完成）
 1. ✅ 审核 `terminal_netlink`、`terminal_manager` 现有初始化流程及 `iface_address_table`/`iface_binding_index` 结构，明确首批接口地址注入位置与锁保护策略。

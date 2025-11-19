@@ -364,6 +364,13 @@ static bool test_increment_add_and_get_all(terminal_manager *mgr,
             std::printf("[FAIL] debug binding dump missing header\n");
             ok = false;
         }
+        TdDebugDumpOptions pending_options;
+        pending_options.expandPendingVlans = true;
+        std::string pending = debug_snapshot.dumpPendingVlanTable(pending_options);
+        if (pending.find("pending_vlans") == std::string::npos) {
+            std::printf("[FAIL] debug pending vlan dump missing summary\n");
+            ok = false;
+        }
         std::string prefixes = debug_snapshot.dumpIfacePrefixTable();
         if (prefixes.find("iface kernel_ifindex") == std::string::npos) {
             std::printf("[FAIL] debug prefix dump missing header\n");

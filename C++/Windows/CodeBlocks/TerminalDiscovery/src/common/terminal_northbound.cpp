@@ -381,6 +381,27 @@ std::string TerminalDebugSnapshot::dumpIfaceBindingTable(const TdDebugDumpOption
     return output;
 }
 
+std::string TerminalDebugSnapshot::dumpPendingVlanTable(const TdDebugDumpOptions &options) const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_opts_t c_opts = options.to_c();
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, &c_opts);
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_pending_vlan_table(manager_, &c_opts, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_pending_vlan_table failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
+}
+
 std::string TerminalDebugSnapshot::dumpMacLookupQueues() const {
     std::string output;
     if (!manager_) {

@@ -112,6 +112,7 @@ typedef struct td_debug_dump_opts {
     size_t mac_prefix_len;
     bool verbose_metrics;
     bool expand_terminals;
+    bool expand_pending_vlans;
 } td_debug_dump_opts_t;
 
 typedef struct td_debug_dump_context {
@@ -251,6 +252,12 @@ int td_debug_dump_mac_lookup_queue(struct terminal_manager *mgr,
                                    td_debug_writer_t writer,
                                    void *writer_ctx,
                                    td_debug_dump_context_t *ctx);
+
+int td_debug_dump_pending_vlan_table(struct terminal_manager *mgr,
+                                     const td_debug_dump_opts_t *opts,
+                                     td_debug_writer_t writer,
+                                     void *writer_ctx,
+                                     td_debug_dump_context_t *ctx);
 
 int td_debug_dump_mac_locator_state(struct terminal_manager *mgr,
                                     td_debug_writer_t writer,

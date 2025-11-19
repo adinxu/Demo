@@ -1201,6 +1201,7 @@ done:
 
 static bool test_debug_dump_interfaces(void) {
     const int vlan_id = 310;
+    const int pending_vlan_id = vlan_id + 1;
     const int tx_kernel_ifindex = mock_kernel_ifindex_for_vlan(vlan_id);
     struct terminal_manager_config cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -1232,6 +1233,20 @@ static bool test_debug_dump_interfaces(void) {
     build_arp_packet(&packet, &arp, mac, "203.0.113.20", "203.0.113.20", vlan_id, 5);
 
     terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    struct ether_arp pending_arp;
+    struct td_adapter_packet_view pending_packet;
+    const uint8_t pending_mac[ETH_ALEN] = {0x02, 0xcc, 0xdd, 0xee, 0xff, 0x10};
+    build_arp_packet(&pending_packet,
+                     &pending_arp,
+                     pending_mac,
+                     "203.0.113.30",
+                     "203.0.113.30",
+                     pending_vlan_id,
+                     6);
+
+    terminal_manager_on_packet(mgr, &pending_packet);
     terminal_manager_flush_events(mgr);
 
     struct debug_capture capture;
@@ -1303,6 +1318,24 @@ static bool test_debug_dump_interfaces(void) {
     rc = td_debug_dump_mac_locator_state(mgr, debug_capture_writer, &capture, &ctx);
     if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "mac_locator")) {
         fprintf(stderr, "mac locator dump failed rc=%d\n", rc);
+        ok = false;
+        goto cleanup;
+    }
+
+    debug_capture_reset(&capture);
+    memset(&opts, 0, sizeof(opts));
+    opts.filter_by_vlan = true;
+    opts.vlan_id = pending_vlan_id;
+    opts.expand_pending_vlans = true;
+    td_debug_context_reset(&ctx, &opts);
+    rc = td_debug_dump_pending_vlan_table(mgr, &opts, debug_capture_writer, &capture, &ctx);
+    if (rc != 0 || ctx.had_error || !capture.data || !strstr(capture.data, "pending vlan=")) {
+        fprintf(stderr, "pending vlan dump failed rc=%d had_error=%d\n", rc, ctx.had_error ? 1 : 0);
+        ok = false;
+        goto cleanup;
+    }
+    if (!strstr(capture.data, "  terminal mac=")) {
+        fprintf(stderr, "pending vlan dump missing terminal detail\n");
         ok = false;
         goto cleanup;
     }
