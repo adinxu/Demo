@@ -147,6 +147,9 @@ flowchart TD
     - 仅当外部注册了事件回调时才会通过 `queue_event` 生成节点；`event_cb == NULL` 时函数直接返回，避免无意义的内存分配，未消费的批次会在统计中累计到 `event_dispatch_failures`。
   - `mac_lookup_task`
     - 封装 MAC 查表请求（终端 key、VLAN、校验标志），由 `mac_need_refresh` 与 `mac_pending_verify` 队列驱动，最终在解锁后批量执行；`verify == true` 表示该任务源自版本刷新后的二次校验，需确认现有 `ifindex` 是否仍与桥表一致，失败时会按照 `mac_lookup_apply_result` 中的逻辑清空旧端口并触发 `MOD` 事件。
+  - `pending_vlan_bucket` / `pending_vlan_entry`
+    - 以 VLAN ID 为索引的 4096 个桶，挂载仍缺乏有效 `tx_kernel_ifindex` / `tx_source_ip` 的终端；`pending_attach` 会在 `resolve_tx_interface` 失败、地址前缀被删除或绑定被回收时将终端加入桶内，`pending_detach` 则在解析成功后移除。
+    - `pending_retry_vlan` 会遍历桶内终端尝试重新绑定，并在成功时将状态改回 `PROBING`；`pending_retry_for_ifindex` 通过 `if_indextoname` 逆解析 VLAN ID，再调用 `pending_retry_vlan`，主要由地址新增事件或初始地址同步成功后触发。
   - `terminal_probe_request_t`
     - `terminal_manager_on_timer` 构造的探测快照，包含终端 key、待使用的 VLAN ID、可选的回退接口和 `source_ip`；`terminal_probe_handler` 依据该结构直接生成以物理口为主、虚接口为备的 ARP 请求。
 - **关键函数**：
@@ -276,6 +279,7 @@ classDiagram
     +mac_lookup_task* mac_need_refresh_tail
     +mac_lookup_task* mac_pending_verify_head
     +mac_lookup_task* mac_pending_verify_tail
+    +pending_vlan_bucket pending_vlans[4096]
     +uint64_t mac_locator_version
     +bool mac_locator_subscribed
     +bool destroying
@@ -343,6 +347,13 @@ classDiagram
     +bool verify
     +mac_lookup_task* next
   }
+  class pending_vlan_bucket {
+    +pending_vlan_entry* head
+  }
+  class pending_vlan_entry {
+    +terminal_entry* terminal
+    +pending_vlan_entry* next
+  }
   class terminal_probe_request_t {
     +terminal_key key
     +char tx_iface[IFNAMSIZ]
@@ -362,6 +373,9 @@ classDiagram
   terminal_manager "1" o--> "*" probe_task : pending
   probe_task "1" --> "1" terminal_probe_request_t
   terminal_manager "1" o--> "*" mac_lookup_task : mac queues
+  terminal_manager "1" o--> "*" pending_vlan_bucket : pending_vlans
+  pending_vlan_bucket "1" o--> "*" pending_vlan_entry
+  pending_vlan_entry --> terminal_entry
   mac_lookup_task --> terminal_key
   terminal_probe_request_t --> terminal_key
   terminal_entry --> terminal_metadata
@@ -376,6 +390,7 @@ classDiagram
 - `probe_task` 链表在 `terminal_manager_on_timer` 内构建（持锁），随后释放锁并逐个执行回调。
 - `mac_lookup_task` 队列由 `mac_need_refresh`/`mac_pending_verify` 两条链维护：`terminal_manager_on_packet`、`terminal_manager_on_timer` 与 MAC 刷新回调都会向其中追加任务；真正的桥接查询在解锁后通过 `mac_lookup_execute` 执行，命中后更新 `terminal_metadata.ifindex` 与 `mac_view_version` 并触发必要的 `MOD` 事件。
 - Realtek 适配器的 `mac_cache_worker` 线程在刷新 `td_switch_mac_snapshot` 成功后调用订阅回调 `mac_locator_on_refresh(version)`；若失败则上报 `version=0`，管理器会保留待处理任务等待下一轮刷新。
+- `pending_vlans` 桶数组在持锁情况下由 `pending_attach/pending_detach` 维护，`pending_retry_vlan` 与 `pending_retry_for_ifindex` 会在重试时遍历桶内链表；成功解析后的终端会在同一锁保护下清除 Pending 记录并复位至可探测状态。
 
 ### 5. Netlink 监听器 `common/terminal_netlink`
 - `terminal_netlink_start/stop`：管理基于 `NETLINK_ROUTE` 的后台线程，订阅 `RTM_NEWADDR/DELADDR` 并调用 `terminal_manager_on_address_update`。
@@ -442,6 +457,10 @@ classDiagram
     +uint32_t rx_ring_size
     +uint32_t tx_interval_ms
   }
+  class td_adapter_env {
+    +log_fn(void*,td_log_level_t,const char*,const char*)
+    +void* log_user_data
+  }
   class realtek_mac_cache {
     +pthread_rwlock_t map_lock
     +mac_bucket_entry* buckets[256]
@@ -467,6 +486,7 @@ classDiagram
   }
   td_adapter --> td_adapter_packet_subscription
   td_adapter --> td_adapter_config
+  td_adapter --> td_adapter_env
   td_adapter --> realtek_mac_cache
   realtek_mac_cache "1" o--> "*" mac_bucket_entry
 ```
@@ -475,6 +495,7 @@ classDiagram
 - `send_lock` 与 `last_send` 实现 ARP 发送节流，确保 `realtek_send_arp` 在多次调用时保持顺序与间隔。
 - `running` 原子变量用于 `rx_thread_main` 的退出控制，来自 `td_atomic.h` 的轻量封装。
 - `mac_cache` 维护桥表快照：`map_lock` 保证哈希桶并发访问，`worker_lock/worker_cond` 控制后台刷新线程，`refresh_cb` 将最新版本号上报给终端管理器。
+- `env` 保存可选日志回调及上下文，`adapter_log_bridge` 会通过该指针将适配器内部日志统一导向 `td_logging` 或嵌入式宿主。
 - `mac_bucket_entry` 链表为每个 VLAN/MAC 提供 ifindex 缓存，刷新失败时保留旧快照以提高稳定性。
 
 ## 通信与顺序
@@ -572,6 +593,31 @@ sequenceDiagram
 
 该流程强调 MAC 桥接刷新与终端 ifindex 的解耦：刷新线程永远不持有管理器锁，`mac_lookup_execute` 在无锁上下文顺序查询并在结束后触发一次事件分发，确保 `MOD/DEL` 事件与北向回调保持一致节奏。
 
+### 顺序图：地址事件驱动状态切换与 Pending 重试
+
+```mermaid
+sequenceDiagram
+  participant NL as terminal_netlink<br/>listener
+  participant TM as terminal_manager
+  participant IF as iface_record
+  participant Pending as pending_vlans
+
+  NL->>TM: terminal_manager_on_address_update(add/del)
+  TM->>IF: iface_prefix_add/remove(ifindex)
+  alt 新增前缀
+    TM->>Pending: pending_retry_for_ifindex(ifindex)
+    Pending->>TM: pending_retry_vlan(vlan)
+    TM->>TM: resolve_tx_interface(终端)
+    TM->>TM: set_state(IFACE_INVALID→PROBING)
+  else 删除前缀
+    TM->>IF: iface_binding_detach(终端)
+    TM->>Pending: pending_attach(终端, vlan)
+    TM->>TM: set_state(任何状态→IFACE_INVALID)
+  end
+```
+
+该序列展示了地址事件与状态机之间的耦合：当 `terminal_netlink` 报告 `RTM_NEWADDR` 时，管理器会刷新 `iface_record` 并调用 `pending_retry_for_ifindex`，按 VLAN 将挂起终端逐一重试；一旦 `resolve_tx_interface` 再次成功会清理 Pending 链表并把状态推进到 `PROBING`。而 `RTM_DELADDR` 会拆除绑定、将终端收入 Pending 桶并即时切换到 `IFACE_INVALID`，同时更新时间戳以便后续淘汰逻辑准确生效。
+
 ## 分配视图（线程与资源）
 
 ```mermaid
@@ -658,6 +704,8 @@ td_switch_mac_get_capacity"]
   - Worker 线程 (`terminal_manager_on_timer`) -> 决定是否探测 -> `terminal_probe_handler` -> `realtek_adapter.send_arp` -> 网络。
 3. **地址事件链路**：
   - Netlink 监听线程 (`terminal_netlink`) -> 启动时先通过地址同步回调抓取当前 IPv4 前缀（`RTM_GETADDR` -> `getifaddrs` 回退） -> 解析实时 `RTM_NEWADDR/DELADDR` -> `terminal_manager_on_address_update` -> 更新地址表与反向索引；若初始抓取失败，后台 worker 会按照挂起标记持续触发重试直至成功。
+  - `RTM_DELADDR` 会触发 `iface_binding_detach`，清理绑定表并调用 `pending_attach` 将终端标记为等待重绑，同时把状态切换为 `IFACE_INVALID` 并重新记录 `last_seen`，以保证淘汰计时基于解绑时刻。
+  - `RTM_NEWADDR` 或同步抓取成功后会设置 `retry_pending`，由 `pending_retry_for_ifindex` 定位 VLAN 并调用 `pending_retry_vlan`；凡是可以重新解析的终端会清空 Pending 状态、恢复绑定并推进状态机到 `PROBING`，否则继续保留在 Pending 桶等待下一次机会。
 4. **查询接口**：
   - 北向 `getAllTerminalInfo` -> `terminal_manager_query_all` -> C++ 向量结果。
 5. **配置入口**：
@@ -665,7 +713,10 @@ td_switch_mac_get_capacity"]
 6. **MAC 桥接刷新链路**：
   - Realtek `mac_cache_worker` -> `mac_locator_on_refresh` 合并 `mac_need_refresh`/`mac_pending_verify` -> 脱锁后 `mac_lookup_execute` 调用 `mac_locator_ops.lookup` -> 写回 `terminal_metadata.ifindex` 与事件队列 -> `terminal_manager_maybe_dispatch_events`。
 
-上述 6 条数据流可以结合前述顺序图和分配视图理解跨线程的执行路径，特别是探测调度、MAC ifindex 更新与事件队列在 `terminal_manager.c` 中的互斥保护与脱锁分发逻辑。
+7. **Pending 重试链路**：
+  - `resolve_tx_interface` 失败、地址删除或绑定被回收时调用 `pending_attach`，终端被存入以 VLAN ID 为索引的桶中并立即进入 `IFACE_INVALID`；随后 `terminal_manager_on_packet`、`pending_retry_for_ifindex` 或 CLI 触发的地址同步成功时，会通过 `pending_retry_vlan` 尝试逐条重绑，成功后由 `pending_detach` 清理桶并重新点亮状态机。
+
+上述 7 条数据流可以结合前述顺序图和分配视图理解跨线程的执行路径，特别是探测调度、MAC ifindex 更新与事件队列在 `terminal_manager.c` 中的互斥保护与脱锁分发逻辑。
 
 ## 维护建议
 - 修改 `terminal_manager` 状态机或事件逻辑时，同时更新 `doc/design/stage3_event_pipeline.md` 与相关测试计划。

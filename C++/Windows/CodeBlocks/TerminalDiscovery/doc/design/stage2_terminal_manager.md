@@ -29,6 +29,7 @@
   - `const td_adapter_ops *adapter_ops` 与 `mac_locator_ops`：构造阶段从适配器描述符读取，`terminal_manager_create` 会完成订阅并保存回调句柄。
   - `mac_need_refresh_head/tail` 与 `mac_pending_verify_head/tail`：内部 `mac_lookup_task` 队列，分别承载等待 MAC 快照刷新与待验证的终端，确保查表过程在解锁状态下串行执行。
   - `mac_locator_version` 与 `mac_locator_subscribed`：记录最近一次成功刷新版本号及当前订阅状态，避免重复注册或错过增量通知。
+  - `pending_vlans[4096]`：按 VLAN ID 建立的延迟绑定桶，每个桶维护一个单链表，保存暂时缺少可用 VLANIF/IPv4 的终端；当 `resolve_tx_interface` 失败时通过 `pending_attach` 写入，地址事件或定时重试会遍历对应链表重新尝试绑定。
   - `iface_address_table`：哈希表维护 `kernel_ifindex -> prefix_list`，每项包含网络地址与掩码长度；仅在持有 `lock` 时更新。
   - `iface_binding_index`：反向索引 `kernel_ifindex -> terminal_entry*` 链表，`resolve_tx_interface` 成功后登记，便于地址变化时精准定位受影响终端。
   - `struct terminal_metadata` 新增字段：
@@ -60,9 +61,9 @@
 2. 生成单一候选：若 VLAN ID >= 0，则根据 `vlan_iface_format`（默认 `vlan%u`）拼出接口名并通过 `if_nametoindex` 解析；若仅得到接口名，函数会再次调用 `if_nametoindex` 兜底，确保内核 ifindex 有效。
 3. 地址校验：解析出 ifindex 后，会到 `iface_records` 中查找对应地址前缀，并通过 `iface_record_select_ip` 挑选与终端 IP 匹配的源地址；失败时认为候选无效并回退。
 4. 解绑与回退：
-  - 当候选无效或完全无法解析时，会调用 `iface_binding_detach`（若此前存在绑定）并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`，随后返回 `false` 以便上层转入 `IFACE_INVALID`；
-  - 旧绑定与新的候选 ifindex 不一致时，同样先执行解绑以维持反向索引一致性。
-5. 建立新绑定：候选合法时，写入 `tx_iface/tx_kernel_ifindex/tx_source_ip` 并调用 `iface_binding_attach` 加入索引；若 attach 失败（内存不足等），会立即回滚到未绑定状态。
+  - 当候选无效或完全无法解析时，会调用 `iface_binding_detach`（若此前存在绑定）并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`，再通过 `pending_attach` 将终端加入对应 VLAN 桶，随后返回 `false` 以便上层转入 `IFACE_INVALID`；
+  - 旧绑定与新的候选内核 ifindex（即 `tx_kernel_ifindex`，并非 `terminal_metadata.ifindex`）不一致时，同样会先执行解绑来保持 `iface_binding_index` 与当前生效的内核 ifindex 一致；若后续 `iface_binding_attach` 走通，则立即根据新内核 ifindex 重建绑定；若 attach 失败或候选在验证阶段被判定不可用，则会通过 `pending_attach` 重新入队至 `pending_vlans`，等待地址事件或下次报文再试。
+5. 建立新绑定：候选合法时，写入 `tx_iface/tx_kernel_ifindex/tx_source_ip` 并调用 `iface_binding_attach` 加入索引；若 attach 失败（内存不足等），会立即回滚到未绑定状态并重新加入 `pending_vlans` 等待后续重试。
 6. 返回值：成功解析且绑定完成时返回 `true`，否则返回 `false`，供调用方控制状态机（`apply_packet_binding` 在失败时将终端标记为 `IFACE_INVALID`）。
 
 ### 定时扫描 `terminal_manager_on_timer`
@@ -84,6 +85,7 @@
   - 对所有关联终端重新校验其 IP 是否仍命中该接口前缀；若不命中则清空回退接口绑定并调用 `set_state(...IFACE_INVALID)`，同时保留 VLAN ID 以便后续报文复活；更新仅影响内部状态，不直接排队事件。
   - 若前缀恢复，只需等待后续报文或定时线程再次调度 `resolve_tx_interface` 即可重新建立绑定；只有当新的报文导致 ifindex 发生变化或终端被重新创建时才会触发对外事件。
   - 当绑定列表因前缀变更而移除终端时，会同步清理 `iface_binding_index` 中对应节点，确保索引与地址表保持一致。
+  - 对于新增前缀，除了刷新已绑定终端的 `tx_source_ip` 外，还会调用 `pending_retry_for_ifindex`：该逻辑依据 `if_indextoname` 拿到 VLAN 号，并只遍历对应的 `pending_vlans` 链表，对每个条目重新执行 `resolve_tx_interface`。一旦新地址满足条件，终端会自动迁回绑定索引，无需等待新报文。
   - `main/terminal_main.c` 在管理器创建后启动 `terminal_netlink` 监听线程，直接调用该接口完成同步，无需额外的适配层事件桥接。
 
 ### 地址初始同步与重试
@@ -96,9 +98,10 @@
 ### IFACE_INVALID 状态补充
 - 所有进入 `IFACE_INVALID` 的路径（如 `resolve_tx_interface` 返回失败、地址事件删除前缀）都会调用 `iface_binding_detach`，立即从 `iface_binding_index` 中移除终端并清空 `tx_iface/tx_kernel_ifindex/tx_source_ip`。若 MAC 查询失败并返回未知 ifindex，仅会把 `meta.ifindex` 重置为 0，状态仍保持不变，等待后续路径再次评估 `is_iface_available`。
 - 定时线程依赖 `is_iface_available` 判断是否具备有效的 `tx_kernel_ifindex` 与 `tx_source_ip`。任一字段缺失都会保持 `IFACE_INVALID`，并通过 `iface_invalid_holdoff_sec` 的倒计时决定是否淘汰，不会主动发起探测。
-- 恢复路径依赖新的报文或对 `resolve_tx_interface` 的再尝试：当有新报文到达且绑定成功时，状态从 `IFACE_INVALID` 先过渡到 `PROBING`，随后在定时线程或再次报文中切回 `ACTIVE`。若报文到达时仍缺乏地址前缀，则保持 `IFACE_INVALID`。
-- `terminal_manager_on_address_update` 在新增前缀时只会刷新仍保持绑定的终端的 `tx_source_ip`。已被解绑的 `IFACE_INVALID` 条目需要等待下一次报文重新入表；其 `last_seen` 会在解绑时刻更新，确保保留期从最新的事件重新计时。
+- 恢复路径可由新增报文或地址事件驱动：当有新报文到达且绑定成功时，状态从 `IFACE_INVALID` 先过渡到 `PROBING`，随后在定时线程或再次报文中切回 `ACTIVE`；若仍缺乏前缀则维持 `IFACE_INVALID`。当地址事件补齐前缀时，`pending_retry_for_ifindex` 会触发 `pending_vlans` 中的条目重新尝试绑定，因此即便没有新报文，终端也能依靠地址恢复自动回归 `PROBING`。
+- `terminal_manager_on_address_update` 在新增前缀时除了刷新仍保持绑定的终端 `tx_source_ip` 外，也会将命中的 `pending_vlans` 条目提前唤醒；若恢复失败（仍缺少匹配网段），条目继续保留在待恢复桶中并维持 `IFACE_INVALID`。
 - **限制说明**：如果终端在进入 `IFACE_INVALID` 后始终没有新的报文抵达，即便后台地址恢复也不会主动触发 `resolve_tx_interface` 或保活探测，条目会一直停留在 `IFACE_INVALID` 状态直至 `iface_invalid_holdoff_sec` 到期被删除。当前实现依赖后续业务流量来唤醒终端，需在 Stage 3+ 评估是否引入主动重试机制。
+  - 上述限制在引入 `pending_vlans` 后缩小到“地址恢复失败”场景：只要地址事件能够解析出 VLANIF 对应的内核 ifindex，就会立即尝试重绑；仍然需要考虑无 `if_indextoname` 映射或 `resolve_tx_interface` 反复失败的情况。
 
 ## ifindex 同步策略
 Realtek 适配器提供 `mac_locator_ops->subscribe` 接口；`terminal_manager_create` 成功后会注册 `mac_locator_on_refresh(uint64_t version, void *ctx)`，用于感知 MAC 快照更新或失败。

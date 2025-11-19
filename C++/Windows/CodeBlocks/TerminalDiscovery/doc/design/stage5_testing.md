@@ -27,7 +27,9 @@
 - `test_duplicate_registration`：再次调用 `setIncrementReport` 期望 `-EALREADY`，验证北向重复注册保护。
 - `test_increment_add_and_get_all`：模拟地址事件 + ARP 报文，确认增量批次仅含 `ADD` 事件，`getAllTerminalInfo` 返回一致的 ifindex/prev_ifindex 组合（新增场景仍为 0）。
 - `test_netlink_removal`：删除前缀并等待 holdoff，检查 `DEL` 事件与全量快照清空。
-- `test_stats_tracking`：执行完整增删流程后读取统计，核对发现/移除/地址事件/当前条目等字段。
+- `test_cross_vlan_migration`：构造「先在缺失 VLANIF 的 VLAN 被学习 → 地址表补齐 → 再迁移到另一 VLAN」的序列，验证 `pending_vlans` 桶如何在 `RTM_NEWADDR` 事件后驱动终端出队、`MOD` 事件携带新旧 ifindex，以及 debug dump 中 `tx_kernel_ifindex/tx_src` 的即时变化。
+- `test_ipv4_recovery`：模拟 VLANIF IPv4 删除并恢复，确认终端进入 `IFACE_INVALID` 后仍保留在 `pending_vlans` 中，地址恢复时无需额外报文即可重新绑定，并检查 debug dump 与最终 `DEL` 事件。
+- `test_stats_tracking`：在上述流程收尾阶段读取统计，核对发现/移除/地址事件总数是否包含跨 VLAN 迁移与 IPv4 恢复场景。
 
 测试过程同样关闭日志噪声，并通过全局捕获器记录增量批次；最终输出 `integration tests passed/failed` 便于自动化脚本判定结果。
 

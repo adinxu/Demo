@@ -21,14 +21,14 @@
 ## 功能性需求
 1. **终端发现**：仅处理接收到的 ARP 广播、免费 ARP、单播回复等（本机发送的 ARP 已在适配层过滤），按 VLAN/接口识别终端；后续需可扩展至 DHCP 报文。
 2. **保活机制**：每个终端每 120 秒发送一次单播 ARP request；连续三次无响应则删除终端。终端与其首次或最近一次有效报文对应的三层虚接口/VLAN 建立绑定，保活报文必须从该虚接口发出，确保与发现路径保持一致；若该接口缺失可用 IPv4（如接口 down、IP 被删除或迁移至不同网段导致无法拼装 ARP），则视为保活通道失效并进入接口无效流程。
-3. **接口感知**：追踪三层 VLAN 接口生命周期（创建/删除/上下线、IP 变更），接口无效时暂停保活。
+3. **接口感知**：仅依赖 IPv4 地址增删和 `if_nametoindex` 可解析性来判断三层 VLAN 接口是否可用，无需额外监听 VLAN 接口的创建/删除事件；接口无效时暂停保活。
 4. **Access/Trunk 逻辑**：当前平台 ACL 已保证送达内核的报文携带真实 VLAN tag，且该 VLAN 必然已在本机存在；因此无需额外查询 Access/Trunk 配置数据，仅依据报文内 VLAN 决定终端归属。仍需在缺失对应 VLANIF 时按三层 Down 逻辑处理。
-5. **拓扑边界场景**：当关联的三层接口 down、VLAN 缺少虚接口或出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）时保留 30 分钟，期间不发送保活；恢复后转入探测态。
+5. **拓扑边界场景**：当关联的三层接口暂不可用（无法解析 `if_nametoindex`、缺少可匹配 IPv4、出现跨网段 ARP）时保留 30 分钟，期间不发送保活；恢复后转入探测态。
 6. **平台适配**：为不同平台提供独立适配器实现，部署时按平台选择单个适配器运行（不在同一进程内并行多个适配器）。
 7. **事件上报**：
    - 提供实时增量变更通知，注册回调后立即推送发现的终端变化。
    - 支持查询当前终端表的全量快照，并确保增量上报状态与查询快照一致。
-   - 当终端因端口变更触发 `MOD` 事件时，增量载荷需同时携带新旧 ifindex；其余事件类型旧端口值填 0 作为占位，便于北向通用处理。
+   - 当终端因端口变更触发 `MOD` 事件时，增量载荷需同时携带新旧 ifindex；此处指的是面向北向的逻辑接口标识（即 `terminal_metadata.ifindex`，与 `TerminalInfo::ifindex` 对齐），而非内部用于发送保活的 `tx_kernel_ifindex`。其余事件类型旧端口值填 0 作为占位，便于北向通用处理。
 8. **可配置项**：
    - 可配置终端保活周期、最大终端数量（200、300、500、1000 等档位）。
    - 启动时按配置选择唯一的平台适配器；为该适配器定义必要的端口/VLAN 过滤参数。
@@ -129,11 +129,18 @@
    5. 默认日志回调实现位于 C++ 桥接层，内置格式保持 `event=<TAG> mac=<MAC> ip=<IP> ifindex=<IDX>` 输出，支持 `setIncrementReport` 运行期在“仅日志”与“业务上报”模式之间切换；若外部未再次注册，事件管线维持最新一次回调配置。
    6. 模块在守护进程生命周期内保持运行；停机与资源回收由宿主进程负责，通常与进程退出同生共死。
 - **接口管理**：
-   1. 仅关心三层虚接口（VLANIF）的上下线、IP 变更；二层 access/trunk 口的物理 up/down 不触发状态变更。
-   2. 收到 Access 口报文、且无对应虚接口时终端保持发现状态但不保活；Trunk 口报文无需再次校验 permit 集合（ACL 已确保 VLAN 合法），仅在缺失对应 VLANIF 时按无虚接口逻辑处理。
-   3. 虚接口事件（创建/删除/up/down/IP 增删改）对终端的最终影响归结为“是否存在可用 IPv4”：只有当 VLANIF 已创建且为 UP 状态、至少绑定一个 IPv4 地址，并且该地址与终端 IP 处于同一网段时，终端才被视为具备可用邻居并可进入 `ACTIVE/PROBING`。任一条件不满足都视作 `IFACE_INVALID`，即便上游持续推送事件也不会放宽判定。收到 ARP 报文时若发现对应 VLANIF 尚未满足上述条件，仍需记录/刷新终端条目，但立刻将其状态切换为 `IFACE_INVALID` 并停止保活，等待后续接口恢复；该行为确保“已发现但暂不可达”的终端不会误报为活跃。
-   4. 需监测虚接口 IP 的增删改（可通过 Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调）；核心引擎维护“可用接口地址表”（`kernel_ifindex -> {prefix}`，以下简称地址表中的 ifindex 均指内核接口索引 `kernel_ifindex`）。该表实现为哈希表或动态数组，元素保存接口索引、前缀长度、网络地址（CIDR 表示）。进程启动阶段必须先获取一次当前完整 IPv4 地址表并写入该结构（优先使用 Netlink `RTM_GETADDR` dump，无法获取时回退至 `getifaddrs` 等通用接口），保证在第一批终端报文到来前即可判断接口有效性；若初始化抓取失败需写入告警日志并维持重试钩子，同时保持终端按现有逻辑处于 `IFACE_INVALID`，以便覆盖确实未配置 IPv4 的设备。一旦监听到新 IPv4 被添加到某个 VLANIF，需立即重新解析该接口下所有 `IFACE_INVALID` 终端：若新地址与终端同网段，则恢复 `tx_source_ip/tx_kernel_ifindex`，将状态推进到 `PROBING` 并在下一轮保活或报文驱动下返回 `ACTIVE`，实现“从无效到恢复”的闭环；若新地址仍不匹配，则继续保持 `IFACE_INVALID`。
-      5. 为避免 IP 事件触发全量扫描，按 `kernel_ifindex` 维护反向索引（`kernel_ifindex -> terminal_entry list`）。索引可采用链表头数组或哈希表，节点即 `terminal_entry` 指针，维护时确保多重注册去重。`resolve_tx_interface` 成功后在索引中登记；若接口当前尚未出现在地址表或终端 IP 未命中前缀，则判定绑定失败，不会写入索引。接口地址集变化时仅遍历该 `kernel_ifindex` 对应终端并设为 `IFACE_INVALID`。
+   1. 仅依赖可解析的三层虚接口名称与 IPv4 地址表判断可用性；二层 access/trunk 口的物理 up/down 不触发状态变更。
+   2. 收到 Access 口报文、且当前无法解析对应 VLANIF 时终端保持发现状态但不保活；Trunk 口报文无需再次校验 permit 集合（ACL 已确保 VLAN 合法），仅在缺失对应 VLANIF 或 IPv4 时按无虚接口逻辑处理。
+   3. 虚接口的实际影响归结为“是否存在可用 IPv4”：只有当 `if_nametoindex` 能解析出 VLANIF，且该接口至少绑定一个与终端 IP 同网段的 IPv4 地址时，终端才被视为具备可用邻居并可进入 `ACTIVE/PROBING`。任一条件不满足都视作 `IFACE_INVALID`，即便上游持续推送事件也不会放宽判定。收到 ARP 报文时若发现对应 VLANIF 尚未满足上述条件，仍需记录/刷新终端条目，但立即将其状态切换为 `IFACE_INVALID` 并停止保活，等待后续接口恢复；该行为确保“已发现但暂不可达”的终端不会误报为活跃。
+   4. 需监听 `RTM_NEWADDR/DELADDR` 并维护“可用接口地址表”（`kernel_ifindex -> {prefix}`，以下简称地址表中的 ifindex 均指内核接口索引 `kernel_ifindex`）。该表实现为哈希表或动态数组，元素保存接口索引、前缀长度、网络地址（CIDR 表示）。进程启动阶段必须先获取一次当前完整 IPv4 地址表并写入该结构（优先使用 Netlink `RTM_GETADDR` dump，无法获取时回退至 `getifaddrs` 等通用接口），保证在第一批终端报文到来前即可判断接口有效性；若初始化抓取失败需写入告警日志并维持重试钩子，同时保持终端按现有逻辑处于 `IFACE_INVALID`，以便覆盖确实未配置 IPv4 的设备。一旦监听到某 VLANIF 新增 IPv4，即刻重新解析该接口下所有待恢复终端：若新地址与终端同网段，则恢复 `tx_source_ip/tx_kernel_ifindex`，将状态推进到 `PROBING` 并在下一轮保活或报文驱动下返回 `ACTIVE`；若仍不匹配则继续保持 `IFACE_INVALID`。
+   5. 为避免地址事件触发全量扫描，维护两类索引：
+      - `iface_binding_index`：按 `kernel_ifindex` 记录已完成 `resolve_tx_interface` 的终端列表（链表头数组或哈希表均可）。当地址事件移除最后一个可匹配的 IPv4 前缀或后续解析发现该接口已不可用时，仅遍历该列表即可批量将终端转入 `IFACE_INVALID`，同时清除其绑定信息并迁移到待恢复结构。
+         - `pending_vlan_index`：按 VLAN ID 记录因缺失 VLANIF、VLANIF DOWN 或无匹配 IPv4 而无法完成 `resolve_tx_interface` 的终端，可实现为 4096 个桶位的直接索引数组或基于 VLAN ID 的开放寻址哈希表（支持在大规模 VLAN 场景下按需扩容），元素内至少保存 VLAN ID、最近一次解析失败的时间戳与 `terminal_entry` 链表头指针。条目写入规则为：
+        * 若 `resolve_tx_interface` 成功（VLANIF 存在且命中 IPv4 前缀），从 `pending_vlan_index` 移除并登记到 `iface_binding_index`；
+        * 若 VLANIF 存在但暂时无匹配 IPv4，可保留 `kernel_ifindex` 元信息便于日志，同时只保留在 `pending_vlan_index` 中等待地址事件恢复；
+      * 若 VLANIF 当前无法通过 `if_nametoindex` 解析或仍无匹配 IPv4，则记录当前 VLAN 及必要的元数据，等待后续地址事件或新一轮报文驱动时重试；若持续无事件触发，条目会在 `iface_invalid_holdoff_sec`（默认 30 分钟）到期后被自动老化清理。
+      监听到某 VLANIF 新增/恢复 IPv4 或因终端迁移进入新 VLAN 时，仅遍历对应 VLAN 的待恢复列表重新尝试绑定，成功后进入 `PROBING/ACTIVE`，失败则继续保留在 `pending_vlan_index`。
+         - 终端因 MAC 漂移或端口调整进入新 VLAN 时，需先在持有 `terminal_manager.lock` 的前提下从旧 VLAN 的 `iface_binding_index` 或 `pending_vlan_index` 中摘除链表节点，随即按照新 VLAN 的解析结果写入对应索引：若新 VLAN 已具备可用 VLANIF，则登记至 `iface_binding_index` 并触发携带新旧逻辑 ifindex（`terminal_metadata.ifindex`）的 `MOD` 事件；若仍缺少有效前缀，则落入新 VLAN 的 `pending_vlan_index`，并更新失败时间戳以便后续超时/告警分析。
    6. 地址表与反向索引的读写均在持有 `terminal_manager.lock` 时进行；外部事件处理（Netlink 回调）进入核心引擎后需先获取此锁，保证与 `resolve_tx_interface`、终端状态机操作不存在竞态。为降低更新阻塞，可在锁内完成结构更新后再脱锁触发终端状态变更/事件队列。
 - **报文路径**：
     1. 适配器仅上报入方向的 ARP 帧及其元数据（MAC、VLAN、入接口、时间戳）给发现引擎；若内核因 RX VLAN offload 剥离 802.1Q 头，必须启用 `PACKET_AUXDATA` 并从 `tpacket_auxdata` 读取原始 VLAN ID；本机发送的 ARP 在适配层即被忽略。
@@ -145,9 +152,9 @@
    5. 如平台提供 CPU tag，终端条目的 `terminal_metadata` 需记录 ifindex（无论来自 CPU tag 还是外部查询），并据此完成事件变更检测；保活发包仍基于内核接口信息。
    6. 发送路径依据终端最近一次有效报文关联的三层上下文构造 ARP request，在用户态封装 `ethhdr + vlan_header + ether_arp` 后直接通过物理接口（如 `eth0`）发送；无需为每个 VLAN 重新绑定虚接口，只要写入正确的 VLAN ID 即可保持与发现路径一致。
       - 若目标平台拒绝用户态插入 VLAN tag，则回退到绑定虚接口（如 `vlan1`）的发送方式。Stage0 Raw Socket demo 已验证 Realtek 平台支持物理口带 VLAN tag 的直出策略，需在 demo 与适配器实现中默认采用该模式并保留回退逻辑。
-   7. `resolve_tx_interface` 的校验顺序：先确认 `if_nametoindex` 或外部回调返回的 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用，否则清空绑定并立即将终端置为 `IFACE_INVALID`。当地址事件清空最后一个前缀时，需要同步移除反向索引节点，避免残留终端继续使用失效接口。
+   7. `resolve_tx_interface` 的校验顺序：先尝试通过 `if_nametoindex`（或外部回调）解析出 `ifindex > 0`，再查可用地址表验证终端 IP 是否命中该接口任一前缀；只有同时满足才视为保活路径可用。任何一步失败都会清空现有绑定、将终端置为 `IFACE_INVALID`，并保持在 `pending_vlan_index` 中等待后续地址事件或新报文重试。地址事件清空最后一个前缀时需要同步移除反向索引节点，避免残留终端继续使用失效接口。
 - **终端状态机**：
-   - `(收到报文) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`。
+   - `(收到报文且对应 VLANIF 已提供可用 IPv4) → ACTIVE → (120s 无流量) → PROBING → (3 次失败) → 删除`；否则终端保持或转入 `IFACE_INVALID`，等待接口恢复后再通过定时或新报文进入 `PROBING/ACTIVE`。
          - `ACTIVE → IFACE_INVALID`：接口 down、出现跨网段 ARP（sender IP 与收包虚接口 IP 不在同一网段）或 VLAN 无虚接口；`IFACE_INVALID` 保留 30 分钟后删除。
    - `IFACE_INVALID → PROBING`：接口 up、IP 改为同网段或新增虚接口时复活。
    - `PROBING → ACTIVE`：收到回应即恢复活跃。

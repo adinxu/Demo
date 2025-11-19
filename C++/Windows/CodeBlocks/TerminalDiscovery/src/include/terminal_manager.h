@@ -45,6 +45,7 @@ struct terminal_entry {
     char tx_iface[IFNAMSIZ];
     int tx_kernel_ifindex;
     struct in_addr tx_source_ip;
+    int pending_vlan_id;
     bool mac_refresh_enqueued;
     bool mac_verify_enqueued;
     struct terminal_entry *next;
