@@ -21,6 +21,7 @@ struct TerminalInfo {
     std::string mac;
     std::string ip;
     std::uint32_t ifindex;
+    std::uint32_t prev_ifindex;
     ModifyTag tag;
 };
 
@@ -45,6 +46,7 @@ struct TdDebugDumpOptions {
     std::size_t macPrefixLen = 0;
     bool verboseMetrics = false;
     bool expandTerminals = false;
+    bool expandPendingVlans = false;
 
     td_debug_dump_opts_t to_c() const {
     td_debug_dump_opts_t opts;
@@ -62,6 +64,7 @@ struct TdDebugDumpOptions {
         }
         opts.verbose_metrics = verboseMetrics;
         opts.expand_terminals = expandTerminals;
+        opts.expand_pending_vlans = expandPendingVlans;
         return opts;
     }
 };
@@ -75,6 +78,7 @@ public:
     std::string dumpTerminalTable(const TdDebugDumpOptions &options = {}) const;
     std::string dumpIfacePrefixTable() const;
     std::string dumpIfaceBindingTable(const TdDebugDumpOptions &options = {}) const;
+    std::string dumpPendingVlanTable(const TdDebugDumpOptions &options = {}) const;
     std::string dumpMacLookupQueues() const;
     std::string dumpMacLocatorState() const;
 

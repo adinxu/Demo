@@ -15,19 +15,21 @@
 ## 单元测试：`terminal_discovery_tests`
 
 - `default_log_timestamp`：重定向 `stderr` 验证默认日志 sink 是否追加 `YYYY-MM-DD HH:MM:SS` 时间戳。
-- `terminal_add_and_event`：构造 VLAN 100 的终端，校验 `ADD` 事件、查询快照与统计计数。
+- `terminal_add_and_event`：构造 VLAN 100 的终端，校验 `ADD` 事件、查询快照与统计计数，同时确认 `prev_ifindex` 在新增场景恒为 0。
 - `probe_failure_removes_terminal`：1 秒保活 + 1 次失败阈值，确认探测回调、`DEL` 事件以及 `probes_scheduled/probe_failures/terminals_removed` 统计。
 - `iface_invalid_holdoff`：移除地址前缀触发保留期，验证 holdoff 期间终端仍可查询，超时后才产生 `DEL` 事件。
-- `ifindex_change_emits_mod`：同一终端入口 ifindex 变化触发 `MOD` 事件，并确保探测回调未误触发。
+- `ifindex_change_emits_mod`：同一终端入口 ifindex 变化触发 `MOD` 事件，验证 `prev_ifindex` 返回旧端口索引，并确保探测回调未误触发。
 
 所有测试均通过桩选择器返回固定 ifindex/VLAN，避免依赖真实适配器；日志级别强制降为 `ERROR`，确保输出干净可读。
 
 ## 集成测试：`terminal_integration_tests`
 
 - `test_duplicate_registration`：再次调用 `setIncrementReport` 期望 `-EALREADY`，验证北向重复注册保护。
-- `test_increment_add_and_get_all`：模拟地址事件 + ARP 报文，确认增量批次仅含 `ADD` 事件，`getAllTerminalInfo` 返回一致的 ifindex。
+- `test_increment_add_and_get_all`：模拟地址事件 + ARP 报文，确认增量批次仅含 `ADD` 事件，`getAllTerminalInfo` 返回一致的 ifindex/prev_ifindex 组合（新增场景仍为 0）。
 - `test_netlink_removal`：删除前缀并等待 holdoff，检查 `DEL` 事件与全量快照清空。
-- `test_stats_tracking`：执行完整增删流程后读取统计，核对发现/移除/地址事件/当前条目等字段。
+- `test_cross_vlan_migration`：构造「先在缺失 VLANIF 的 VLAN 被学习 → 地址表补齐 → 再迁移到另一 VLAN」的序列，验证 `pending_vlans` 桶如何在 `RTM_NEWADDR` 事件后驱动终端出队、`MOD` 事件携带新旧 ifindex，以及 debug dump 中 `tx_kernel_ifindex/tx_src` 的即时变化。
+- `test_ipv4_recovery`：模拟 VLANIF IPv4 删除并恢复，确认终端进入 `IFACE_INVALID` 后仍保留在 `pending_vlans` 中，地址恢复时无需额外报文即可重新绑定，并检查 debug dump 与最终 `DEL` 事件。
+- `test_stats_tracking`：在上述流程收尾阶段读取统计，核对发现/移除/地址事件总数是否包含跨 VLAN 迁移与 IPv4 恢复场景。
 
 测试过程同样关闭日志噪声，并通过全局捕获器记录增量批次；最终输出 `integration tests passed/failed` 便于自动化脚本判定结果。
 

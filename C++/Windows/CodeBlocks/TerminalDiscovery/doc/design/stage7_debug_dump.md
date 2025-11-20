@@ -23,6 +23,7 @@
   - `td_debug_dump_terminal_table`
   - `td_debug_dump_iface_prefix_table`
   - `td_debug_dump_iface_binding_table`
+  - `td_debug_dump_pending_vlan_table`
   - `td_debug_dump_mac_lookup_queue`
   - `td_debug_dump_mac_locator_state`
 - 调用步骤：初始化 `td_debug_dump_context_t`，按需配置 `td_debug_dump_opts_t`，再组织 writer。以下示例写入 `stdout`：
@@ -50,6 +51,8 @@ int rc = td_debug_dump_terminal_table(manager,
   - `filter_by_mac_prefix` / `mac_prefix` + `mac_prefix_len`：按字节前缀筛选 MAC。
   - `verbose_metrics`：附加探测失败计数、桥接版本等详细指标。
   - `expand_terminals`：在绑定表导出时展开桶内全部终端。
+  - `expand_pending_vlans`：在 pending VLAN 导出时逐项展开挂起终端详情。
+- `td_debug_dump_pending_vlan_table` 会先输出整体统计（匹配的桶数与挂起终端数量），随后为每个匹配的 VLAN 打印 `pending vlan=<vid> entries=<count> total=<total>` 摘要；开启 `expand_pending_vlans` 后，将附加 `MAC/IP/状态/pending_vlan_id/meta_vlan/ifindex` 逐行输出，便于定位具体终端。过滤条件与其他导出函数保持一致，可按 VLAN、状态、ifindex 或 MAC 前缀快速聚焦。
 - `td_debug_dump_context_t` 可监控是否出现 writer 异常；若 `ctx.had_error == true`，上层应视为导出未完成并记录日志。
 
 ## C++ 北向封装
@@ -64,6 +67,9 @@ options.expandTerminals = true;
 
 std::string terminals = snapshot.dumpTerminalTable(options);
 std::string bindings  = snapshot.dumpIfaceBindingTable(options);
+TdDebugDumpOptions pending;
+pending.expandPendingVlans = true;
+std::string pendings  = snapshot.dumpPendingVlanTable(pending);
 std::string prefixes  = snapshot.dumpIfacePrefixTable();
 std::string queues    = snapshot.dumpMacLookupQueues();
 std::string locator   = snapshot.dumpMacLocatorState();
@@ -84,6 +90,9 @@ terminal mac=02:aa:bb:cc:dd:ee ip=203.0.113.20 vlan=310 state=ACTIVE ifindex=105
 iface kernel_ifindex=105 address=203.0.113.1/24 prefixes=1 bindings=1
 binding kernel_ifindex=105 vlan=310 entries=1
 terminal mac=02:aa:bb:cc:dd:ee ip=203.0.113.20 state=ACTIVE probes_failed=0
+pending_vlans buckets=1 terminals=1
+pending vlan=311 entries=1 total=1
+  terminal mac=02:cc:dd:ee:ff:10 ip=203.0.113.30 state=IFACE_INVALID pending_vlan=311 meta_vlan=-1 ifindex=0
 mac_lookup queue pending_refresh=1 pending_verify=0 total=1
 mac_locator version=42 subscribed=1 last_refresh_ms=500
 ```

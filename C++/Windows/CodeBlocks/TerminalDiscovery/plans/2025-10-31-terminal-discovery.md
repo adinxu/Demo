@@ -36,7 +36,7 @@
    - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带的 ifindex 线索；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；默认在物理接口 `eth0` 的原始套接字中封装 802.1Q 头直接发包，优先采用请求内的 VLAN/接口信息生成帧；若驱动拒绝用户态 VLAN tag，则回退到绑定虚接口（如 `vlan1`），发送前仍会查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
    - MAC 表拉取：在 demo 验证通过的基础上集成外部桥接模块提供的 C 接口（如 `td_switch_mac_snapshot`），由适配层显式触发容量查询与快照，周期性/按需复用调用侧维护的 `SwUcMacEntry` 数组，拉取并解析为内部 `ifindex/vlan` 映射供终端管理器检索；需要在适配层自行管理缓冲区容量、重试回退与错误日志，并确保桥接模块初始化失败时不会阻塞主线程。`realtek_mac_locator_lookup` 必须严格按照规范区分错误码：缓存未完成或刷新失败时返回 `TD_ADAPTER_ERR_NOT_READY`，未在 MAC 表命中时返回 `TD_ADAPTER_ERR_NOT_FOUND` 并附带 `ifindex=0`，避免终端管理器重复排队。
-   - 接口管理：基于标准 netlink 订阅接口事件（监听 VLANIF 上下线、IP 变更、flags 改动），按线程上下文更新内部绑定；当前通过公共模块 `terminal_netlink` 在管理器创建后启动监听线程，保活节奏仍在终端引擎线程内统一调度。
+   - 接口管理：通过 `terminal_netlink` 订阅 IPv4 地址新增/删除事件（`RTM_NEWADDR/DELADDR`），并在需要时调用 `if_nametoindex` 判断 VLANIF 是否已经可解析；接口创建/删除不再单独监听，保活节奏仍在终端引擎线程内统一调度。
    - 生命周期：实现 `init/start/stop/shutdown`，确保线程安全关闭；未实现的接口事件/定时器将返回 `UNSUPPORTED` 并记录告警。
 3. ✅ 公共组件：
    - `td_config_load_defaults` 提供统一的默认运行配置（适配器名称 `realtek`、`eth0`/`vlan1`、100ms 发送间隔、INFO 日志级别）。
@@ -55,9 +55,15 @@
    - 超过 `keepalive_miss_threshold` 后清理终端并记录日志，避免 livelock。
 4. ✅ 接口感知：
    - 报文回调刷新 ingress/VLAN 元数据，并通过 `resolve_tx_interface` 应用选择器、格式模板或入口接口回退；VLAN ID 始终从 `PACKET_AUXDATA` 恢复，若底层暂未解析出逻辑 ifindex，则回落到配置/选择器给出的发包接口，同时触发异步调用桥接 API 尝试补全逻辑 ifindex。
-   - 仅监测虚接口 IPv4 地址的新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调），在 `terminal_manager` 内维护 `iface_address_table`（`kernel_ifindex -> prefix_list`）和反向索引 `iface_binding_index`（`kernel_ifindex -> terminal_entry*` 列表）。
-   - `resolve_tx_interface` 先确认 `if_nametoindex` 或 selector 返回的 `kernel_ifindex > 0`，再校验终端 IP 是否命中地址表中的任意前缀；否则清空绑定并立即置为 `IFACE_INVALID`。
-   - 地址表变更时仅遍历该 `kernel_ifindex` 对应的终端，将其设为 `IFACE_INVALID` 并等待后续报文或地址恢复重新探测。保活发送上下文仍依据终端绑定的 VLAN 元数据与物理接口配置组合，而非直接复用收包返回的逻辑 ifindex。
+   - 仅依赖可解析的 VLANIF 名称与 IPv4 地址新增/删除（Netlink `RTM_NEWADDR/DELADDR` 或平台等效回调）判断接口可用性，在 `terminal_manager` 内维护：
+     * `iface_address_table`：`kernel_ifindex -> prefix_list`；
+     * `iface_binding_index`：`kernel_ifindex -> terminal_entry*` 列表，用于已完成 `resolve_tx_interface` 的终端；
+     * `pending_vlan_index`：按 VLAN ID 聚合仍缺失可用 VLANIF/IPv4 的终端，首选 4096 桶数组或可扩容的开放寻址表，元素记录 VLAN ID、最近一次解析失败时间戳、链表头及可选 `kernel_ifindex` 备注。
+   - `resolve_tx_interface` 先确认 `if_nametoindex`（或 selector）能返回 `kernel_ifindex > 0`，再校验终端 IP 是否命中地址表任一前缀；任一环节失败都会清空绑定、将终端置为 `IFACE_INVALID`，并把条目保留在 `pending_vlan_index`，等待后续地址事件或新报文触发重试；若持续无事件，条目会在 `iface_invalid_holdoff_sec`（默认 30 分钟）到期后自动老化。
+   - 地址事件或新的报文驱动仅遍历对应 `kernel_ifindex`/VLAN 的索引：若删除最后一个匹配前缀或后续解析仍无法绑定，则将 `iface_binding_index` 中的终端批量迁移到 `pending_vlan_index` 并标记 `IFACE_INVALID`；若新增 IPv4 使同网段前缀恢复，则仅重试该 VLAN 的待恢复列表，将命中的终端移回 `iface_binding_index` 并推进至 `PROBING`。
+   - 终端因 MAC 漂移或端口调整进入新 VLAN 时，在持有 `terminal_manager.lock` 的前提下先从旧 VLAN 的索引中摘除，再根据新 VLAN 解析结果写入 `iface_binding_index` 或 `pending_vlan_index`。若成功绑定逻辑接口，则更新 `terminal_metadata.ifindex` 并触发携带新旧逻辑 ifindex 的 `MOD` 事件；否则刷新失败时间戳等待后续恢复。
+   - 保活发送上下文仍依据终端绑定的 VLAN 元数据与物理接口配置组合，而非直接复用收包返回的逻辑 ifindex。
+   - 监听到绑定 VLANIF 删除最后一个有效 IPv4 时，立即清空终端的 `tx_kernel_ifindex/tx_source_ip`，输出结构化日志并将终端置为 `IFACE_INVALID` 保留；当同一接口重新添加与终端同网段的 IPv4 后，在地址表/索引更新钩子中触发恢复流程，将其推进到 `PROBING` 并安排下一轮保活。
 5. ✅ 并发与锁：
    - 哈希桶访问由主互斥保护，探测回调在 worker 锁外执行，杜绝回调 re-entry 死锁。
 6. ✅ 文档：`doc/design/stage2_terminal_manager.md` 描述线程模型、接口解析策略与配置参数取值。
@@ -67,28 +73,40 @@
    - `terminal_manager_on_packet` 在持锁前采集快照，刷新 VLAN/接口元数据并据此触发状态切换；若暂未解析到 ifindex 时回退到 VLAN 模板或选择器结果，保证事件仍能携带有效上下文。针对免费 ARP（sender IP 为空或 0.0.0.0）的情况，明确改用报文 `target IP` 更新终端 IPv4 地址，禁止继续记录无意义的 0.0.0.0；sender/target 同为 0.0.0.0 的报文视为异常并直接丢弃。
    - Realtek 平台结合 MAC 表缓存刷新 `terminal_metadata.ifindex`，若缓存命中失败则触发桥接 API 重拉，确保事件与北向查询对齐整机 ifindex。
    - 依赖 ACL 提供的 VLAN tag 判定终端归属；若地址表查不到对应前缀或无法再构造有效 ARP（例如 VLANIF 被移除 IPv4 或迁移网段），即转入 `IFACE_INVALID`，后续在地址恢复或报文再次到达时重新探测。
+   - 当 VLANIF 重新获得有效 IPv4 时，事件队列需及时触发一次 `IFACE_INVALID → PROBING` 的状态变更（或 `MOD`/`ADD` 视上下文而定），并补充相应结构化日志，保证北向能够感知恢复并在下一轮保活重新探测。
 2. ✅ 事件队列：
-   - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/ifindex + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
+   - 使用单一 FIFO 链表收集 `terminal_event_record_t`（MAC/IP/ifindex/prev_ifindex + ModifyTag），在 `terminal_manager_maybe_dispatch_events` 内实时批量分发。
    - 分发阶段在脱锁状态下将节点拷贝为连续数组并释放，内存分配失败时记录告警并丢弃该批次，避免回调阻塞核心逻辑。
 3. ✅ 北向接口：
    - 新增 `terminal_manager_set_event_sink`、`terminal_manager_query_all`、`terminal_manager_flush_events`，由本项目导出 `getAllTerminalInfo`/`setIncrementReport`，外部团队提供非阻塞的 `IncReportCb`。
-   - 查询阶段生成 `terminal_event_record_t` 数组后脱锁回调；订阅阶段在初始化时注册后即刻推送首批事件，并在桥接层将记录映射为携带 `ifindex` 与 `tag` 字段的 `MAC_IP_INFO` 单向量。
+   - 查询阶段生成 `terminal_event_record_t` 数组后脱锁回调；订阅阶段在初始化时注册后即刻推送首批事件，并在桥接层将记录映射为携带逻辑 ifindex（`terminal_metadata.ifindex`/`TerminalInfo::ifindex`）与 `prev_ifindex`、`tag` 字段的 `MAC_IP_INFO` 单向量，确保 `MOD` 事件提供新旧逻辑 ifindex，其他事件旧值置 0。
 4. ✅ 文档：
    - `doc/design/stage3_event_pipeline.md` 说明事件链路设计、实时上报策略、关键数据结构与并发模型，便于后续维护与扩展。
+5. ✅ 事件字段升级：
+   - 在 `terminal_manager` 内部记录端口切换时的 `prev_ifindex`，并在 `queue_event`/`terminal_manager_query_all` 输出结构中暴露该字段。
+   - 扩展 `terminal_event_record_t` 及相关结构以携带 `prev_ifindex`，在 `MOD` 事件时提供旧端口信息；更新 `MAC_IP_INFO`/`TerminalInfo` 桥接层映射与增量回调打桩，确保非 `MOD` 事件旧端口置 0。
+   - 调整 `getAllTerminalInfo` 快照与查询路径，保证历史端口字段在全量输出中同步可见，并与事件载荷保持一致。
+   - 扩展 `terminal_manager_tests`、`terminal_integration_tests` 覆盖端口切换场景，验证增量回调与全量查询同时携带新旧 ifindex。
+   - 更新设计/接口文档与示例，通知北向团队完成回调消费方兼容性验证。
+6. ✅ VLAN 忽略过滤：已在 `td_config`/`terminal_manager` 中引入 `ignored_vlans` 判定逻辑，命中时记录 DEBUG 日志后直接返回，并同步更新设计文档。
 
 ### 阶段 4：配置、日志与文档（已完成）
 1. ✅ 配置体系：扩展 `td_config` 支持终端保活间隔、失败阈值、最大终端数量等参数；引擎统一从配置体系读取，暂不依赖环境变量。
 2. ✅ 日志与指标：引入核心模块结构化日志标签（如 `terminal_manager`, `event_queue`），暴露探测计数、失败数、接口波动等指标，预留对接外部采集的入口，并确保全部基于单调时钟；主程序新增 `--stats-interval`（默认 0，即禁用周期性输出，可指定秒数开启），并支持 `SIGUSR1` 触发即时 `terminal_stats` 快照。
    - ✅ `td_log_writef` 默认格式追加 `YYYY-MM-DD HH:MM:SS` 级别的系统时间戳（wall clock），同时保留自定义 sink 兼容性并新增相应单测。
 3. ✅ 文档：补充阶段 2+ 核心引擎设计说明、API 参考与构建部署指南，同步最新 `MAC_IP_INFO`/`TerminalInfo` 字段约束。
+4. ✅ 配置扩展：在 `td_config`/CLI 中新增 `ignored_vlans`（支持 `--ignore-vlan <vid>` 多次传入、内部去重与上限校验），并在管理器配置结构体与运行期命令中落地，可选开关默认关闭。
 
 ### 阶段 5：测试与验收（进行中）
 1. ✅ 单元测试：新增 `terminal_discovery_tests` 覆盖状态机（探测失败淘汰、接口失效保留期、ifindex 变更上报）与事件分发，命令 `make test` 可在 x86 环境快速执行。
    - ✅ 已实现日志时间戳断言（`test_default_log_timestamp`），通过重定向标准错误验证默认 sink 输出格式。
 2. ✅ 集成测试：新增 `terminal_integration_tests`，基于打桩 netlink/ARP 流程验证 `ADD/DEL` 事件、统计数据和重复注册保护。
 3. ✅ 北向测试：
-   - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex` 数值）与重复注册告警。
+   - 通过 `terminal_integration_tests` 驱动 `setIncrementReport`/`getAllTerminalInfo`，验证异常保护、字段完整性（含 `ifindex/prev_ifindex` 数值）与重复注册告警。
    - 后续若需并发访问覆盖，可在现有桩环境扩展多线程情景。
+   - ✅ 忽略 VLAN 覆盖：单元/集成测试已注入被忽略的 VLAN 报文，验证不会生成终端/事件并输出过滤日志。
+   - ✅ 跨 VLAN 迁移覆盖：已在 `terminal_integration_tests` 中新增跨 VLAN 迁移流程，用例验证终端在 `pending_vlan_index`/`iface_binding_index` 间的切换、`MOD` 事件携带新旧 ifindex 以及重新绑定后的保活态。
+   - ✅ IPv4 恢复覆盖：新增集成测试模拟 VLANIF IPv4 删除与恢复，确认条目回迁、`tx_kernel_ifindex/tx_source_ip` 重建、状态推进与事件/日志输出均符合规范。
 4. ✳️ 打桩测试扩展方向：
    - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
    - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
@@ -112,7 +130,22 @@
 1. ✅ 设计 `td_debug_writer_t` 及 `td_debug_dump_opts_t/td_debug_dump_context_t` 数据结构，确保在核心锁范围内的调用不会引入阻塞 IO，并定义默认的 `FILE*` 写入包装。
 2. ✅ 在 `terminal_manager` 内实现 `td_debug_dump_terminal_table`、`td_debug_dump_iface_prefix_table`、`td_debug_dump_iface_binding_table`、`td_debug_dump_mac_lookup_queue`、`td_debug_dump_mac_locator_state`，支持按状态/VLAN/ifindex/MAC 前缀过滤以及输出行数统计，并确保在 `writer` 返回错误时及时释放锁并上报错误码。
 3. ✅ 更新北向 C++ 桥接，提供面向 `std::string`/`std::ostream` 的轻量封装及 `TerminalDebugSnapshot` 工具类，便于外部守护进程在不中断主流程情况下获取快照；同时新增示例代码演示如何注册回调与调用调试接口。
-4. ✅ 扩展单元与集成测试：新增针对过滤参数、错误回调、空数据集与大规模哈希桶的断言；在现有测试框架中注入打桩 `writer` 捕获输出并校验关键字段。补充 `doc/` 下调试接口指南，记录常见排障场景与示例输出。
+4. ✅ 扩展单元与集成测试：补齐 `td_debug_dump_pending_vlan_table` 实现，串联 CLI `dump pending vlan` 与 C++ `TerminalDebugSnapshot::dumpPendingVlanTable`，并在单元/集成测试及调试文档中覆盖 pending VLAN 场景与展开输出示例。
+
+### 阶段 8：启动阶段地址表同步（已完成）
+1. ✅ 审核 `terminal_netlink`、`terminal_manager` 现有初始化流程及 `iface_address_table`/`iface_binding_index` 结构，明确首批接口地址注入位置与锁保护策略。
+2. ✅ 实现 `terminal_netlink_sync_address_table()`：优先使用 Netlink `RTM_GETADDR` dump 获取当前 IPv4 地址表，失败时回退 `getifaddrs`，并复用增量更新解析代码，确保写入时持有管理器锁；
+3. ✅ 在管理器/适配器启动序列中调用初次同步；若抓取失败，记录结构化告警并立即维持终端处于既有 `IFACE_INVALID` 判定路径，同时注册基于 `terminal_manager_worker` 的周期重试钩子，待重试成功后补齐地址表并触发一次接口检查。
+4. ✅ 扩展单元/集成测试，覆盖初次同步成功、抓取失败保持 `IFACE_INVALID`、重试成功后恢复保活等场景，确保日志与状态转移符合规范。
+
+### 阶段 9：VLAN 点查接口整合（待开始）
+1. ✅ 打桩扩展：在 `src/stub/td_switch_mac_stub.c` 增加 `td_switch_mac_get_ifindex_by_vid` 弱符号实现，支持入参填充 VLAN/MAC 后返回固定示例 ifindex/错误码，并沿用 `[switch-mac-stub]` 日志；通过环境变量配置命中/未命中行为。
+2. ✅ Demo 演示：在 `src/demo/td_switch_mac_demo.c` 补充调用样例，展示点查成功与未命中输出，并保持与快照示例一致的格式；确保 demo 在无真实 SDK 环境下与打桩配合。
+3. 🔜 适配器桥接：更新 Realtek MAC 定位实现，使 `td_adapter_mac_locator_ops->lookup` 调用点查接口处理单条查询，保留现有全表快照流程不变，并区分 `NOT_READY`/`NOT_FOUND` 错误码。
+4. 🔜 管理器逻辑：调整 `terminal_manager_on_packet` 在首次发现 `ifindex==0` 或 VLAN 变更时发起点查，并在成功后同步 `meta.mac_view_version` 为当前 `mac_locator_version`；`on_timer`/`on_refresh` 流程保持现有基于版本的刷新策略。
+5. 🔜 测试补充：扩展单元/集成测试覆盖点查命中、未命中以及 VLAN 切换时的 `MOD` 事件，新增 demo 与 stub 断言；必要时为适配器/管理器新增桩测试验证错误码处理。
+6. 🔜 文档同步：更新规范与设计文档引用（demo 指南、适配器说明、调试手册），标注点查接口调用顺序与回退路径，并说明点查不返回版本号的处理方式。
+
 
 ## 依赖与风险
 - 依赖网络测试仪能稳定模拟大规模 ARP 终端。
@@ -133,4 +166,4 @@
 
 ## 审批与下一步
 - 当前状态：阶段 4 配置/日志文档与阶段 6 守护进程嵌入入口均已完成并交付，最新实现见 `doc/design/stage4_observability.md`、`doc/design/stage6_embedded_init.md` 及相关源码。
-- 下一步：继续推进阶段 5（扩展集成测试、开展 Realtek 实机/压力验证、整理验收报告），为后续交付准备验收材料与性能数据。
+- 下一步：聚焦剩余待办——(1) 在阶段 0 补齐 300 终端规模验证并沉淀资源占用数据；(2) 在阶段 5 完成跨 VLAN 迁移、IPv4 恢复等集成用例及打桩测试扩展；(3) 按阶段 9 先落地点查桩与 demo，再推进适配器与终端管理器逻辑补充；(4) 汇总实机/压力验证及回滚策略文档，为最终验收做准备。

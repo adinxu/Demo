@@ -83,7 +83,8 @@ bool accumulate_query(const terminal_event_record_t *record, void *user_ctx) {
         TerminalInfo info;
         info.mac = format_mac(record->key.mac);
         info.ip = format_ip(record->key.ip);
-    info.ifindex = record->ifindex;
+        info.ifindex = record->ifindex;
+        info.prev_ifindex = record->prev_ifindex;
         info.tag = to_modify_tag(record->tag);
         ctx->info->push_back(std::move(info));
         return true;
@@ -126,6 +127,7 @@ void inc_report_adapter(const terminal_event_record_t *records, size_t count, vo
             info.mac = format_mac(records[i].key.mac);
             info.ip = format_ip(records[i].key.ip);
             info.ifindex = records[i].ifindex;
+            info.prev_ifindex = records[i].prev_ifindex;
             info.tag = to_modify_tag(records[i].tag);
             payload.push_back(std::move(info));
         }
@@ -175,11 +177,12 @@ void default_event_logger(const terminal_event_record_t *records, size_t count, 
 
         td_log_writef(TD_LOG_INFO,
                       "terminal_events",
-                      "event=%s mac=%s ip=%s ifindex=%u",
+                      "event=%s mac=%s ip=%s ifindex=%u prev_ifindex=%u",
                       event_tag_to_string(rec.tag),
                       mac.c_str(),
                       ip_str,
-                      rec.ifindex);
+                      rec.ifindex,
+                      rec.prev_ifindex);
     }
 }
 
@@ -372,6 +375,27 @@ std::string TerminalDebugSnapshot::dumpIfaceBindingTable(const TdDebugDumpOption
         td_log_writef(TD_LOG_WARN,
                       "terminal_northbound",
                       "td_debug_dump_iface_binding_table failed rc=%d had_error=%d",
+                      rc,
+                      ctx.had_error ? 1 : 0);
+    }
+    return output;
+}
+
+std::string TerminalDebugSnapshot::dumpPendingVlanTable(const TdDebugDumpOptions &options) const {
+    std::string output;
+    if (!manager_) {
+        return output;
+    }
+
+    td_debug_dump_opts_t c_opts = options.to_c();
+    td_debug_dump_context_t ctx;
+    td_debug_context_reset(&ctx, &c_opts);
+    StringWriterCtx writer_ctx{&output, &ctx};
+    int rc = td_debug_dump_pending_vlan_table(manager_, &c_opts, string_writer_adapter, &writer_ctx, &ctx);
+    if (rc != 0 || ctx.had_error) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_northbound",
+                      "td_debug_dump_pending_vlan_table failed rc=%d had_error=%d",
                       rc,
                       ctx.had_error ? 1 : 0);
     }

@@ -8,11 +8,13 @@ extern "C" {
 }
 
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <netinet/if_ether.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 #include <inttypes.h>
@@ -25,6 +27,20 @@ static td_adapter g_stub_adapter;
 
 static int mock_kernel_ifindex_for_vlan(int vlan_id) {
     return 2000 + vlan_id;
+}
+
+extern "C" char *if_indextoname(unsigned int ifindex, char *ifname) {
+    if (!ifname) {
+        return nullptr;
+    }
+    if (ifindex >= 2000U) {
+        unsigned int vlan = ifindex - 2000U;
+        if (vlan > 0U && vlan < 4096U) {
+            std::snprintf(ifname, IFNAMSIZ, "vlan%u", vlan);
+            return ifname;
+        }
+    }
+    return nullptr;
 }
 
 extern "C" unsigned int if_nametoindex(const char *name) {
@@ -124,6 +140,151 @@ static void inc_report_capture(const MAC_IP_INFO &info) {
     g_inc_capture.batches.push_back(info);
 }
 
+static std::string format_mac_string(const uint8_t mac[ETH_ALEN]) {
+    char buf[18];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "%02x:%02x:%02x:%02x:%02x:%02x",
+                  mac[0],
+                  mac[1],
+                  mac[2],
+                  mac[3],
+                  mac[4],
+                  mac[5]);
+    return std::string(buf);
+}
+
+static const char *modify_tag_name(ModifyTag tag) {
+    switch (tag) {
+    case ModifyTag::ADD:
+        return "ADD";
+    case ModifyTag::DEL:
+        return "DEL";
+    case ModifyTag::MOD:
+    default:
+        return "MOD";
+    }
+}
+
+static bool expect_single_event(const char *context,
+                                ModifyTag expected_tag,
+                                const std::string &expected_mac,
+                                const std::string &expected_ip,
+                                uint32_t expected_ifindex,
+                                uint32_t expected_prev_ifindex) {
+    if (g_inc_capture.calls != 1 || g_inc_capture.batches.size() != 1) {
+        std::printf("[FAIL] %s: expected one batch, got calls=%zu batches=%zu\n",
+                    context,
+                    g_inc_capture.calls,
+                    g_inc_capture.batches.size());
+        return false;
+    }
+    const auto &batch = g_inc_capture.batches.front();
+    if (batch.size() != 1) {
+        std::printf("[FAIL] %s: expected batch size 1, got %zu\n", context, batch.size());
+        return false;
+    }
+    const auto &info = batch.front();
+    bool ok = true;
+    if (info.tag != expected_tag) {
+        std::printf("[FAIL] %s: expected tag %s, got %s\n",
+                    context,
+                    modify_tag_name(expected_tag),
+                    modify_tag_name(info.tag));
+        ok = false;
+    }
+    if (info.mac != expected_mac) {
+        std::printf("[FAIL] %s: expected mac %s, got %s\n",
+                    context,
+                    expected_mac.c_str(),
+                    info.mac.c_str());
+        ok = false;
+    }
+    if (info.ip != expected_ip) {
+        std::printf("[FAIL] %s: expected ip %s, got %s\n",
+                    context,
+                    expected_ip.c_str(),
+                    info.ip.c_str());
+        ok = false;
+    }
+    if (info.ifindex != expected_ifindex) {
+        std::printf("[FAIL] %s: expected ifindex %u, got %u\n",
+                    context,
+                    expected_ifindex,
+                    info.ifindex);
+        ok = false;
+    }
+    if (info.prev_ifindex != expected_prev_ifindex) {
+        std::printf("[FAIL] %s: expected prev_ifindex %u, got %u\n",
+                    context,
+                    expected_prev_ifindex,
+                    info.prev_ifindex);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool expect_no_events(const char *context) {
+    if (g_inc_capture.calls != 0 || !g_inc_capture.batches.empty()) {
+        std::printf("[FAIL] %s: expected no events, got calls=%zu batches=%zu\n",
+                    context,
+                    g_inc_capture.calls,
+                    g_inc_capture.batches.size());
+        return false;
+    }
+    return true;
+}
+
+static bool expect_debug_line(struct terminal_manager *mgr,
+                              const uint8_t mac[ETH_ALEN],
+                              const char *ip,
+                              const std::vector<std::string> &tokens,
+                              const char *context) {
+    if (!mgr || !ip) {
+        std::printf("[FAIL] %s: invalid arguments for debug expectation\n", context);
+        return false;
+    }
+
+    TdDebugDumpOptions opts;
+    opts.verboseMetrics = true;
+    opts.expandTerminals = true;
+    opts.filterByMacPrefix = true;
+    opts.macPrefixLen = ETH_ALEN;
+    for (size_t i = 0; i < ETH_ALEN; ++i) {
+        opts.macPrefix[i] = mac[i];
+    }
+
+    TerminalDebugSnapshot snapshot(mgr);
+    if (!snapshot.valid()) {
+        std::printf("[FAIL] %s: TerminalDebugSnapshot invalid\n", context);
+        return false;
+    }
+
+    std::string dump = snapshot.dumpTerminalTable(opts);
+    std::string mac_str = format_mac_string(mac);
+    std::string expected_head = "terminal mac=" + mac_str + " ip=" + std::string(ip);
+    size_t pos = dump.find(expected_head);
+    if (pos == std::string::npos) {
+        std::printf("[FAIL] %s: unable to locate terminal line for %s\n",
+                    context,
+                    mac_str.c_str());
+        return false;
+    }
+    size_t end = dump.find('\n', pos);
+    std::string line = dump.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    bool ok = true;
+    for (const std::string &token : tokens) {
+        if (line.find(token) == std::string::npos) {
+            std::printf("[FAIL] %s: expected '%s' in line: %s\n",
+                        context,
+                        token.c_str(),
+                        line.c_str());
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool test_duplicate_registration() {
     int rc = setIncrementReport(inc_report_capture);
     if (rc != -EALREADY) {
@@ -203,6 +364,13 @@ static bool test_increment_add_and_get_all(terminal_manager *mgr,
             std::printf("[FAIL] debug binding dump missing header\n");
             ok = false;
         }
+        TdDebugDumpOptions pending_options;
+        pending_options.expandPendingVlans = true;
+        std::string pending = debug_snapshot.dumpPendingVlanTable(pending_options);
+        if (pending.find("pending_vlans") == std::string::npos) {
+            std::printf("[FAIL] debug pending vlan dump missing summary\n");
+            ok = false;
+        }
         std::string prefixes = debug_snapshot.dumpIfacePrefixTable();
         if (prefixes.find("iface kernel_ifindex") == std::string::npos) {
             std::printf("[FAIL] debug prefix dump missing header\n");
@@ -269,22 +437,232 @@ static bool test_stats_tracking(terminal_manager *mgr) {
     terminal_manager_get_stats(mgr, &stats);
 
     bool ok = true;
-    if (stats.terminals_discovered != 1) {
-        std::printf("[FAIL] expected terminals_discovered=1, got %" PRIu64 "\n", stats.terminals_discovered);
+    if (stats.terminals_discovered != 3) {
+        std::printf("[FAIL] expected terminals_discovered=3, got %" PRIu64 "\n", stats.terminals_discovered);
         ok = false;
     }
-    if (stats.terminals_removed != 1) {
-        std::printf("[FAIL] expected terminals_removed=1, got %" PRIu64 "\n", stats.terminals_removed);
+    if (stats.terminals_removed != 3) {
+        std::printf("[FAIL] expected terminals_removed=3, got %" PRIu64 "\n", stats.terminals_removed);
         ok = false;
     }
-    if (stats.address_update_events < 2) {
-        std::printf("[FAIL] expected address_update_events>=2, got %" PRIu64 "\n", stats.address_update_events);
+    if (stats.address_update_events < 8) {
+        std::printf("[FAIL] expected address_update_events>=8, got %" PRIu64 "\n", stats.address_update_events);
         ok = false;
     }
     if (stats.current_terminals != 0) {
         std::printf("[FAIL] expected current_terminals=0, got %" PRIu64 "\n", stats.current_terminals);
         ok = false;
     }
+    return ok;
+}
+
+static bool test_cross_vlan_migration(terminal_manager *mgr) {
+    const int vlan_initial = 300;
+    const int vlan_migrated = 301;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x30, 0x31, 0x32, 0x33, 0x34};
+    const char *ip = "198.18.0.42";
+    const std::string mac_str = format_mac_string(mac);
+
+    terminal_manager_flush_events(mgr);
+
+    ether_arp arp;
+    td_adapter_packet_view packet;
+
+    g_inc_capture.reset();
+    build_arp_packet(&packet, &arp, mac, ip, vlan_initial, 31);
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = expect_single_event("cross_vlan/initial_add",
+                                  ModifyTag::ADD,
+                                  mac_str,
+                                  ip,
+                                  31,
+                                  0);
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            ip,
+                            {"state=IFACE_INVALID",
+                             "vlan=300",
+                             "ifindex=31",
+                             "tx_iface=<unset>",
+                             "tx_kernel_ifindex=-1",
+                             "tx_src=-"},
+                            "cross_vlan/initial_state");
+
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_initial), "198.18.0.1", 24, true);
+    terminal_manager_flush_events(mgr);
+    ok &= expect_no_events("cross_vlan/address_add_initial");
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            ip,
+                            {"state=PROBING",
+                             "vlan=300",
+                             "ifindex=31",
+                             "tx_iface=vlan300",
+                             std::string("tx_kernel_ifindex=") + std::to_string(mock_kernel_ifindex_for_vlan(vlan_initial)),
+                             "tx_src=198.18.0.1"},
+                            "cross_vlan/after_initial_iface");
+
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    build_arp_packet(&packet, &arp, mac, ip, vlan_migrated, 61);
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    ok &= expect_single_event("cross_vlan/migration_mod",
+                              ModifyTag::MOD,
+                              mac_str,
+                              ip,
+                              61,
+                              31);
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            ip,
+                            {"state=IFACE_INVALID",
+                             "vlan=301",
+                             "ifindex=61",
+                             "tx_iface=<unset>",
+                             "tx_kernel_ifindex=-1",
+                             "tx_src=-"},
+                            "cross_vlan/migrated_pending");
+
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_migrated), "198.18.0.1", 24, true);
+    terminal_manager_flush_events(mgr);
+    ok &= expect_no_events("cross_vlan/address_add_migrated");
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            ip,
+                            {"state=PROBING",
+                             "vlan=301",
+                             "ifindex=61",
+                             "tx_iface=vlan301",
+                             std::string("tx_kernel_ifindex=") + std::to_string(mock_kernel_ifindex_for_vlan(vlan_migrated)),
+                             "tx_src=198.18.0.1"},
+                            "cross_vlan/migrated_bound");
+
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_migrated), "198.18.0.1", 24, false);
+    terminal_manager_flush_events(mgr);
+    ok &= expect_no_events("cross_vlan/address_remove_cleanup");
+
+    sleep_ms(1100);
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    terminal_manager_on_timer(mgr);
+    terminal_manager_flush_events(mgr);
+
+    ok &= expect_single_event("cross_vlan/del",
+                              ModifyTag::DEL,
+                              mac_str,
+                              ip,
+                              61,
+                              0);
+
+    terminal_manager_flush_events(mgr);
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_initial), "198.18.0.1", 24, false);
+    terminal_manager_flush_events(mgr);
+
+    return ok;
+}
+
+static bool test_ipv4_recovery(terminal_manager *mgr) {
+    const int vlan_id = 350;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x40, 0x41, 0x42, 0x43, 0x44};
+    const char *terminal_ip = "198.51.100.55";
+    const char *iface_ip = "198.51.100.1";
+    const std::string mac_str = format_mac_string(mac);
+
+    terminal_manager_flush_events(mgr);
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_id), iface_ip, 24, true);
+    terminal_manager_flush_events(mgr);
+
+    ether_arp arp;
+    td_adapter_packet_view packet;
+
+    g_inc_capture.reset();
+    build_arp_packet(&packet, &arp, mac, terminal_ip, vlan_id, 77);
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = expect_single_event("ipv4_recovery/add",
+                                  ModifyTag::ADD,
+                                  mac_str,
+                                  terminal_ip,
+                                  77,
+                                  0);
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            terminal_ip,
+                            {"state=ACTIVE",
+                             "vlan=350",
+                             "ifindex=77",
+                             "tx_iface=vlan350",
+                             std::string("tx_kernel_ifindex=") + std::to_string(mock_kernel_ifindex_for_vlan(vlan_id)),
+                             std::string("tx_src=") + iface_ip},
+                            "ipv4_recovery/bound_initial");
+
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_id), iface_ip, 24, false);
+    terminal_manager_flush_events(mgr);
+    ok &= expect_no_events("ipv4_recovery/remove_ip");
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            terminal_ip,
+                            {"state=IFACE_INVALID",
+                             "vlan=350",
+                             "ifindex=77",
+                             "tx_iface=<unset>",
+                             "tx_kernel_ifindex=-1",
+                             "tx_src=-"},
+                            "ipv4_recovery/after_remove");
+
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_id), iface_ip, 24, true);
+    terminal_manager_flush_events(mgr);
+    ok &= expect_no_events("ipv4_recovery/readd_ip");
+
+    ok &= expect_debug_line(mgr,
+                            mac,
+                            terminal_ip,
+                            {"state=PROBING",
+                             "vlan=350",
+                             "ifindex=77",
+                             "tx_iface=vlan350",
+                             std::string("tx_kernel_ifindex=") + std::to_string(mock_kernel_ifindex_for_vlan(vlan_id)),
+                             std::string("tx_src=") + iface_ip},
+                            "ipv4_recovery/after_readd");
+
+    terminal_manager_flush_events(mgr);
+    apply_address_update(mgr, mock_kernel_ifindex_for_vlan(vlan_id), iface_ip, 24, false);
+    terminal_manager_flush_events(mgr);
+
+    sleep_ms(1100);
+    terminal_manager_flush_events(mgr);
+    g_inc_capture.reset();
+    terminal_manager_on_timer(mgr);
+    terminal_manager_flush_events(mgr);
+
+    ok &= expect_single_event("ipv4_recovery/del",
+                              ModifyTag::DEL,
+                              mac_str,
+                              terminal_ip,
+                              77,
+                              0);
+
     return ok;
 }
 
@@ -326,6 +704,8 @@ int main() {
     all_ok &= test_duplicate_registration();
     all_ok &= test_increment_add_and_get_all(mgr, tx_kernel_ifindex, vlan_id);
     all_ok &= test_netlink_removal(mgr, tx_kernel_ifindex, "192.0.2.1");
+    all_ok &= test_cross_vlan_migration(mgr);
+    all_ok &= test_ipv4_recovery(mgr);
     all_ok &= test_stats_tracking(mgr);
 
     terminal_manager_set_event_sink(mgr, nullptr, nullptr);

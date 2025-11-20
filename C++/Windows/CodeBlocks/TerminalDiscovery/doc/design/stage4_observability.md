@@ -10,12 +10,12 @@
 - `stats_log_interval_sec` 支持通过 `--stats-interval` CLI 参数动态调整，默认 `0`（仅按需打印），可设置为 >0 启用周期性统计日志。
 - `td_config_to_manager_config` 负责将上述字段映射到 `terminal_manager_config`，缺省值依旧在 `terminal_manager_create` 内兜底，避免旧调用栈遗漏配置时出现 0 值。
 - 当前仍沿用 `scan_interval_ms` 默认值，后续若需要从配置文件调优扫描节奏，仅需在 `td_runtime_config` 补充同名字段并透传即可。
-- `terminal_main` 在加载完配置后会按 CLI 参数更新 `runtime_cfg`，并把 `stats_log_interval_sec` 传入主循环；循环内部跟踪 `stats_elapsed_sec`，只要到达阈值或收到信号触发都会调用 `log_manager_stats`。
+- `terminal_main` 在加载完配置后会按 CLI 参数更新 `runtime_cfg`，并把 `stats_log_interval_sec` 传入主循环；循环内部跟踪 `stats_elapsed_sec`，只要到达阈值或收到信号触发都会调用 `terminal_manager_log_stats`。
 
 ## 日志强化
 - 当 `max_terminals` 达到上限时，会输出 `terminal_manager` 组件的 WARN 级日志，携带当前数量与被丢弃终端的 MAC/IP，便于观察容量策略触发频次。
-- 主程序新增 `terminal_stats` 组件日志：支持 `kill -USR1 <pid>` 立即打印一次 `terminal_manager_get_stats` 快照，并提供交互式命令行（提示符 `td>`）；运行期间可以输入 `stats`、`dump terminal|prefix|binding|mac queue|mac state`、`show config`、`exit|quit` 以及 `set keepalive|miss|holdoff|max|log-level <value>` 等命令即时获取、调整或终止运行，方便在线排障。
-- `handle_stats_signal` 捕获 `SIGUSR1`，仅把 `g_should_dump_stats` 原子标记为 1；主循环检测到该标记后调用 `log_manager_stats` 并清零标记，期间不会与定时输出互相抢占。
+- 主程序新增 `terminal_stats` 组件日志：支持 `kill -USR1 <pid>` 立即打印一次 `terminal_manager_get_stats` 快照，并提供交互式命令行（提示符 `td>`）；运行期间可以输入 `stats`、`dump terminal|prefix|binding|mac queue|mac state`、`show config`、`exit|quit`、`set keepalive|miss|holdoff|max|log-level <value>` 以及 `ignore-vlan add|remove|clear` 等命令即时获取、调整或终止运行，方便在线排障；其中 `show config` 直接调用 `terminal_manager_log_config`，输出 `terminal_config` 组件日志携带管理器快照字段（含忽略 VLAN 列表）。
+- `handle_stats_signal` 捕获 `SIGUSR1`，仅把 `g_should_dump_stats` 原子标记为 1；主循环检测到该标记后调用 `terminal_manager_log_stats` 并清零标记，期间不会与定时输出互相抢占。
 - 新终端分配失败（内存不足）统一记录为 ERROR 日志，快速暴露资源耗尽风险。
 - 默认日志 sink（未注入自定义回调时）会在消息前追加 `YYYY-MM-DD HH:MM:SS` 的系统时间戳，便于与外部日志或主机时间同步排查。
 - 虚接口前缀变化、探测失败超阈值等仍沿用 INFO/DEBUG 级别的结构化日志，结合统计指标可还原关键时间线。

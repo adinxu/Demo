@@ -1,5 +1,6 @@
 #include "td_config.h"
 
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -47,5 +48,81 @@ int td_config_to_manager_config(const struct td_runtime_config *runtime,
     out->vlan_iface_format = NULL;
     out->max_terminals = runtime->max_terminals;
 
+    if (runtime->ignored_vlan_count > TD_MAX_IGNORED_VLANS) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < runtime->ignored_vlan_count; ++i) {
+        uint16_t vlan = runtime->ignored_vlans[i];
+        if (vlan == 0 || vlan > 4094U) {
+            return -1;
+        }
+    }
+
+    out->ignored_vlan_count = runtime->ignored_vlan_count;
+    if (runtime->ignored_vlan_count > 0) {
+        memcpy(out->ignored_vlans,
+               runtime->ignored_vlans,
+               runtime->ignored_vlan_count * sizeof(out->ignored_vlans[0]));
+    }
+
     return 0;
+}
+
+int td_config_add_ignored_vlan(struct td_runtime_config *cfg, unsigned int vlan_id) {
+    if (!cfg) {
+        return -EINVAL;
+    }
+    if (vlan_id == 0 || vlan_id > 4094U) {
+        return -ERANGE;
+    }
+
+    for (size_t i = 0; i < cfg->ignored_vlan_count; ++i) {
+        if (cfg->ignored_vlans[i] == vlan_id) {
+            return 0;
+        }
+    }
+
+    if (cfg->ignored_vlan_count >= TD_MAX_IGNORED_VLANS) {
+        return -ENOSPC;
+    }
+
+    cfg->ignored_vlans[cfg->ignored_vlan_count++] = (uint16_t)vlan_id;
+    return 0;
+}
+
+int td_config_remove_ignored_vlan(struct td_runtime_config *cfg, unsigned int vlan_id) {
+    if (!cfg) {
+        return -EINVAL;
+    }
+    if (vlan_id == 0 || vlan_id > 4094U) {
+        return -ERANGE;
+    }
+
+    for (size_t i = 0; i < cfg->ignored_vlan_count; ++i) {
+        if (cfg->ignored_vlans[i] == vlan_id) {
+            size_t remaining = cfg->ignored_vlan_count - i - 1;
+            if (remaining > 0) {
+                memmove(&cfg->ignored_vlans[i],
+                        &cfg->ignored_vlans[i + 1],
+                        remaining * sizeof(cfg->ignored_vlans[0]));
+            }
+            cfg->ignored_vlan_count -= 1;
+            cfg->ignored_vlans[cfg->ignored_vlan_count] = 0U;
+            return 0;
+        }
+    }
+
+    return -ENOENT;
+}
+
+void td_config_clear_ignored_vlans(struct td_runtime_config *cfg) {
+    if (!cfg) {
+        return;
+    }
+
+    if (cfg->ignored_vlan_count > 0) {
+        memset(cfg->ignored_vlans, 0, sizeof(cfg->ignored_vlans));
+        cfg->ignored_vlan_count = 0;
+    }
 }

@@ -87,12 +87,39 @@ struct iface_record {
     struct iface_record *next;
 };
 
+#ifndef TD_PENDING_VLAN_CAPACITY
+#define TD_PENDING_VLAN_CAPACITY 4096
+#endif
+
+#ifndef TD_MIN_VLAN_ID
+#define TD_MIN_VLAN_ID 1
+#endif
+
+#ifndef TD_MAX_VLAN_ID
+#define TD_MAX_VLAN_ID 4094
+#endif
+
+struct pending_vlan_entry {
+    struct terminal_entry *terminal;
+    struct pending_vlan_entry *next;
+};
+
+struct pending_vlan_bucket {
+    struct pending_vlan_entry *head;
+};
+
 static pthread_mutex_t g_active_manager_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct terminal_manager *g_active_manager = NULL;
 
 static void bind_active_manager(struct terminal_manager *mgr);
 static void unbind_active_manager(struct terminal_manager *mgr);
 static void mac_locator_on_refresh(uint64_t version, void *ctx);
+static void terminal_manager_run_address_sync(struct terminal_manager *mgr);
+static bool vlan_is_ignored(const struct terminal_manager *mgr, int vlan_id);
+static void format_ignored_vlan_array(const uint16_t *vlans,
+                                      size_t count,
+                                      char *buffer,
+                                      size_t buffer_len);
 
 struct terminal_manager *terminal_manager_get_active(void) {
     pthread_mutex_lock(&g_active_manager_mutex);
@@ -125,6 +152,7 @@ struct terminal_manager {
     size_t max_terminals;
     struct terminal_manager_stats stats;
     struct iface_record *iface_records;
+    struct pending_vlan_bucket pending_vlans[TD_PENDING_VLAN_CAPACITY];
     struct mac_lookup_task *mac_need_refresh_head;
     struct mac_lookup_task *mac_need_refresh_tail;
     struct mac_lookup_task *mac_pending_verify_head;
@@ -132,6 +160,10 @@ struct terminal_manager {
     uint64_t mac_locator_version;
     bool mac_locator_subscribed;
     bool destroying;
+    terminal_address_sync_fn address_sync_cb;
+    void *address_sync_ctx;
+    bool address_sync_pending;
+    bool address_sync_in_progress;
 };
 
 static bool is_iface_available(const struct terminal_entry *entry);
@@ -140,7 +172,8 @@ static void event_queue_push(struct terminal_event_queue *queue, struct terminal
 static void queue_event(struct terminal_manager *mgr,
                         terminal_event_tag_t tag,
                         const struct terminal_key *key,
-                        const struct terminal_metadata *meta);
+                        const struct terminal_metadata *meta,
+                        uint32_t prev_ifindex);
 static void queue_add_event(struct terminal_manager *mgr,
                             const struct terminal_entry *entry);
 static void queue_remove_event(struct terminal_manager *mgr,
@@ -163,6 +196,8 @@ static bool iface_binding_attach(struct terminal_manager *mgr,
 static void iface_binding_detach(struct terminal_manager *mgr,
                                  int kernel_ifindex,
                                  struct terminal_entry *entry);
+static bool resolve_tx_interface(struct terminal_manager *mgr,
+                                 struct terminal_entry *entry);
 static void iface_record_prune_if_empty(struct iface_record **slot_ref);
 static struct in_addr prefix_network(struct in_addr address, uint8_t prefix_len);
 static bool ip_matches_prefix(struct in_addr ip,
@@ -178,6 +213,24 @@ static bool iface_prefix_remove(struct terminal_manager *mgr,
                                 struct in_addr network,
                                           struct in_addr address,
                                 uint8_t prefix_len);
+static struct pending_vlan_bucket *pending_get_bucket(struct terminal_manager *mgr,
+                                                      int vlan_id);
+static void pending_detach_from_vlan(struct terminal_manager *mgr,
+                                     struct terminal_entry *entry,
+                                     int vlan_id);
+static void pending_detach(struct terminal_manager *mgr,
+                           struct terminal_entry *entry);
+static void pending_attach(struct terminal_manager *mgr,
+                           struct terminal_entry *entry,
+                           int vlan_id);
+static void pending_retry_vlan(struct terminal_manager *mgr,
+                               int vlan_id);
+static void pending_retry_for_ifindex(struct terminal_manager *mgr,
+                                      int kernel_ifindex);
+static bool parse_vlan_from_ifname(const char *format,
+                                   const char *ifname,
+                                   int *out_vlan);
+static bool vlan_id_supported(int vlan_id);
 
 static uint64_t debug_timespec_diff_ms(const struct timespec *start,
                                        const struct timespec *end) {
@@ -448,9 +501,6 @@ static void enqueue_need_refresh(struct terminal_manager *mgr, struct terminal_e
     if (entry->mac_refresh_enqueued) {
         return;
     }
-    if (entry->meta.vlan_id < 0) {
-        return;
-    }
     struct mac_lookup_task *task = mac_lookup_task_create(&entry->key, entry->meta.vlan_id, false);
     if (!task) {
         td_log_writef(TD_LOG_WARN,
@@ -536,7 +586,8 @@ static void free_event_queue(struct terminal_event_queue *queue) {
 static void queue_event(struct terminal_manager *mgr,
                         terminal_event_tag_t tag,
                         const struct terminal_key *key,
-                        const struct terminal_metadata *meta) {
+                        const struct terminal_metadata *meta,
+                        uint32_t prev_ifindex) {
     if (!mgr || !mgr->event_cb || !key) {
         return;
     }
@@ -552,6 +603,7 @@ static void queue_event(struct terminal_manager *mgr,
     } else {
         node->record.ifindex = 0U;
     }
+    node->record.prev_ifindex = prev_ifindex;
     node->record.tag = tag;
     event_queue_push(&mgr->events, node);
 }
@@ -561,7 +613,7 @@ static void queue_add_event(struct terminal_manager *mgr,
     if (!mgr || !entry) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, &entry->meta);
+    queue_event(mgr, TERMINAL_EVENT_TAG_ADD, &entry->key, &entry->meta, 0U);
 }
 
 static void queue_remove_event(struct terminal_manager *mgr,
@@ -569,7 +621,7 @@ static void queue_remove_event(struct terminal_manager *mgr,
     if (!mgr || !snapshot) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, &snapshot->meta);
+    queue_event(mgr, TERMINAL_EVENT_TAG_DEL, &snapshot->key, &snapshot->meta, 0U);
 }
 
 static void queue_modify_event_if_ifindex_changed(struct terminal_manager *mgr,
@@ -583,7 +635,11 @@ static void queue_modify_event_if_ifindex_changed(struct terminal_manager *mgr,
     if (before_ifindex == after_ifindex) {
         return;
     }
-    queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+    queue_event(mgr,
+                TERMINAL_EVENT_TAG_MOD,
+                &entry->key,
+                &entry->meta,
+                before_ifindex);
 }
 
 static void terminal_manager_maybe_dispatch_events(struct terminal_manager *mgr) {
@@ -816,6 +872,178 @@ static void iface_record_prune_if_empty(struct iface_record **slot_ref) {
     }
 }
 
+static bool vlan_id_supported(int vlan_id) {
+    return vlan_id >= TD_MIN_VLAN_ID && vlan_id <= TD_MAX_VLAN_ID;
+}
+
+static struct pending_vlan_bucket *pending_get_bucket(struct terminal_manager *mgr,
+                                                      int vlan_id) {
+    if (!mgr || !vlan_id_supported(vlan_id)) {
+        return NULL;
+    }
+    return &mgr->pending_vlans[vlan_id];
+}
+
+static void pending_reset_bucket(struct pending_vlan_bucket *bucket) {
+    if (!bucket) {
+        return;
+    }
+    bucket->head = NULL;
+}
+
+static void pending_detach_from_vlan(struct terminal_manager *mgr,
+                                     struct terminal_entry *entry,
+                                     int vlan_id) {
+    if (!mgr || !entry) {
+        return;
+    }
+    if (!vlan_id_supported(vlan_id)) {
+        return;
+    }
+    struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan_id);
+    if (!bucket) {
+        return;
+    }
+    struct pending_vlan_entry **cursor = &bucket->head;
+    while (*cursor) {
+        if ((*cursor)->terminal == entry) {
+            struct pending_vlan_entry *node = *cursor;
+            *cursor = node->next;
+            free(node);
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    if (!bucket->head) {
+        pending_reset_bucket(bucket);
+    }
+    if (entry->pending_vlan_id == vlan_id) {
+        entry->pending_vlan_id = -1;
+    }
+}
+
+static void pending_detach(struct terminal_manager *mgr,
+                           struct terminal_entry *entry) {
+    if (!mgr || !entry) {
+        return;
+    }
+    if (!vlan_id_supported(entry->pending_vlan_id)) {
+        entry->pending_vlan_id = -1;
+        return;
+    }
+    pending_detach_from_vlan(mgr, entry, entry->pending_vlan_id);
+}
+
+static void pending_attach(struct terminal_manager *mgr,
+                           struct terminal_entry *entry,
+                           int vlan_id) {
+    if (!mgr || !entry) {
+        return;
+    }
+
+    struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan_id);
+    if (!bucket) {
+        return;
+    }
+
+    if (entry->pending_vlan_id >= 0 && entry->pending_vlan_id != vlan_id) {
+        pending_detach(mgr, entry);
+    } else if (entry->pending_vlan_id == vlan_id) {
+        return;
+    }
+
+    struct pending_vlan_entry *node = bucket->head;
+    while (node) {
+        if (node->terminal == entry) {
+            entry->pending_vlan_id = vlan_id;
+            return;
+        }
+        node = node->next;
+    }
+
+    node = calloc(1, sizeof(*node));
+    if (!node) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "failed to allocate pending node for vlan=%d",
+                      vlan_id);
+        return;
+    }
+    node->terminal = entry;
+    node->next = bucket->head;
+    bucket->head = node;
+    entry->pending_vlan_id = vlan_id;
+}
+
+static bool parse_vlan_from_ifname(const char *format,
+                                   const char *ifname,
+                                   int *out_vlan) {
+    if (!format || !ifname || !out_vlan) {
+        return false;
+    }
+    unsigned int parsed = 0;
+    if (sscanf(ifname, format, &parsed) == 1 && vlan_id_supported((int)parsed)) {
+        *out_vlan = (int)parsed;
+        return true;
+    }
+    return false;
+}
+
+static void pending_retry_vlan(struct terminal_manager *mgr,
+                               int vlan_id) {
+    if (!mgr || !vlan_id_supported(vlan_id)) {
+        return;
+    }
+    struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan_id);
+    if (!bucket || !bucket->head) {
+        return;
+    }
+
+    struct pending_vlan_entry *node = bucket->head;
+    while (node) {
+        struct pending_vlan_entry *next = node->next;
+        struct terminal_entry *entry = node->terminal;
+        if (!entry) {
+            node = next;
+            continue;
+        }
+
+        bool resolved = resolve_tx_interface(mgr, entry);
+        if (resolved && is_iface_available(entry)) {
+            set_state(entry, TERMINAL_STATE_PROBING);
+            entry->failed_probes = 0;
+        }
+
+        node = next;
+    }
+}
+
+static void pending_retry_for_ifindex(struct terminal_manager *mgr,
+                                      int kernel_ifindex) {
+    if (!mgr || kernel_ifindex <= 0) {
+        return;
+    }
+
+    char ifname[IFNAMSIZ] = {0};
+    int vlan_id = -1;
+    if (!if_indextoname((unsigned int)kernel_ifindex, ifname)) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "pending retry on ifindex %d failed: unable to resolve name",
+                      kernel_ifindex);
+        return;
+    }
+    if (!parse_vlan_from_ifname(mgr->cfg.vlan_iface_format, ifname, &vlan_id)) {
+        td_log_writef(TD_LOG_WARN,
+                      "terminal_manager",
+                      "pending retry on ifindex %d failed: unable to parse vlan from %s",
+                      kernel_ifindex,
+                      ifname);
+        return;
+    }
+    pending_retry_vlan(mgr, vlan_id);
+}
+
 static bool iface_prefix_add(struct terminal_manager *mgr,
                              int kernel_ifindex,
                              struct in_addr network,
@@ -972,10 +1200,9 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
     char candidate[IFNAMSIZ] = {0};
     int candidate_kernel_ifindex = -1;
     bool resolved = false;
-
     struct in_addr candidate_source_ip = {0};
 
-    if (mgr->cfg.vlan_iface_format && entry->meta.vlan_id >= 0) {
+    if (mgr->cfg.vlan_iface_format) {
         snprintf(candidate,
                  sizeof(candidate),
                  mgr->cfg.vlan_iface_format,
@@ -1003,6 +1230,8 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
         entry->tx_iface[0] = '\0';
         entry->tx_kernel_ifindex = -1;
         entry->tx_source_ip.s_addr = 0;
+
+        pending_attach(mgr, entry, entry->meta.vlan_id);
         return false;
     }
 
@@ -1022,9 +1251,12 @@ static bool resolve_tx_interface(struct terminal_manager *mgr, struct terminal_e
         entry->tx_iface[0] = '\0';
         entry->tx_kernel_ifindex = -1;
         entry->tx_source_ip.s_addr = 0;
+
+        pending_attach(mgr, entry, entry->meta.vlan_id);
         return false;
     }
 
+    pending_detach(mgr, entry);
     return true;
 }
 
@@ -1036,6 +1268,7 @@ static void apply_packet_binding(struct terminal_manager *mgr,
     }
 
     entry->meta.vlan_id = packet->vlan_id;
+
     if (packet->ifindex > 0U) {
         entry->meta.ifindex = packet->ifindex;
     }
@@ -1067,6 +1300,7 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
     entry->tx_iface[0] = '\0';
     entry->tx_kernel_ifindex = -1;
     entry->tx_source_ip.s_addr = 0;
+    entry->pending_vlan_id = -1;
     entry->mac_refresh_enqueued = false;
     entry->mac_verify_enqueued = false;
     entry->next = NULL;
@@ -1085,6 +1319,26 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
                                                   void *probe_ctx) {
     if (!cfg || !adapter) {
         return NULL;
+    }
+
+    if (cfg->ignored_vlan_count > TD_MAX_IGNORED_VLANS) {
+        td_log_writef(TD_LOG_ERROR,
+                      "terminal_manager",
+                      "ignored vlan count %zu exceeds limit %u",
+                      cfg->ignored_vlan_count,
+                      (unsigned int)TD_MAX_IGNORED_VLANS);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < cfg->ignored_vlan_count; ++i) {
+        uint16_t vlan = cfg->ignored_vlans[i];
+        if (vlan < TD_MIN_VLAN_ID || vlan > TD_MAX_VLAN_ID) {
+            td_log_writef(TD_LOG_ERROR,
+                          "terminal_manager",
+                          "ignored vlan %u out of range",
+                          (unsigned int)vlan);
+            return NULL;
+        }
     }
 
     struct terminal_manager *mgr = calloc(1, sizeof(*mgr));
@@ -1141,9 +1395,17 @@ struct terminal_manager *terminal_manager_create(const struct terminal_manager_c
     mgr->mac_locator_version = 0ULL;
     mgr->mac_locator_subscribed = false;
     mgr->destroying = false;
+    mgr->address_sync_cb = NULL;
+    mgr->address_sync_ctx = NULL;
+    mgr->address_sync_pending = false;
+    mgr->address_sync_in_progress = false;
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         mgr->table[i] = NULL;
+    }
+
+    for (int vid = 0; vid < TD_PENDING_VLAN_CAPACITY; ++vid) {
+        pending_reset_bucket(&mgr->pending_vlans[vid]);
     }
 
     if (pthread_create(&mgr->worker_thread, NULL, terminal_manager_worker, mgr) == 0) {
@@ -1206,6 +1468,15 @@ void terminal_manager_destroy(struct terminal_manager *mgr) {
     mgr->mac_need_refresh_tail = NULL;
     mgr->mac_pending_verify_head = NULL;
     mgr->mac_pending_verify_tail = NULL;
+    for (int vid = 0; vid < TD_PENDING_VLAN_CAPACITY; ++vid) {
+        struct pending_vlan_entry *node = mgr->pending_vlans[vid].head;
+        while (node) {
+            struct pending_vlan_entry *next = node->next;
+            free(node);
+            node = next;
+        }
+        pending_reset_bucket(&mgr->pending_vlans[vid]);
+    }
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         struct terminal_entry *node = mgr->table[i];
         while (node) {
@@ -1309,7 +1580,11 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
         entry->meta.ifindex = ifindex;
         entry->meta.mac_view_version = version;
         if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
-            queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+            queue_event(mgr,
+                        TERMINAL_EVENT_TAG_MOD,
+                        &entry->key,
+                        &entry->meta,
+                        before_ifindex);
         }
         pthread_mutex_unlock(&mgr->lock);
         return;
@@ -1324,7 +1599,11 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
             }
         }
         if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
-            queue_event(mgr, TERMINAL_EVENT_TAG_MOD, &entry->key, &entry->meta);
+            queue_event(mgr,
+                        TERMINAL_EVENT_TAG_MOD,
+                        &entry->key,
+                        &entry->meta,
+                        before_ifindex);
         }
     } else {
         if (rc == TD_ADAPTER_ERR_NOT_READY) {
@@ -1375,6 +1654,14 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
         return;
     }
 
+    if (!vlan_id_supported(packet->vlan_id)) {
+        td_log_writef(TD_LOG_DEBUG,
+                      "terminal_manager",
+                      "ignore packet on unsupported vlan=%d",
+                      (int)packet->vlan_id);
+        return;
+    }
+
     struct mac_lookup_task *lookup_head = NULL;
     struct mac_lookup_task *lookup_tail = NULL;
 
@@ -1410,6 +1697,15 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     size_t bucket = hash_key(&key) % TERMINAL_BUCKET_COUNT;
 
     pthread_mutex_lock(&mgr->lock);
+
+    if (vlan_is_ignored(mgr, packet->vlan_id)) {
+        pthread_mutex_unlock(&mgr->lock);
+        td_log_writef(TD_LOG_DEBUG,
+                      "terminal_manager",
+                      "ignored packet on vlan=%d",
+                      packet->vlan_id);
+        return;
+    }
 
     bool track_events = mgr->event_cb != NULL;
     bool newly_created = false;
@@ -1478,7 +1774,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
         set_state(entry, TERMINAL_STATE_ACTIVE);
     }
 
-    if (mgr->mac_locator_ops && entry->meta.vlan_id >= 0) {
+    if (mgr->mac_locator_ops) {
         bool version_ready = mgr->mac_locator_version > 0;
         bool wants_lookup = false;
 
@@ -1523,6 +1819,52 @@ static bool is_iface_available(const struct terminal_entry *entry) {
     return entry && entry->tx_kernel_ifindex > 0 && entry->tx_source_ip.s_addr != 0;
 }
 
+static void terminal_manager_run_address_sync(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    terminal_address_sync_fn handler = NULL;
+    void *handler_ctx = NULL;
+
+    pthread_mutex_lock(&mgr->lock);
+    if (mgr->address_sync_pending && mgr->address_sync_cb && !mgr->address_sync_in_progress) {
+        mgr->address_sync_in_progress = true;
+        handler = mgr->address_sync_cb;
+        handler_ctx = mgr->address_sync_ctx;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    if (!handler) {
+        return;
+    }
+
+    int rc = handler(handler_ctx);
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->address_sync_in_progress = false;
+    if (rc == 0) {
+        mgr->address_sync_pending = false;
+    } else {
+        mgr->address_sync_pending = true;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+static bool vlan_is_ignored(const struct terminal_manager *mgr, int vlan_id) {
+    if (!mgr || !vlan_id_supported(vlan_id) || mgr->cfg.ignored_vlan_count == 0) {
+        return false;
+    }
+
+    uint16_t vlan = (uint16_t)vlan_id;
+    for (size_t i = 0; i < mgr->cfg.ignored_vlan_count; ++i) {
+        if (mgr->cfg.ignored_vlans[i] == vlan) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool has_expired(const struct terminal_manager *mgr,
                         const struct terminal_entry *entry,
                         const struct timespec *now) {
@@ -1540,6 +1882,8 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
     if (!mgr) {
         return;
     }
+
+    terminal_manager_run_address_sync(mgr);
 
     struct timespec now;
     monotonic_now(&now);
@@ -1566,7 +1910,7 @@ void terminal_manager_on_timer(struct terminal_manager *mgr) {
                 have_before_snapshot = true;
             }
 
-            if (mgr->mac_locator_ops && entry->meta.vlan_id >= 0) {
+            if (mgr->mac_locator_ops) {
                 if (entry->state == TERMINAL_STATE_IFACE_INVALID) {
                     if (mgr->mac_locator_version > 0 &&
                         entry->meta.mac_view_version < mgr->mac_locator_version) {
@@ -1733,10 +2077,6 @@ static void mac_locator_on_refresh(uint64_t version, void *ctx) {
 
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
-            if (entry->meta.vlan_id < 0) {
-                continue;
-            }
-
             if (entry->meta.ifindex == 0) {
                 if (!entry->mac_refresh_enqueued) {
                     struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
@@ -1793,6 +2133,7 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
     mgr->stats.address_update_events += 1;
 
     struct in_addr network = prefix_network(update->address, update->prefix_len);
+    bool retry_pending = false;
     if (update->is_add) {
         if (!iface_prefix_add(mgr,
                               update->kernel_ifindex,
@@ -1802,6 +2143,7 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
             pthread_mutex_unlock(&mgr->lock);
             return;
         }
+        retry_pending = true;
     } else {
         iface_prefix_remove(mgr,
                             update->kernel_ifindex,
@@ -1836,6 +2178,7 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
             terminal->tx_iface[0] = '\0';
             terminal->tx_kernel_ifindex = -1;
             terminal->tx_source_ip.s_addr = 0;
+            pending_attach(mgr, terminal, terminal->meta.vlan_id);
             monotonic_now(&terminal->last_seen);
             set_state(terminal, TERMINAL_STATE_IFACE_INVALID);
         } else {
@@ -1845,7 +2188,49 @@ void terminal_manager_on_address_update(struct terminal_manager *mgr,
 
     iface_record_prune_if_empty(slot);
 
+    if (retry_pending) {
+        pending_retry_for_ifindex(mgr, update->kernel_ifindex);
+    }
+
     pthread_mutex_unlock(&mgr->lock);
+}
+
+void terminal_manager_set_address_sync_handler(struct terminal_manager *mgr,
+                                               terminal_address_sync_fn handler,
+                                               void *handler_ctx) {
+    if (!mgr) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    mgr->address_sync_cb = handler;
+    mgr->address_sync_ctx = handler_ctx;
+    if (!handler) {
+        mgr->address_sync_pending = false;
+        mgr->address_sync_in_progress = false;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+void terminal_manager_request_address_sync(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    bool should_signal = false;
+
+    pthread_mutex_lock(&mgr->lock);
+    if (mgr->address_sync_cb) {
+        mgr->address_sync_pending = true;
+        should_signal = true;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+
+    if (should_signal) {
+        pthread_mutex_lock(&mgr->worker_lock);
+        pthread_cond_signal(&mgr->worker_cond);
+        pthread_mutex_unlock(&mgr->worker_lock);
+    }
 }
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
@@ -1906,6 +2291,7 @@ int terminal_manager_query_all(struct terminal_manager *mgr,
                 memcpy(records[idx].key.mac, entry->key.mac, ETH_ALEN);
                 records[idx].key.ip = entry->key.ip;
                 records[idx].ifindex = entry->meta.ifindex;
+                records[idx].prev_ifindex = 0U;
                 records[idx].tag = TERMINAL_EVENT_TAG_ADD;
             }
             ++idx;
@@ -2001,6 +2387,174 @@ int terminal_manager_set_max_terminals(struct terminal_manager *mgr,
     mgr->max_terminals = max_terminals;
     pthread_mutex_unlock(&mgr->lock);
     return 0;
+}
+
+int terminal_manager_add_ignored_vlan(struct terminal_manager *mgr,
+                                      uint16_t vlan_id) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (vlan_id < TD_MIN_VLAN_ID || vlan_id > TD_MAX_VLAN_ID) {
+        return -ERANGE;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    for (size_t i = 0; i < mgr->cfg.ignored_vlan_count; ++i) {
+        if (mgr->cfg.ignored_vlans[i] == vlan_id) {
+            pthread_mutex_unlock(&mgr->lock);
+            return 0;
+        }
+    }
+
+    if (mgr->cfg.ignored_vlan_count >= TD_MAX_IGNORED_VLANS) {
+        pthread_mutex_unlock(&mgr->lock);
+        return -ENOSPC;
+    }
+
+    mgr->cfg.ignored_vlans[mgr->cfg.ignored_vlan_count++] = vlan_id;
+    pthread_mutex_unlock(&mgr->lock);
+    return 0;
+}
+
+int terminal_manager_remove_ignored_vlan(struct terminal_manager *mgr,
+                                         uint16_t vlan_id) {
+    if (!mgr) {
+        return -EINVAL;
+    }
+    if (vlan_id < TD_MIN_VLAN_ID || vlan_id > TD_MAX_VLAN_ID) {
+        return -ERANGE;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+
+    for (size_t i = 0; i < mgr->cfg.ignored_vlan_count; ++i) {
+        if (mgr->cfg.ignored_vlans[i] == vlan_id) {
+            size_t remaining = mgr->cfg.ignored_vlan_count - i - 1;
+            if (remaining > 0) {
+                memmove(&mgr->cfg.ignored_vlans[i],
+                        &mgr->cfg.ignored_vlans[i + 1],
+                        remaining * sizeof(mgr->cfg.ignored_vlans[0]));
+            }
+            mgr->cfg.ignored_vlan_count -= 1;
+            mgr->cfg.ignored_vlans[mgr->cfg.ignored_vlan_count] = 0U;
+            pthread_mutex_unlock(&mgr->lock);
+            return 0;
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return -ENOENT;
+}
+
+void terminal_manager_clear_ignored_vlans(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    pthread_mutex_lock(&mgr->lock);
+    if (mgr->cfg.ignored_vlan_count > 0) {
+        memset(mgr->cfg.ignored_vlans, 0, sizeof(mgr->cfg.ignored_vlans));
+        mgr->cfg.ignored_vlan_count = 0;
+    }
+    pthread_mutex_unlock(&mgr->lock);
+}
+
+static void format_ignored_vlan_array(const uint16_t *vlans,
+                                      size_t count,
+                                      char *buffer,
+                                      size_t buffer_len) {
+    if (!buffer || buffer_len == 0) {
+        return;
+    }
+
+    if (!vlans || count == 0) {
+        snprintf(buffer, buffer_len, "none");
+        return;
+    }
+
+    size_t pos = 0;
+    int written = snprintf(buffer + pos, buffer_len - pos, "[");
+    if (written < 0 || (size_t)written >= buffer_len - pos) {
+        buffer[buffer_len - 1] = '\0';
+        return;
+    }
+    pos += (size_t)written;
+
+    for (size_t i = 0; i < count; ++i) {
+        written = snprintf(buffer + pos,
+                           buffer_len - pos,
+                           "%s%u",
+                           (i == 0) ? "" : ",",
+                           (unsigned int)vlans[i]);
+        if (written < 0 || (size_t)written >= buffer_len - pos) {
+            buffer[buffer_len - 1] = '\0';
+            return;
+        }
+        pos += (size_t)written;
+    }
+
+    snprintf(buffer + pos, buffer_len - pos, "]");
+}
+
+void terminal_manager_log_config(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    struct terminal_manager_config cfg_snapshot;
+    memset(&cfg_snapshot, 0, sizeof(cfg_snapshot));
+
+    pthread_mutex_lock(&mgr->lock);
+    cfg_snapshot = mgr->cfg;
+    pthread_mutex_unlock(&mgr->lock);
+
+    char ignored_buf[TD_MAX_IGNORED_VLANS * 6 + 8];
+    memset(ignored_buf, 0, sizeof(ignored_buf));
+    format_ignored_vlan_array(cfg_snapshot.ignored_vlans,
+                              cfg_snapshot.ignored_vlan_count,
+                              ignored_buf,
+                              sizeof(ignored_buf));
+
+    const char *iface_format = cfg_snapshot.vlan_iface_format ? cfg_snapshot.vlan_iface_format : "<default>";
+
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_config",
+                  "keepalive=%us miss=%u holdoff=%us scan=%ums max=%zu vlan_iface_format=%s ignored_vlans=%s",
+                  cfg_snapshot.keepalive_interval_sec,
+                  cfg_snapshot.keepalive_miss_threshold,
+                  cfg_snapshot.iface_invalid_holdoff_sec,
+                  cfg_snapshot.scan_interval_ms,
+                  cfg_snapshot.max_terminals,
+                  iface_format,
+                  ignored_buf);
+}
+
+void terminal_manager_log_stats(struct terminal_manager *mgr) {
+    if (!mgr) {
+        return;
+    }
+
+    struct terminal_manager_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    terminal_manager_get_stats(mgr, &stats);
+
+    td_log_writef(TD_LOG_INFO,
+                  "terminal_stats",
+                  "current=%" PRIu64 " discovered=%" PRIu64 " removed=%" PRIu64
+                  " probes=%" PRIu64 " probe_failures=%" PRIu64
+                  " capacity_drops=%" PRIu64
+                  " events=%" PRIu64 " dispatch_failures=%" PRIu64
+                  " addr_updates=%" PRIu64,
+                  stats.current_terminals,
+                  stats.terminals_discovered,
+                  stats.terminals_removed,
+                  stats.probes_scheduled,
+                  stats.probe_failures,
+                  stats.capacity_drops,
+                  stats.events_dispatched,
+                  stats.event_dispatch_failures,
+                  stats.address_update_events);
 }
 
 static int td_debug_prepare_context(td_debug_dump_context_t **ctx_ptr,
@@ -2136,15 +2690,17 @@ int td_debug_dump_terminal_table(struct terminal_manager *mgr,
                 rc = debug_emit_line(writer,
                                      writer_ctx,
                                      ctx_in,
-                                     "  terminal mac=%s ip=%s state=%s vlan=%d ifindex=%u tx_iface=%s last_seen=%s age_ms=%" PRIu64 "\n",
+                                     "  terminal mac=%s ip=%s state=%s vlan=%d ifindex=%u last_seen=%s age_ms=%" PRIu64 " last_probe=%s probe_age_ms=%" PRIu64 " failed_probes=%u\n",
                                      mac_buf,
                                      ip_buf,
                                      state_to_string(iter->state),
                                      iter->meta.vlan_id,
                                      iter->meta.ifindex,
-                                     tx_iface,
                                      last_seen_buf[0] ? last_seen_buf : "",
-                                     last_seen_age_ms);
+                                     last_seen_age_ms,
+                                     last_probe_buf[0] ? last_probe_buf : "",
+                                     last_probe_age_ms,
+                                     iter->failed_probes);
             }
         }
     }
@@ -2303,6 +2859,124 @@ int td_debug_dump_iface_binding_table(struct terminal_manager *mgr,
                                  state_to_string(terminal->state),
                                  terminal->meta.vlan_id,
                                  bucket);
+        }
+    }
+
+    pthread_mutex_unlock(&mgr->lock);
+    return rc;
+}
+
+int td_debug_dump_pending_vlan_table(struct terminal_manager *mgr,
+                                     const td_debug_dump_opts_t *opts,
+                                     td_debug_writer_t writer,
+                                     void *writer_ctx,
+                                     td_debug_dump_context_t *ctx) {
+    if (!mgr || !writer) {
+        return -EINVAL;
+    }
+
+    td_debug_dump_context_t local_ctx;
+    td_debug_dump_context_t *ctx_in = ctx;
+    if (td_debug_prepare_context(&ctx_in, &local_ctx, opts) != 0) {
+        return -EINVAL;
+    }
+
+    size_t filtered_counts[TD_PENDING_VLAN_CAPACITY];
+    size_t total_counts[TD_PENDING_VLAN_CAPACITY];
+    memset(filtered_counts, 0, sizeof(filtered_counts));
+    memset(total_counts, 0, sizeof(total_counts));
+
+    pthread_mutex_lock(&mgr->lock);
+
+    size_t matched_buckets = 0;
+    size_t matched_entries = 0;
+
+    /* Collect per-VLAN counts so the summary line can be emitted before details. */
+    for (int vlan = TD_MIN_VLAN_ID; vlan <= TD_MAX_VLAN_ID; ++vlan) {
+        struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan);
+        if (!bucket || !bucket->head) {
+            continue;
+        }
+        if (opts && opts->filter_by_vlan && opts->vlan_id != vlan) {
+            continue;
+        }
+
+        size_t bucket_total = 0;
+        size_t bucket_filtered = 0;
+        for (struct pending_vlan_entry *node = bucket->head; node; node = node->next) {
+            struct terminal_entry *entry = node->terminal;
+            if (!entry) {
+                continue;
+            }
+            bucket_total += 1;
+            if (!opts || debug_entry_matches_opts(entry, opts)) {
+                bucket_filtered += 1;
+            }
+        }
+
+        if (bucket_filtered == 0) {
+            continue;
+        }
+
+        filtered_counts[vlan] = bucket_filtered;
+        total_counts[vlan] = bucket_total;
+        matched_buckets += 1;
+        matched_entries += bucket_filtered;
+    }
+
+    int rc = debug_emit_line(writer,
+                             writer_ctx,
+                             ctx_in,
+                             "pending_vlans buckets=%zu terminals=%zu\n",
+                             matched_buckets,
+                             matched_entries);
+
+    if (rc == 0 && matched_entries > 0) {
+        for (int vlan = TD_MIN_VLAN_ID; vlan <= TD_MAX_VLAN_ID && rc == 0; ++vlan) {
+            size_t bucket_filtered = filtered_counts[vlan];
+            if (bucket_filtered == 0) {
+                continue;
+            }
+            size_t bucket_total = total_counts[vlan];
+            rc = debug_emit_line(writer,
+                                 writer_ctx,
+                                 ctx_in,
+                                 "pending vlan=%d entries=%zu total=%zu\n",
+                                 vlan,
+                                 bucket_filtered,
+                                 bucket_total);
+            if (rc != 0) {
+                break;
+            }
+
+            if (opts && opts->expand_pending_vlans) {
+                struct pending_vlan_bucket *bucket = pending_get_bucket(mgr, vlan);
+                if (!bucket) {
+                    continue;
+                }
+                for (struct pending_vlan_entry *node = bucket->head; node && rc == 0; node = node->next) {
+                    struct terminal_entry *entry = node->terminal;
+                    if (!entry) {
+                        continue;
+                    }
+                    if (opts && !debug_entry_matches_opts(entry, opts)) {
+                        continue;
+                    }
+                    char mac_buf[18];
+                    char ip_buf[INET_ADDRSTRLEN];
+                    format_terminal_identity(&entry->key, mac_buf, ip_buf);
+                    rc = debug_emit_line(writer,
+                                         writer_ctx,
+                                         ctx_in,
+                                         "  terminal mac=%s ip=%s state=%s pending_vlan=%d meta_vlan=%d ifindex=%u\n",
+                                         mac_buf,
+                                         ip_buf,
+                                         state_to_string(entry->state),
+                                         entry->pending_vlan_id,
+                                         entry->meta.vlan_id,
+                                         entry->meta.ifindex);
+                }
+            }
         }
     }
 

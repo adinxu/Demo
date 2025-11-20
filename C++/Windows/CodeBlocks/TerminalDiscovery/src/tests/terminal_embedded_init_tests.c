@@ -47,6 +47,10 @@ struct stub_state {
     unsigned int netlink_stop_calls;
     unsigned int set_sink_calls;
     unsigned int northbound_attach_calls;
+    unsigned int set_sync_calls;
+    unsigned int request_sync_calls;
+    terminal_address_sync_fn last_sync_handler;
+    void *last_sync_ctx;
     struct terminal_manager_config manager_cfg;
     terminal_event_callback_fn registered_callback;
     void *registered_ctx;
@@ -171,6 +175,20 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     (void)packet;
 }
 
+void terminal_manager_set_address_sync_handler(struct terminal_manager *mgr,
+                                               terminal_address_sync_fn handler,
+                                               void *handler_ctx) {
+    (void)mgr;
+    g_stub.set_sync_calls += 1;
+    g_stub.last_sync_handler = handler;
+    g_stub.last_sync_ctx = handler_ctx;
+}
+
+void terminal_manager_request_address_sync(struct terminal_manager *mgr) {
+    (void)mgr;
+    g_stub.request_sync_calls += 1;
+}
+
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
                                     terminal_event_callback_fn callback,
                                     void *callback_ctx) {
@@ -244,6 +262,10 @@ static void stub_reset(void) {
     g_stub.last_nonnull_callback = NULL;
     g_stub.last_nonnull_ctx = NULL;
     g_stub.last_attached_manager = NULL;
+    g_stub.set_sync_calls = 0U;
+    g_stub.request_sync_calls = 0U;
+    g_stub.last_sync_handler = NULL;
+    g_stub.last_sync_ctx = NULL;
     memset(&g_stub.last_subscription, 0, sizeof(g_stub.last_subscription));
     td_log_set_level(TD_LOG_NONE);
 }

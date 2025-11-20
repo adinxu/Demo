@@ -10,6 +10,10 @@
 
 #include "adapter_api.h"
 
+#ifndef TD_MAX_IGNORED_VLANS
+#define TD_MAX_IGNORED_VLANS 32U
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,6 +45,7 @@ struct terminal_entry {
     char tx_iface[IFNAMSIZ];
     int tx_kernel_ifindex;
     struct in_addr tx_source_ip;
+    int pending_vlan_id;
     bool mac_refresh_enqueued;
     bool mac_verify_enqueued;
     struct terminal_entry *next;
@@ -71,6 +76,7 @@ typedef enum {
 typedef struct terminal_event_record {
     struct terminal_key key;
     uint32_t ifindex; /* 0 when unknown; logical port identifier */
+    uint32_t prev_ifindex; /* 0 when unavailable; previous logical port for MOD events */
     terminal_event_tag_t tag;
 } terminal_event_record_t;
 
@@ -106,6 +112,7 @@ typedef struct td_debug_dump_opts {
     size_t mac_prefix_len;
     bool verbose_metrics;
     bool expand_terminals;
+    bool expand_pending_vlans;
 } td_debug_dump_opts_t;
 
 typedef struct td_debug_dump_context {
@@ -150,6 +157,8 @@ typedef struct terminal_address_update {
     bool is_add;        /* true = add/update, false = remove */
 } terminal_address_update_t;
 
+typedef int (*terminal_address_sync_fn)(void *ctx);
+
 struct terminal_manager_config {
     unsigned int keepalive_interval_sec;
     unsigned int keepalive_miss_threshold;
@@ -157,6 +166,8 @@ struct terminal_manager_config {
     unsigned int scan_interval_ms;
     const char *vlan_iface_format; /* e.g. "vlan%u"; leave NULL to reuse ingress name */
     size_t max_terminals;
+    uint16_t ignored_vlans[TD_MAX_IGNORED_VLANS];
+    size_t ignored_vlan_count;
 };
 
 struct terminal_manager *terminal_manager_create(const struct terminal_manager_config *cfg,
@@ -174,6 +185,12 @@ void terminal_manager_on_timer(struct terminal_manager *mgr);
 
 void terminal_manager_on_address_update(struct terminal_manager *mgr,
                                         const terminal_address_update_t *update);
+
+void terminal_manager_set_address_sync_handler(struct terminal_manager *mgr,
+                                               terminal_address_sync_fn handler,
+                                               void *handler_ctx);
+
+void terminal_manager_request_address_sync(struct terminal_manager *mgr);
 
 int terminal_manager_set_event_sink(struct terminal_manager *mgr,
                                     terminal_event_callback_fn callback,
@@ -202,6 +219,18 @@ int terminal_manager_set_iface_invalid_holdoff(struct terminal_manager *mgr,
 int terminal_manager_set_max_terminals(struct terminal_manager *mgr,
                                        size_t max_terminals);
 
+int terminal_manager_add_ignored_vlan(struct terminal_manager *mgr,
+                                      uint16_t vlan_id);
+
+int terminal_manager_remove_ignored_vlan(struct terminal_manager *mgr,
+                                         uint16_t vlan_id);
+
+void terminal_manager_clear_ignored_vlans(struct terminal_manager *mgr);
+
+void terminal_manager_log_config(struct terminal_manager *mgr);
+
+void terminal_manager_log_stats(struct terminal_manager *mgr);
+
 int td_debug_dump_terminal_table(struct terminal_manager *mgr,
                                  const td_debug_dump_opts_t *opts,
                                  td_debug_writer_t writer,
@@ -223,6 +252,12 @@ int td_debug_dump_mac_lookup_queue(struct terminal_manager *mgr,
                                    td_debug_writer_t writer,
                                    void *writer_ctx,
                                    td_debug_dump_context_t *ctx);
+
+int td_debug_dump_pending_vlan_table(struct terminal_manager *mgr,
+                                     const td_debug_dump_opts_t *opts,
+                                     td_debug_writer_t writer,
+                                     void *writer_ctx,
+                                     td_debug_dump_context_t *ctx);
 
 int td_debug_dump_mac_locator_state(struct terminal_manager *mgr,
                                     td_debug_writer_t writer,

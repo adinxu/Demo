@@ -54,6 +54,9 @@
    td_config_load_defaults(&cfg);
    cfg.stats_log_interval_sec = 30;
    cfg.max_terminals = 200;
+     if (td_config_add_ignored_vlan(&cfg, 200) != 0) {
+       /* TODO: 记录告警或回退策略 */
+     }
 
    struct terminal_discovery_init_params params = {
        .runtime_config = &cfg,
@@ -61,7 +64,8 @@
    int rc = terminal_discovery_initialize(&params);
    ```
   初始化默认挂接日志 sink；若宿主暂不消费增量通知，可保持默认配置，通过 INFO 级别日志观察事件。
-2. 由于配置按值拷贝，初始化返回后无需保持 `cfg` 生命周期；仍可记录副本供调试。
+2. 若需忽略多个 VLAN，可在初始化前多次调用 `td_config_add_ignored_vlan(&cfg, vid)`，函数会自动去重并在列表满时返回 `-ENOSPC`（宿主可据此告警或选择截断配置）。
+3. 由于配置按值拷贝，初始化返回后无需保持 `cfg` 生命周期；仍可记录副本供调试。
 3. 若需要手动触发统计输出，可调用 `terminal_discovery_get_manager()` 获取管理器句柄，再结合 `terminal_manager_get_stats` 输出统计；亦可缓存 `terminal_discovery_get_app_context()` 结果以备扩展使用（返回指针仅供只读查询）。
 4. 当前版本默认与进程同生共死，未提供显式停止 API；宿主退出即可释放所有资源。
 5. 若直接将 `terminal_main.c` 编译进宿主可执行文件，需在编译参数中定义 `TD_DISABLE_APP_MAIN`（例如 `-DTD_DISABLE_APP_MAIN`），以屏蔽 CLI 的 `main` 实现并避免链接阶段出现重复入口符号。
