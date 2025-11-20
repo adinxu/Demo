@@ -107,9 +107,9 @@
                1. 周期性 `getDevUcMacAddress`/`mac_locator_version` 仍作为基线，用于覆盖整机范围、处理终端迁出/老化、维持缓存完整性。
                2. 点查接口只在我们“确信 VLAN 正确”且“需要快速确认端口”的场景触发，避免对未知 VLAN 的终端反复失败查询。
             - 推荐流程：
-               1. `terminal_manager_on_packet`：报文先刷新 `entry->meta.vlan_id`，若探测到 VLAN 变更或 `meta.ifindex==0`，先依据报文指示的 VLAN 调用点查；成功后将点查返回的 ifindex 写回并同步 `meta.mac_view_version` 为当前 `mac_locator_version`，同时入队 `MOD` 事件；失败时无需额外处理，直接等待后续的全表刷新再次覆盖。
+               1. `terminal_manager_on_packet`：报文先刷新 `entry->meta.vlan_id`，若探测到 VLAN 变更或 `meta.ifindex==0`，先依据报文指示的 VLAN 调用点查；成功后将点查返回的 ifindex 写回并同步 `meta.mac_view_version` 为当前 `mac_locator_version`，同时入队 `MOD` 事件；失败时仅记录日志并保持 `terminal_metadata.ifindex` 及关联元数据的旧值，禁止写 0 清空，等待后续全表刷新覆盖。
                2. `terminal_manager_on_timer`：保持现有逻辑，仅依据 `mac_locator_version` 变更驱动 `mac_need_refresh`/`mac_pending_verify` 队列，不额外调用点查接口。
-               3. `mac_locator_on_refresh`：保持原有版本驱动流程，通过全表快照结果更新 `meta.ifindex` 与 `mac_view_version`，不在回调内追加新的点查。
+               3. `mac_locator_on_refresh`：保持原有版本驱动流程，通过全表快照结果更新 `meta.ifindex` 与 `mac_view_version`，不在回调内追加新的点查；当本次快照查询失败或未命中终端时同样保留旧的 `ifindex` 值，不再强制写 0，待下一轮有效数据再行更新。
             - 点查接口本身不返回版本号；调用方需要在 `TD_ADAPTER_OK` 或 `TD_ADAPTER_ERR_NOT_FOUND` 两个分支中主动写入最新 `mac_locator_version`，以避免随后的版本刷新立即再次排队同一终端。
             - 无论是全表刷新还是点查，一旦拿到明确结论（命中或确认未命中），都应更新 `entry->meta.mac_view_version` 为最新值（点查路径取当前 `mac_locator_version`），避免后续 `mac_locator_on_refresh` 或计时线程重复排队；只有在点查返回 `TD_ADAPTER_ERR_NOT_READY` 等错误时才保留旧版本等待重试。
             - 考虑到点查接口本身开销极低，允许在后续报文驱动下重复尝试，无需显式记录或限制调用频率。

@@ -1597,7 +1597,6 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
     if (task->verify) {
         uint32_t before_ifindex = entry->meta.ifindex;
         if (rc == TD_ADAPTER_ERR_NOT_READY) {
-            entry->meta.ifindex = 0;
             entry->vid_lookup_attempted = false;
             entry->vid_lookup_vlan = -1;
             if (version > 0 && version >= entry->meta.mac_view_version) {
@@ -1778,8 +1777,8 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
 
     bool vlan_changed = (!newly_created) && (previous_vlan != entry->meta.vlan_id);
     if (vlan_changed) {
-        if (packet->ifindex == 0U) {
-            entry->meta.ifindex = 0U;
+        if (packet->ifindex > 0U) {
+            entry->meta.ifindex = packet->ifindex;
         }
         entry->meta.mac_view_version = 0ULL;
         entry->vid_lookup_attempted = false;
@@ -1816,10 +1815,9 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
                 entry->vid_lookup_vlan = entry->meta.vlan_id;
                 point_lookup_succeeded = true;
             } else if (rc == TD_ADAPTER_ERR_NOT_FOUND) {
-                entry->meta.ifindex = 0;
-                entry->meta.mac_view_version = mgr->mac_locator_version;
                 entry->vid_lookup_attempted = true;
                 entry->vid_lookup_vlan = entry->meta.vlan_id;
+                entry->meta.mac_view_version = mgr->mac_locator_version;
             } else {
                 entry->vid_lookup_attempted = false;
                 entry->vid_lookup_vlan = -1;
@@ -1858,7 +1856,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     if (newly_created) {
         queue_add_event(mgr, entry);
     } else if (have_before_snapshot) {
-    queue_modify_event_if_ifindex_changed(mgr, &before_snapshot, entry);
+        queue_modify_event_if_ifindex_changed(mgr, &before_snapshot, entry);
     }
 
     pthread_mutex_unlock(&mgr->lock);

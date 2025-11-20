@@ -132,10 +132,10 @@
 4. ✅ 扩展单元/集成测试，覆盖初次同步成功、抓取失败保持 `IFACE_INVALID`、重试成功后恢复保活等场景，确保日志与状态转移符合规范。
 
 ### 阶段 9：VLAN 点查接口整合（已完成）
-1. ✅ 打桩扩展：在 `src/stub/td_switch_mac_stub.c` 增加 `td_switch_mac_get_ifindex_by_vid` 弱符号实现，支持入参填充 VLAN/MAC 后返回固定示例 ifindex/错误码，并沿用 `[switch-mac-stub]` 日志；通过环境变量配置命中/未命中行为。
+1. ✅ 打桩扩展：在 `src/stub/td_switch_mac_stub.c` 增加 `td_switch_mac_get_ifindex_by_vid` 弱符号实现，支持入参填充 VLAN/MAC 后返回固定示例 ifindex/错误码，并沿用 `[switch-mac-stub]` 日志；通过环境变量配置命中/未命中行为。点查失败及全表查询失败场景均需打印“stub”标识，且不得主动将 `entry->ifindex` 清零，以免误导上层诊断。
 2. ✅ Demo 演示：在 `src/demo/td_switch_mac_demo.c` 补充调用样例，展示点查成功与未命中输出，并保持与快照示例一致的格式；确保 demo 在无真实 SDK 环境下与打桩配合。
 3. ✅ 适配器桥接：已在 `td_adapter_mac_locator_ops` 中加入 `lookup_by_vid` 指针，并完成 Realtek 适配器对 `td_switch_mac_get_ifindex_by_vid` 的封装，区分 `TD_ADAPTER_ERR_NOT_FOUND`/`TD_ADAPTER_ERR_NOT_READY` 等错误码，同时保持全表快照路径不变。
-4. ✅ 管理器逻辑：`terminal_manager_on_packet` 已集成 VLAN 点查流程，在 `ifindex==0` 或 VLAN 变更时触发 `lookup_by_vid`，成功后写回 `meta.ifindex` 与当前 `mac_locator_version`，未命中亦更新版本并记录尝试；`on_timer`/`on_refresh` 依旧沿用版本驱动策略。
+4. ✅ 管理器逻辑：`terminal_manager_on_packet` 已集成 VLAN 点查流程，在 `ifindex==0` 或 VLAN 变更时触发 `lookup_by_vid`，成功后写回 `meta.ifindex` 与当前 `mac_locator_version`，未命中仅记录日志并保留旧的 `meta.ifindex` 等元数据等待后续覆盖；`on_timer`/`on_refresh` 依旧沿用版本驱动策略，查询失败时同样维持旧 ifindex，不再强制写 0。
 5. ✅ 测试补充：已扩展单元测试覆盖点查命中/未命中与 VLAN 切换 `MOD` 事件，并通过 `make test` 验证通过；后续若需 demo/stub 断言可在回归阶段追加。
 6. ✅ 文档同步：已更新规范与设计文档引用（demo 指南、适配器说明、调试手册），标注点查接口调用顺序与回退路径，并说明点查不返回版本号时由管理器写回当前版本的处理方式。
 
