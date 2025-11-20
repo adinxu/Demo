@@ -1301,8 +1301,10 @@ static struct terminal_entry *create_entry(const struct terminal_key *key,
     entry->tx_kernel_ifindex = -1;
     entry->tx_source_ip.s_addr = 0;
     entry->pending_vlan_id = -1;
+    entry->vid_lookup_vlan = -1;
     entry->mac_refresh_enqueued = false;
     entry->mac_verify_enqueued = false;
+    entry->vid_lookup_attempted = false;
     entry->next = NULL;
 
     if (packet) {
@@ -1579,6 +1581,8 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
         uint32_t before_ifindex = entry->meta.ifindex;
         entry->meta.ifindex = ifindex;
         entry->meta.mac_view_version = version;
+        entry->vid_lookup_attempted = true;
+        entry->vid_lookup_vlan = entry->meta.vlan_id;
         if (mgr->event_cb && before_ifindex != entry->meta.ifindex) {
             queue_event(mgr,
                         TERMINAL_EVENT_TAG_MOD,
@@ -1594,6 +1598,8 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
         uint32_t before_ifindex = entry->meta.ifindex;
         if (rc == TD_ADAPTER_ERR_NOT_READY) {
             entry->meta.ifindex = 0;
+            entry->vid_lookup_attempted = false;
+            entry->vid_lookup_vlan = -1;
             if (version > 0 && version >= entry->meta.mac_view_version) {
                 entry->meta.mac_view_version = version;
             }
@@ -1607,6 +1613,8 @@ static void mac_lookup_apply_result(struct terminal_manager *mgr,
         }
     } else {
         if (rc == TD_ADAPTER_ERR_NOT_READY) {
+            entry->vid_lookup_attempted = false;
+            entry->vid_lookup_vlan = -1;
             enqueue_need_refresh(mgr, entry);
         }
     }
@@ -1711,9 +1719,14 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     bool newly_created = false;
     terminal_snapshot_t before_snapshot;
     bool have_before_snapshot = false;
+    int previous_vlan = -1;
 
     struct terminal_entry **prev_next = NULL;
     struct terminal_entry *entry = find_entry(mgr, &key, bucket, &prev_next);
+    if (entry) {
+        previous_vlan = entry->meta.vlan_id;
+    }
+
     if (!entry) {
         if (mgr->terminal_count >= mgr->max_terminals) {
             char mac_buf[18];
@@ -1763,6 +1776,16 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
         apply_packet_binding(mgr, entry, packet);
     }
 
+    bool vlan_changed = (!newly_created) && (previous_vlan != entry->meta.vlan_id);
+    if (vlan_changed) {
+        if (packet->ifindex == 0U) {
+            entry->meta.ifindex = 0U;
+        }
+        entry->meta.mac_view_version = 0ULL;
+        entry->vid_lookup_attempted = false;
+        entry->vid_lookup_vlan = -1;
+    }
+
     entry->failed_probes = 0;
     monotonic_now(&entry->last_seen);
 
@@ -1775,6 +1798,34 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
     }
 
     if (mgr->mac_locator_ops) {
+        bool point_lookup_succeeded = false;
+
+        if (mgr->mac_locator_ops->lookup_by_vid &&
+            vlan_id_supported(entry->meta.vlan_id) &&
+            entry->meta.ifindex == 0 &&
+            (!entry->vid_lookup_attempted || entry->vid_lookup_vlan != entry->meta.vlan_id)) {
+            uint32_t resolved_ifindex = 0U;
+            td_adapter_result_t rc = mgr->mac_locator_ops->lookup_by_vid(mgr->adapter,
+                                                                         entry->key.mac,
+                                                                         (uint16_t)entry->meta.vlan_id,
+                                                                         &resolved_ifindex);
+            if (rc == TD_ADAPTER_OK) {
+                entry->meta.ifindex = resolved_ifindex;
+                entry->meta.mac_view_version = mgr->mac_locator_version;
+                entry->vid_lookup_attempted = true;
+                entry->vid_lookup_vlan = entry->meta.vlan_id;
+                point_lookup_succeeded = true;
+            } else if (rc == TD_ADAPTER_ERR_NOT_FOUND) {
+                entry->meta.ifindex = 0;
+                entry->meta.mac_view_version = mgr->mac_locator_version;
+                entry->vid_lookup_attempted = true;
+                entry->vid_lookup_vlan = entry->meta.vlan_id;
+            } else {
+                entry->vid_lookup_attempted = false;
+                entry->vid_lookup_vlan = -1;
+            }
+        }
+
         bool version_ready = mgr->mac_locator_version > 0;
         bool wants_lookup = false;
 
@@ -1782,7 +1833,7 @@ void terminal_manager_on_packet(struct terminal_manager *mgr,
             wants_lookup = true;
         } else if (entry->meta.mac_view_version < mgr->mac_locator_version) {
             wants_lookup = true;
-        } else if (entry->meta.mac_view_version == 0 && !version_ready) {
+        } else if (entry->meta.mac_view_version == 0 && !version_ready && !point_lookup_succeeded) {
             wants_lookup = true;
         }
 
@@ -2078,6 +2129,8 @@ static void mac_locator_on_refresh(uint64_t version, void *ctx) {
     for (size_t i = 0; i < TERMINAL_BUCKET_COUNT; ++i) {
         for (struct terminal_entry *entry = mgr->table[i]; entry; entry = entry->next) {
             if (entry->meta.ifindex == 0) {
+                entry->vid_lookup_attempted = false;
+                entry->vid_lookup_vlan = -1;
                 if (!entry->mac_refresh_enqueued) {
                     struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
                                                                           entry->meta.vlan_id,
@@ -2092,6 +2145,8 @@ static void mac_locator_on_refresh(uint64_t version, void *ctx) {
                     }
                 }
             } else if (entry->meta.mac_view_version < version) {
+                entry->vid_lookup_attempted = false;
+                entry->vid_lookup_vlan = -1;
                 if (!entry->mac_verify_enqueued) {
                     struct mac_lookup_task *task = mac_lookup_task_create(&entry->key,
                                                                           entry->meta.vlan_id,
