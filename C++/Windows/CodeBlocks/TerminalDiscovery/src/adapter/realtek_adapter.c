@@ -1247,6 +1247,60 @@ static td_adapter_result_t realtek_mac_locator_lookup(td_adapter_t *handle,
     return TD_ADAPTER_ERR_NOT_READY;
 }
 
+static td_adapter_result_t realtek_mac_locator_lookup_by_vid(td_adapter_t *handle,
+                                                             const uint8_t mac[ETH_ALEN],
+                                                             uint16_t vlan_id,
+                                                             uint32_t *ifindex_out) {
+    if (!handle || !mac) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+    if (vlan_id == 0U || vlan_id > 4094U) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+
+    if (ifindex_out) {
+        *ifindex_out = 0U;
+    }
+
+    struct td_adapter *adapter = handle;
+    SwUcMacEntry query;
+    memset(&query, 0, sizeof(query));
+    memcpy(query.mac, mac, ETH_ALEN);
+    query.vlan = vlan_id;
+
+    int rc = td_switch_mac_get_ifindex_by_vid(&query);
+    if (rc == 0) {
+        if (ifindex_out) {
+            *ifindex_out = query.ifindex;
+        }
+        return TD_ADAPTER_OK;
+    }
+
+    if (rc == -ENOENT) {
+        return TD_ADAPTER_ERR_NOT_FOUND;
+    }
+
+    char mac_buf[18];
+    snprintf(mac_buf,
+             sizeof(mac_buf),
+             "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0],
+             mac[1],
+             mac[2],
+             mac[3],
+             mac[4],
+             mac[5]);
+
+    realtek_logf(adapter,
+                 TD_LOG_WARN,
+                 "td_switch_mac_get_ifindex_by_vid failed: mac=%s vlan=%u rc=%d",
+                 mac_buf,
+                 (unsigned)vlan_id,
+                 rc);
+
+    return TD_ADAPTER_ERR_SYS;
+}
+
 static td_adapter_result_t realtek_mac_locator_subscribe(td_adapter_t *handle,
                                                          td_adapter_mac_locator_refresh_cb cb,
                                                          void *ctx) {
@@ -1300,6 +1354,7 @@ static td_adapter_result_t realtek_mac_locator_get_version(td_adapter_t *handle,
 
 static const struct td_adapter_mac_locator_ops g_realtek_mac_locator_ops = {
     .lookup = realtek_mac_locator_lookup,
+    .lookup_by_vid = realtek_mac_locator_lookup_by_vid,
     .subscribe = realtek_mac_locator_subscribe,
     .get_version = realtek_mac_locator_get_version,
 };

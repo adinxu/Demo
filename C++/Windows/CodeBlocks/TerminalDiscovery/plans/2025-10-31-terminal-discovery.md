@@ -141,7 +141,7 @@
 ### 阶段 9：VLAN 点查接口整合（待开始）
 1. ✅ 打桩扩展：在 `src/stub/td_switch_mac_stub.c` 增加 `td_switch_mac_get_ifindex_by_vid` 弱符号实现，支持入参填充 VLAN/MAC 后返回固定示例 ifindex/错误码，并沿用 `[switch-mac-stub]` 日志；通过环境变量配置命中/未命中行为。
 2. ✅ Demo 演示：在 `src/demo/td_switch_mac_demo.c` 补充调用样例，展示点查成功与未命中输出，并保持与快照示例一致的格式；确保 demo 在无真实 SDK 环境下与打桩配合。
-3. 🔜 适配器桥接：更新 Realtek MAC 定位实现，使 `td_adapter_mac_locator_ops->lookup` 调用点查接口处理单条查询，保留现有全表快照流程不变，并区分 `NOT_READY`/`NOT_FOUND` 错误码。
+3. 🔜 适配器桥接：在 `td_adapter_mac_locator_ops` 中新增专用于 VLAN 点查的接口指针（例如 `lookup_by_vid`），让终端管理器可显式请求点查；更新 Realtek MAC 定位实现，内部通过新指针调用 `td_switch_mac_get_ifindex_by_vid` 处理单条查询，保留现有全表快照流程不变，并区分 `NOT_READY`/`NOT_FOUND` 错误码。
 4. 🔜 管理器逻辑：调整 `terminal_manager_on_packet` 在首次发现 `ifindex==0` 或 VLAN 变更时发起点查，并在成功后同步 `meta.mac_view_version` 为当前 `mac_locator_version`；`on_timer`/`on_refresh` 流程保持现有基于版本的刷新策略。
 5. 🔜 测试补充：扩展单元/集成测试覆盖点查命中、未命中以及 VLAN 切换时的 `MOD` 事件，新增 demo 与 stub 断言；必要时为适配器/管理器新增桩测试验证错误码处理。
 6. 🔜 文档同步：更新规范与设计文档引用（demo 指南、适配器说明、调试手册），标注点查接口调用顺序与回退路径，并说明点查不返回版本号的处理方式。

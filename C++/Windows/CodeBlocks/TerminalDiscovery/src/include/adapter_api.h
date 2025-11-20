@@ -128,6 +128,10 @@ struct td_adapter_mac_locator_ops {
                                   uint16_t vlan_id,
                                   uint32_t *ifindex_out,
                                   uint64_t *version_out);
+    td_adapter_result_t (*lookup_by_vid)(td_adapter_t *handle,
+                                         const uint8_t mac[ETH_ALEN],
+                                         uint16_t vlan_id,
+                                         uint32_t *ifindex_out);
     td_adapter_result_t (*subscribe)(td_adapter_t *handle,
                                      td_adapter_mac_locator_refresh_cb cb,
                                      void *ctx);
