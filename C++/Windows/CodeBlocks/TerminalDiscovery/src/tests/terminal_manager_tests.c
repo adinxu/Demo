@@ -834,15 +834,22 @@ static bool test_point_lookup_retries_on_vlan_change(void) {
 
     capture_reset(&events);
     mock_locator_clear_counters();
-    mock_locator_set_lookup_by_vid(TD_ADAPTER_OK, 99);
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_ERR_NOT_FOUND, 0);
+    mock_locator_set_lookup(TD_ADAPTER_OK, 99);
 
     build_arp_packet(&packet, &arp, mac, "192.0.2.90", "192.0.2.90", vlan_migrated, 0);
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
 
-    if (g_mock_locator.lookup_by_vid_calls != 1) {
-        fprintf(stderr, "expected lookup_by_vid call after vlan change, got %zu\n",
+    if (g_mock_locator.lookup_by_vid_calls != 0) {
+        fprintf(stderr, "did not expect lookup_by_vid call after vlan change, got %zu\n",
                 g_mock_locator.lookup_by_vid_calls);
+        ok = false;
+    }
+
+    if (g_mock_locator.lookup_calls != 1) {
+        fprintf(stderr, "expected full lookup call after vlan change, got %zu\n",
+                g_mock_locator.lookup_calls);
         ok = false;
     }
 
@@ -933,14 +940,21 @@ static bool test_vlan_change_without_ingress_ifindex_retains_previous(void) {
     mock_locator_clear_counters();
     g_mock_locator.version = 11;
     mock_locator_set_lookup_by_vid(TD_ADAPTER_ERR_NOT_FOUND, 0);
+    mock_locator_set_lookup(TD_ADAPTER_ERR_NOT_READY, 0);
 
     build_arp_packet(&packet, &arp, mac, "198.51.100.30", "198.51.100.30", vlan_migrated, 0);
     terminal_manager_on_packet(mgr, &packet);
     terminal_manager_flush_events(mgr);
 
-    if (g_mock_locator.lookup_by_vid_calls != 1) {
-        fprintf(stderr, "expected one lookup_by_vid call on vlan change, got %zu\n",
+    if (g_mock_locator.lookup_by_vid_calls != 0) {
+        fprintf(stderr, "did not expect lookup_by_vid call on vlan change, got %zu\n",
                 g_mock_locator.lookup_by_vid_calls);
+        ok = false;
+    }
+
+    if (g_mock_locator.lookup_calls != 1) {
+        fprintf(stderr, "expected one fallback lookup call on vlan change, got %zu\n",
+                g_mock_locator.lookup_calls);
         ok = false;
     }
 
