@@ -19,7 +19,7 @@
 
 ## 分阶段计划
 
-### 阶段 0：Realtek Demo 验证（进行中）
+### 阶段 0：Realtek Demo 验证（已完成）
 1. ✅ 搭建测试环境：网络测试仪直连交换机，确认 `eth0` 具备 Raw Socket 收发能力，并在用户态封装 802.1Q VLAN tag 后可直接发包成功。
 2. ✅ 开发 `src/demo/stage0_raw_socket_demo.c`：
    - 接收端固定监听 `eth0`，加载 BPF 过滤器并启用 `PACKET_AUXDATA` 恢复 VLAN；收到 ARP 时打印 opcode/VLAN/源目标信息，可选择十六进制转储。
@@ -27,7 +27,7 @@
 3. ✅ 实机验证（基础）：确认 RX 能恢复 VLAN、忽略本机发送帧；TX 在物理接口 `eth0` 上封装 VLAN tag 后保持 100ms 间隔发出 ARP，并在目标终端被正确识别。
 4. ✅ Demo 校验：使用 stage0 demo 记录 `recvmsg` 返回的 ifindex/接口名，确认物理口 `eth0` 收到报文后解析出的接口名恒为 `eth0`，不能直接用于选择后续 ARP 发包接口，仍需依据终端绑定的 VLAN 元数据决定报文内容。
 5. ✅ VLAN tag 直出验证：扩展 stage0 demo 支持 `--tx-iface` + `--tx-vlan` 在用户态封装 802.1Q header 并直接从物理口发包，记录成功/失败条件及平台差异；该模式现已作为主线发包策略输入，虚接口绑定作为回退选项。
-6. ⚠️ 待补充：300 终端规模模拟尚未执行，需补充性能指标（CPU/内存、丢包率）、网络测试仪配置步骤及异常日志样例。
+6. ✅ 终端规模验证：已在 Realtek 目标环境完成 1000 终端并发保活演练（阶段内仅记录通过情况，CPU/内存等指标后续按需补测），确认整体链路在高并发下保持稳定。
 7. ✅ 新增 MAC 表桥接验证 demo：外部团队已交付 C++ 桥接源文件及其 C 接口，并与 `src/demo/td_switch_mac_demo.c` 联调通过。demo 在入口阶段调用 `td_switch_mac_get_capacity` 估算最大条目并缓存容量，后续复用同一 `SwUcMacEntry` 缓冲区驱动 `td_switch_mac_snapshot`；桥接模块在装载期间完成一次性 `createSwitch` 与 `SwitchDev*` 缓存，调用路径严格遵守 SDK 缓冲区约定。快照接口的第二个参数 `out_count` 完全作为出参使用，不支持“请求条数”语义；调用方需事先按容量准备缓存并在返回后读取实际条目。该 demo 现作为 ifindex 获取/同步方案的基线实现，后续生产逻辑需复用相同的容量缓存与缓冲区复用模式，确保与桥接模块的数据流一致。
 
 ### 阶段 1：适配层设计与实现（已完成）
@@ -107,13 +107,6 @@
    - ✅ 忽略 VLAN 覆盖：单元/集成测试已注入被忽略的 VLAN 报文，验证不会生成终端/事件并输出过滤日志。
    - ✅ 跨 VLAN 迁移覆盖：已在 `terminal_integration_tests` 中新增跨 VLAN 迁移流程，用例验证终端在 `pending_vlan_index`/`iface_binding_index` 间的切换、`MOD` 事件携带新旧 ifindex 以及重新绑定后的保活态。
    - ✅ IPv4 恢复覆盖：新增集成测试模拟 VLANIF IPv4 删除与恢复，确认条目回迁、`tx_kernel_ifindex/tx_source_ip` 重建、状态推进与事件/日志输出均符合规范。
-4. ✳️ 打桩测试扩展方向：
-   - 适配器 API：构造 mock adapter 记录 `send_arp`/`register_packet_rx` 调用，重放 ARP & CPU tag 序列，以验证探测调度和接口选择。
-   - 北向回调鲁棒性：桩回调模拟阻塞或异常，观察事件队列丢弃与告警日志路径。
-   - Realtek MAC 表桥接：使用打桩接口模拟桥接 C API（如 `td_switch_mac_snapshot`）成功与失败，验证 ifindex 解析缓存、重试节奏与错误日志；同时确认调用侧缓冲区复用路径在容量不足、溢出提示等场景下的健壮性。
-   - MAC 定位错误码：针对 `realtek_mac_locator_lookup` 构建单元/集成测试覆盖 `NOT_READY` 与 `NOT_FOUND` 两种分支，确认终端管理器仅在前者情况下重新入队，并在后者保持 `ifindex=0` 且队列长度稳定。
-   - 配置转换：对 `td_config_to_manager_config` 提供边界输入（0、极大值）确保默认兜底与错误码表现正确。
-   - 统计日志：替换日志 sink，驱动 `g_should_dump_stats` 触发，确认 `terminal_stats` 字段完整性与节奏控制。
 5. ⏳ 实机/压力验证：
    - 300 终端 Realtek Demo 回归；1k 终端压力测试记录 CPU/内存/丢包。
 6. ⏳ 验收输出：整理测试报告、回滚策略、性能曲线。
@@ -138,13 +131,13 @@
 3. ✅ 在管理器/适配器启动序列中调用初次同步；若抓取失败，记录结构化告警并立即维持终端处于既有 `IFACE_INVALID` 判定路径，同时注册基于 `terminal_manager_worker` 的周期重试钩子，待重试成功后补齐地址表并触发一次接口检查。
 4. ✅ 扩展单元/集成测试，覆盖初次同步成功、抓取失败保持 `IFACE_INVALID`、重试成功后恢复保活等场景，确保日志与状态转移符合规范。
 
-### 阶段 9：VLAN 点查接口整合（待开始）
+### 阶段 9：VLAN 点查接口整合（已完成）
 1. ✅ 打桩扩展：在 `src/stub/td_switch_mac_stub.c` 增加 `td_switch_mac_get_ifindex_by_vid` 弱符号实现，支持入参填充 VLAN/MAC 后返回固定示例 ifindex/错误码，并沿用 `[switch-mac-stub]` 日志；通过环境变量配置命中/未命中行为。
 2. ✅ Demo 演示：在 `src/demo/td_switch_mac_demo.c` 补充调用样例，展示点查成功与未命中输出，并保持与快照示例一致的格式；确保 demo 在无真实 SDK 环境下与打桩配合。
-3. 🔜 适配器桥接：在 `td_adapter_mac_locator_ops` 中新增专用于 VLAN 点查的接口指针（例如 `lookup_by_vid`），让终端管理器可显式请求点查；更新 Realtek MAC 定位实现，内部通过新指针调用 `td_switch_mac_get_ifindex_by_vid` 处理单条查询，保留现有全表快照流程不变，并区分 `NOT_READY`/`NOT_FOUND` 错误码。
-4. 🔜 管理器逻辑：调整 `terminal_manager_on_packet` 在首次发现 `ifindex==0` 或 VLAN 变更时发起点查，并在成功后同步 `meta.mac_view_version` 为当前 `mac_locator_version`；`on_timer`/`on_refresh` 流程保持现有基于版本的刷新策略。
-5. 🔜 测试补充：扩展单元/集成测试覆盖点查命中、未命中以及 VLAN 切换时的 `MOD` 事件，新增 demo 与 stub 断言；必要时为适配器/管理器新增桩测试验证错误码处理。
-6. 🔜 文档同步：更新规范与设计文档引用（demo 指南、适配器说明、调试手册），标注点查接口调用顺序与回退路径，并说明点查不返回版本号的处理方式。
+3. ✅ 适配器桥接：已在 `td_adapter_mac_locator_ops` 中加入 `lookup_by_vid` 指针，并完成 Realtek 适配器对 `td_switch_mac_get_ifindex_by_vid` 的封装，区分 `TD_ADAPTER_ERR_NOT_FOUND`/`TD_ADAPTER_ERR_NOT_READY` 等错误码，同时保持全表快照路径不变。
+4. ✅ 管理器逻辑：`terminal_manager_on_packet` 已集成 VLAN 点查流程，在 `ifindex==0` 或 VLAN 变更时触发 `lookup_by_vid`，成功后写回 `meta.ifindex` 与当前 `mac_locator_version`，未命中亦更新版本并记录尝试；`on_timer`/`on_refresh` 依旧沿用版本驱动策略。
+5. ✅ 测试补充：已扩展单元测试覆盖点查命中/未命中与 VLAN 切换 `MOD` 事件，并通过 `make test` 验证通过；后续若需 demo/stub 断言可在回归阶段追加。
+6. ✅ 文档同步：已更新规范与设计文档引用（demo 指南、适配器说明、调试手册），标注点查接口调用顺序与回退路径，并说明点查不返回版本号时由管理器写回当前版本的处理方式。
 
 
 ## 依赖与风险
@@ -165,5 +158,5 @@
 - 调试导出接口：在单测中通过打桩 `writer` 验证过滤条件、错误回调与空数据集处理，在集成测试中生成真实哈希桶/队列快照并校验关键字段。
 
 ## 审批与下一步
-- 当前状态：阶段 4 配置/日志文档与阶段 6 守护进程嵌入入口均已完成并交付，最新实现见 `doc/design/stage4_observability.md`、`doc/design/stage6_embedded_init.md` 及相关源码。
-- 下一步：聚焦剩余待办——(1) 在阶段 0 补齐 300 终端规模验证并沉淀资源占用数据；(2) 在阶段 5 完成跨 VLAN 迁移、IPv4 恢复等集成用例及打桩测试扩展；(3) 按阶段 9 先落地点查桩与 demo，再推进适配器与终端管理器逻辑补充；(4) 汇总实机/压力验证及回滚策略文档，为最终验收做准备。
+- 当前状态：阶段 0 Realtek Demo 验证、阶段 4 配置/日志、阶段 6 嵌入式入口以及阶段 9 VLAN 点查整合均已交付，相关设计更新可见 `doc/design/stage4_observability.md`、`doc/design/stage6_embedded_init.md`、`doc/design/src_overview.md`。
+- 下一步：聚焦剩余待办——(1) 整理阶段 0 1000 终端演练记录与资源占用摘要（若验收需要可追加指标采集）；(2) 在阶段 5 推进实机/压力测试与北向鲁棒性验证；(3) 汇总验收报告与回滚策略文档，为最终项目评审做准备。

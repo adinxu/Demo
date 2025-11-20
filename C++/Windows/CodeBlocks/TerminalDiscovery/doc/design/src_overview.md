@@ -141,6 +141,7 @@ flowchart TD
   - `terminal_entry`
     - 记录 MAC/IP、状态机（`terminal_state_t`）、最近报文时间、探测信息和接口元数据。
     - `terminal_metadata.ifindex` 与 `mac_view_version` 存储最近一次 MAC 表查表结果，`mac_refresh_enqueued/mac_verify_enqueued` 标志避免重复排队。
+    - 新增 `vid_lookup_vlan/vid_lookup_attempted` 跟踪最近一次 VLAN 点查（`lookup_by_vid`）的上下文：同一 VLAN 内只会在必要时重试，VLAN 发生变化或点查返回 `TD_ADAPTER_ERR_NOT_READY` 时会自动清零，确保新报文或版本刷新可重新触发点查。
   - 缓存最近一次可用的发包上下文：`tx_iface/tx_kernel_ifindex`（仅在需要回退到 VLAN 虚接口时填充）以及 `tx_source_ip`（默认取自可用 VLANIF 的 IPv4，供物理口发包使用）。
   - `terminal_event_record_t`
     - 用于增量事件（`ADD/DEL/MOD`），供北向转换为 `TerminalInfo`。结构包含 `ifindex` 与 `prev_ifindex`，其中 `prev_ifindex` 仅在 `MOD` 事件中携带端口切换前的逻辑索引，其余事件固定为 `0`。
@@ -169,6 +170,7 @@ flowchart TD
 #### MAC 表 ifindex 维护
 
 - `terminal_manager_create` 会在检测到适配器实现 `mac_locator_ops` 时初始化缓存版本并注册 `mac_locator_on_refresh`。刷新回调在持锁状态下合并 `mac_need_refresh` 与 `mac_pending_verify` 队列，并遍历全部终端，将 `ifindex` 缺失或版本过期的条目排队查表。
+- `terminal_manager_on_packet` 在定位 ifindex 时先尝试调用适配器暴露的 `lookup_by_vid`：当终端在当前 VLAN 上尚未点查或 VLAN 已发生变化时，直接触发点查；命中立即写回 `meta.ifindex` 并将 `vid_lookup_vlan/vid_lookup_attempted` 记录为最新值，未命中也会同步版本号以避免重复排队；若桥接返回 `TD_ADAPTER_ERR_NOT_READY` 或其他异常，则清空点查标记并按原有版本驱动流程进入 `mac_need_refresh`。
 - 解锁后由 `mac_lookup_execute` 执行批量查表：
   - 命中时更新 `terminal_metadata.ifindex` 与 `mac_view_version`，若端口发生漂移，会通过事件队列投递 `MOD` 并同步反向索引；
   - `verify` 任务由 `mac_locator_on_refresh` 在检测到 `version` 前进时生成：对于已有 `ifindex` 但 `mac_view_version < version` 的终端，会进入 `mac_pending_verify` 队列，查表失败（返回 `TD_ADAPTER_ERR_NOT_READY`）时立即清零终端的 `ifindex`，保证北向能尽快感知端口失效；
@@ -296,6 +298,8 @@ classDiagram
     +in_addr tx_source_ip
     +bool mac_refresh_enqueued
     +bool mac_verify_enqueued
+    +int vid_lookup_vlan
+    +bool vid_lookup_attempted
     +terminal_entry* next
   }
   class terminal_key {
@@ -524,6 +528,7 @@ flowchart LR
 sequenceDiagram
   participant RX as Realtek Adapter
   participant TM as terminal_manager
+  participant Locator as MAC Locator
   participant EQ as Event Queue
   participant NB as terminal_northbound
   participant APP as IncReportCb
@@ -531,6 +536,14 @@ sequenceDiagram
   RX->>TM: terminal_manager_on_packet(view)
   TM->>TM: 查找/创建 terminal_entry
   TM->>TM: resolve_tx_interface(meta)
+  opt ifindex 缺失或版本落后
+    TM->>Locator: lookup_by_vid(mac, vlan)
+    alt 命中
+      Locator-->>TM: TD_ADAPTER_OK + ifindex
+    else 未命中或暂不可用
+      Locator-->>TM: result code
+    end
+  end
   alt 端口变化或新建
     TM->>EQ: queue_event(tag)
   end
@@ -538,7 +551,7 @@ sequenceDiagram
   NB->>APP: IncReportCb(batch)
 ```
 
-此流程覆盖 `terminal_manager_on_packet` 内部的哈希查找、接口绑定、事件入队，以及 `terminal_manager_maybe_dispatch_events` 批量上报逻辑。
+此流程覆盖 `terminal_manager_on_packet` 内部的哈希查找、接口绑定、VLAN 点查与事件入队；当 `lookup_by_vid` 返回 `NOT_READY` 时，终端会在同一轮中被重新排队至 `mac_need_refresh` 等待全量快照。最终 `terminal_manager_maybe_dispatch_events` 会在脱锁后批量上报结果。
 
 ### 顺序图：保活探测
 
@@ -699,7 +712,7 @@ td_switch_mac_get_capacity"]
 ## 关键数据流
 
 1. **发现链路**：
-  - Realtek 适配器 (`rx_thread_main`) -> `terminal_manager_on_packet` -> 更新终端状态 -> 入队事件 -> `terminal_manager_maybe_dispatch_events` -> 北向回调/日志。
+  - Realtek 适配器 (`rx_thread_main`) -> `terminal_manager_on_packet`；若终端缺少 ifindex，则优先调用 `mac_locator_ops.lookup_by_vid` 进行 VLAN 点查 -> 更新终端状态/版本 -> 入队事件 -> `terminal_manager_maybe_dispatch_events` -> 北向回调/日志。
 2. **保活链路**：
   - Worker 线程 (`terminal_manager_on_timer`) -> 决定是否探测 -> `terminal_probe_handler` -> `realtek_adapter.send_arp` -> 网络。
 3. **地址事件链路**：
@@ -711,7 +724,7 @@ td_switch_mac_get_capacity"]
 5. **配置入口**：
   - CLI -> `td_runtime_config` -> `td_config_to_manager_config` -> `terminal_manager_create`。
 6. **MAC 桥接刷新链路**：
-  - Realtek `mac_cache_worker` -> `mac_locator_on_refresh` 合并 `mac_need_refresh`/`mac_pending_verify` -> 脱锁后 `mac_lookup_execute` 调用 `mac_locator_ops.lookup` -> 写回 `terminal_metadata.ifindex` 与事件队列 -> `terminal_manager_maybe_dispatch_events`。
+  - Realtek `mac_cache_worker` -> `mac_locator_on_refresh` 合并 `mac_need_refresh`/`mac_pending_verify` -> 脱锁后 `mac_lookup_execute` 调用 `mac_locator_ops.lookup`；报文路径若已通过 `lookup_by_vid` 得到确切结论，会携带最新 `mac_view_version` 直接略过本轮查询 -> 写回 `terminal_metadata.ifindex` 与事件队列 -> `terminal_manager_maybe_dispatch_events`。
 
 7. **Pending 重试链路**：
   - `resolve_tx_interface` 失败、地址删除或绑定被回收时调用 `pending_attach`，终端被存入以 VLAN ID 为索引的桶中并立即进入 `IFACE_INVALID`；随后 `terminal_manager_on_packet`、`pending_retry_for_ifindex` 或 CLI 触发的地址同步成功时，会通过 `pending_retry_vlan` 尝试逐条重绑，成功后由 `pending_detach` 清理桶并重新点亮状态机。

@@ -66,4 +66,6 @@ sudo ./stage0_raw_socket_demo \
 
 - `td_switch_mac_demo.c`/`td_switch_mac_demo.h` 提供无入口函数的辅助逻辑，可与外部团队交付的 C++ 桥接模块一同编译；
 - 外部 demo 在完成桥接模块初始化后调用 `td_switch_mac_demo_dump()`，即可打印桥接接口返回的 MAC/VLAN/ifindex 信息；函数首次运行时调用一次 `td_switch_mac_get_capacity()` 缓存最大条目数，并基于该值一次性 `calloc` 分配 `SwUcMacEntry` 缓冲区，后续快照均复用同一块内存；`td_switch_mac_snapshot()` 仅通过输出参数返回实际条目数，调用前无需为 `count` 填充初值；所有日志与表格均写入标准输出，便于统一采集；由于底层 `getDevUcMacAddress` 不检查缓冲区大小，请务必保证桥接层返回的容量与实际条目数一致，并在桥接内部复用调用侧传入的 `SwUcMacEntry` 缓冲区；
-- 辅助模块依赖 `td_switch_mac_bridge.h` 中声明的 `td_switch_mac_snapshot` 与 `SwUcMacEntry` 类型，该头默认完全复用 `src/ref/realtek/mgmt_switch_mac.c`中的定义; 接口调整时需同步更新此辅助模块。
+- `td_switch_mac_demo_dump()` 在输出表格后会额外演示两次 VLAN 点查：`td_switch_mac_get_ifindex_by_vid` 命中示例直接打印查询到的 ifindex，未命中示例保留原样并输出返回码。结合打桩环境，可快速验证“点查命中后立即更新 ifindex、未命中时保持 0”两个分支。
+- 打桩实现允许通过环境变量 `TD_SWITCH_MAC_STUB_LOOKUP` 控制点查结果：可设置为 `hit`/`miss` 或者具体的样例下标，便于驱动上述演示或终端管理器单元测试观察调用顺序。
+- 辅助模块依赖 `td_switch_mac_bridge.h` 中声明的 `td_switch_mac_snapshot`、`td_switch_mac_get_ifindex_by_vid` 与 `SwUcMacEntry` 类型，该头默认完全复用 `src/ref/realtek/mgmt_switch_mac.c` 中的定义；接口调整时需同步更新此辅助模块。
