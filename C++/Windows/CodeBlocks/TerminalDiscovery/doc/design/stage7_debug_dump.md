@@ -81,6 +81,7 @@ std::string locator   = snapshot.dumpMacLocatorState();
 ## 调试建议
 - 先导出 `td_debug_dump_terminal_table` 确认哈希桶分布，再结合 `ifindex`/`VLAN` 过滤定位问题终端。
 - `td_debug_dump_mac_lookup_queue` 与 `td_debug_dump_mac_locator_state` 可观察 `mac_need_refresh_` / `mac_pending_verify_*` 队列长度和 `mac_locator_version`，排查 MAC 查表延迟或失效。
+- 若需确认 VLAN 点查行为，可配合启用 `[switch-mac-stub]` 日志或在 demo 环境设置 `TD_SWITCH_MAC_STUB_LOOKUP` 强制命中/未命中：成功的 `lookup_by_vid` 会立即在终端快照中体现新的 ifindex，同时调试导出显示 `mac_locator_version` 未前进但 `mac_view_version` 已更新；如点查返回 `NOT_READY`，日志会提示等待下一轮快照。
 - 在锁持有期间执行 writer，确保输出路径不会阻塞；写文件时推荐使用无缓冲管道或预分配缓冲区。
 
 ## 输出示例

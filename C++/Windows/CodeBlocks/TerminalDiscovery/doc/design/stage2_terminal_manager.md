@@ -19,6 +19,7 @@
   - 按 `struct terminal_key{mac+ip}` 哈希存储于 `table[256]` 链表中。
   - 记录最近一次报文时间 `last_seen`、最近一次保活探测时间 `last_probe` 以及失败计数。
   - `terminal_metadata` 保留 ARP 报文的 VLAN 与 ifindex（可来自 CPU tag 或 MAC 表查詢，缺失时写入 `0` 代表未知），其中 `ifindex` 统一表示整机逻辑接口标识；`vlan_id` 用于在物理口发包时封装 802.1Q 头部。
+  - `bool vid_lookup_attempted` 与 `int vid_lookup_vlan` 记录最近一次 VLAN 点查的上下文，用于抑制在同一 VLAN 上的重复点查；当 VLAN 发生变化时会清零，以便再次尝试 `lookup_by_vid`。
   - `tx_iface/tx_kernel_ifindex` 仅在需要回退到 VLAN 虚接口的场景下填充；常规情况下置空并依赖 `meta.vlan_id` + 物理口完成发包，解析失败同样置空并进入 `IFACE_INVALID`。
   - 时间戳字段（`last_seen`/`last_probe`）统一使用 `CLOCK_MONOTONIC` 采集，避免系统时间跳变对状态机造成干扰。
 
@@ -52,9 +53,10 @@
   - 只有当 `iface_address_table` 中存在命中的前缀时，才认为该 VLAN 的地址上下文有效；否则视为不可保活并保留 VLAN ID 以待后续报文复活。
   - 若无法确认可用地址，`resolve_tx_interface` 会清空 `tx_iface/tx_kernel_ifindex`，从反向索引移除该终端，并触发 `set_state(...IFACE_INVALID)`；成功时将条目加入 `iface_binding_index` 并保持/进入 `ACTIVE`，同时保留 `meta.vlan_id` 供物理口发包使用。
 5. 当报文绑定成功且终端 `meta.ifindex == 0`、或 `meta.mac_view_version < mac_locator_version` 时，会尝试解析整机 ifindex：
-  - 若已有有效版本号（`mac_locator_version > 0`），就在解锁后立即调度一条 `mac_lookup_task`，调用适配器的 `mac_locator_ops->lookup(mac, vlan, &ifindex, &version)`。
-  - 若当前尚未获得版本号，则将终端加入 `need_refresh` 队列（设置 `mac_refresh_enqueued`），等待下一次 MAC 刷新回调批量处理。
-  - 查询命中时写回 `meta.ifindex` 与最新 `mac_view_version`，若 ifindex 发生变化（例如 MAC 漂移），会入队 `MOD` 事件；查询返回 `TD_ADAPTER_ERR_NOT_READY` 时则重新排队等待刷新。
+  - 若适配器实现了 `lookup_by_vid`，且终端在当前 VLAN 上尚未尝试点查，会立即调用一次点查：命中后直接写回 `meta.ifindex`，并将 `vid_lookup_attempted` 与 `vid_lookup_vlan` 记录为当前 VLAN；未命中同样刷新标记但保持 `ifindex=0`，以便北向感知无端口；若桥接返回 `TD_ADAPTER_ERR_NOT_READY` 或其他错误，则清空标记，允许后续报文或定时线程再次尝试。
+  - 点查成功或明确未命中后，管理器会将终端的 `mac_view_version` 设置为当前 `mac_locator_version`（即便版本号仍为 0），防止随后的全量流程马上重复排队；只有当点查被视为暂不可用时才保留旧版本。
+  - 若仍需进一步确认（例如当前版本号已前进或点查未命中时仍希望等待快照校验），则继续采用原有逻辑：当 `mac_locator_version > 0` 时，构造 `mac_lookup_task` 在解锁后执行 `lookup`；尚未拿到版本号的情况下，将终端放入 `need_refresh` 队列（设置 `mac_refresh_enqueued`），等待下一次刷新回调。
+  - 全量查询命中时写回 `meta.ifindex` 与最新 `mac_view_version`，若 ifindex 发生变化（如 MAC 漂移）会入队 `MOD` 事件；返回 `TD_ADAPTER_ERR_NOT_READY` 时重新排队等待刷新。
 
 #### `resolve_tx_interface` 实现细节
 1. 记录历史绑定：在尝试解析前，先缓存旧的 `tx_iface/tx_kernel_ifindex`，用于后续比对及必要时的解绑。
@@ -109,6 +111,7 @@ Realtek 适配器提供 `mac_locator_ops->subscribe` 接口；`terminal_manager_
   1. 在持锁状态下取出 `need_refresh`/`pending_verify` 队列，并遍历全部终端，将 `meta.ifindex == 0` 或 `mac_view_version < version` 的条目补齐到这两个队列中（借助 `mac_refresh_enqueued/mac_verify_enqueued` 标志避免重复排队）。
   2. 解锁后调用 `mac_locator_ops->lookup` 执行批量查询：刷新队列命中即更新 `meta.ifindex` 与 `mac_view_version`，必要时入队 `MOD`；验证队列若发现 ifindex 漂移则同样触发事件并更新索引。
   3. 当回调收到 `version == 0` 时，仅记录 WARN 并保留原有队列，等待下一轮刷新。
+- 报文路径的点查与版本驱动流程相互独立：`lookup_by_vid` 成功或明确未命中后会写回 `vid_lookup_attempted` 与 `mac_view_version`，但仍保留在后续版本刷新时接受校验；当 VLAN 变更或点查返回 `NOT_READY` 时，标志会被清除，确保下一次 ARP 或刷新机会可以重新尝试点查。
 - `terminal_manager_on_timer` 在保活扫描阶段若发现终端处于 `IFACE_INVALID`，会根据当前 `mac_locator_version` 将其加入即时查表或等待刷新队列，确保即便没有新报文到达也能借助 MAC 表恢复 ifindex。
 - 所有 `mac_locator` 调用都在释放互斥锁后执行，避免桥接刷新过程阻塞报文线程；查询完成后再重新上锁写回终端结构与事件队列。
 

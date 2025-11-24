@@ -168,8 +168,15 @@ int td_switch_mac_demo_dump(void) {
             td_switch_mac_print_entry(stdout, &entries[i], i);
         }
     }
+    const uint8_t *hit_mac = kDemoLookupHitMac;
+    vlan_id_t hit_vlan = 1;
+    if (count > 0) {
+        hit_mac = entries[0].mac;
+        hit_vlan = entries[0].vlan;
+    }
+
     fprintf(stdout, "[switch-mac-demo] 点查演示 - 命中示例\n");
-    td_switch_mac_demo_print_lookup_case("点查命中示例", kDemoLookupHitMac, 1);
+    td_switch_mac_demo_print_lookup_case("点查命中示例", hit_mac, hit_vlan);
 
     fprintf(stdout, "[switch-mac-demo] 点查演示 - 未命中示例\n");
     td_switch_mac_demo_print_lookup_case("点查未命中示例", kDemoLookupMissMac, 1);

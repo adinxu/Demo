@@ -36,6 +36,114 @@ struct probe_capture {
 
 static struct td_adapter g_stub_adapter;
 
+struct mock_mac_locator_state {
+    td_adapter_result_t lookup_rc;
+    td_adapter_result_t lookup_by_vid_rc;
+    uint32_t lookup_ifindex;
+    uint32_t lookup_by_vid_ifindex;
+    uint64_t version;
+    size_t lookup_calls;
+    size_t lookup_by_vid_calls;
+    uint16_t last_lookup_vlan;
+    uint16_t last_lookup_by_vid_vlan;
+    uint8_t last_lookup_mac[ETH_ALEN];
+    uint8_t last_lookup_by_vid_mac[ETH_ALEN];
+    bool subscribed;
+    td_adapter_mac_locator_refresh_cb refresh_cb;
+    void *refresh_ctx;
+};
+
+static struct mock_mac_locator_state g_mock_locator;
+
+static void mock_locator_reset(void) {
+    memset(&g_mock_locator, 0, sizeof(g_mock_locator));
+    g_mock_locator.lookup_rc = TD_ADAPTER_ERR_NOT_READY;
+    g_mock_locator.lookup_by_vid_rc = TD_ADAPTER_ERR_NOT_FOUND;
+    g_mock_locator.version = 1;
+}
+
+static void mock_locator_set_lookup(td_adapter_result_t rc, uint32_t ifindex) {
+    g_mock_locator.lookup_rc = rc;
+    g_mock_locator.lookup_ifindex = ifindex;
+}
+
+static void mock_locator_set_lookup_by_vid(td_adapter_result_t rc, uint32_t ifindex) {
+    g_mock_locator.lookup_by_vid_rc = rc;
+    g_mock_locator.lookup_by_vid_ifindex = ifindex;
+}
+
+static void mock_locator_clear_counters(void) {
+    g_mock_locator.lookup_calls = 0;
+    g_mock_locator.lookup_by_vid_calls = 0;
+}
+
+static td_adapter_result_t mock_locator_lookup(td_adapter_t *handle,
+                                               const uint8_t mac[ETH_ALEN],
+                                               uint16_t vlan_id,
+                                               uint32_t *ifindex_out,
+                                               uint64_t *version_out) {
+    (void)handle;
+    g_mock_locator.lookup_calls += 1;
+    g_mock_locator.last_lookup_vlan = vlan_id;
+    if (mac) {
+        memcpy(g_mock_locator.last_lookup_mac, mac, ETH_ALEN);
+    }
+    if (ifindex_out) {
+        *ifindex_out = g_mock_locator.lookup_ifindex;
+    }
+    if (version_out) {
+        *version_out = g_mock_locator.version;
+    }
+    return g_mock_locator.lookup_rc;
+}
+
+static td_adapter_result_t mock_locator_lookup_by_vid(td_adapter_t *handle,
+                                                      const uint8_t mac[ETH_ALEN],
+                                                      uint16_t vlan_id,
+                                                      uint32_t *ifindex_out) {
+    (void)handle;
+    g_mock_locator.lookup_by_vid_calls += 1;
+    g_mock_locator.last_lookup_by_vid_vlan = vlan_id;
+    if (mac) {
+        memcpy(g_mock_locator.last_lookup_by_vid_mac, mac, ETH_ALEN);
+    }
+    if (ifindex_out) {
+        *ifindex_out = g_mock_locator.lookup_by_vid_ifindex;
+    }
+    return g_mock_locator.lookup_by_vid_rc;
+}
+
+static td_adapter_result_t mock_locator_subscribe(td_adapter_t *handle,
+                                                  td_adapter_mac_locator_refresh_cb cb,
+                                                  void *ctx) {
+    (void)handle;
+    g_mock_locator.subscribed = true;
+    g_mock_locator.refresh_cb = cb;
+    g_mock_locator.refresh_ctx = ctx;
+    return TD_ADAPTER_OK;
+}
+
+static td_adapter_result_t mock_locator_get_version(td_adapter_t *handle,
+                                                    uint64_t *version_out) {
+    (void)handle;
+    if (!version_out) {
+        return TD_ADAPTER_ERR_INVALID_ARG;
+    }
+    *version_out = g_mock_locator.version;
+    return TD_ADAPTER_OK;
+}
+
+static const struct td_adapter_mac_locator_ops g_mock_mac_locator_ops = {
+    .lookup = mock_locator_lookup,
+    .lookup_by_vid = mock_locator_lookup_by_vid,
+    .subscribe = mock_locator_subscribe,
+    .get_version = mock_locator_get_version,
+};
+
+static const struct td_adapter_ops g_mock_adapter_ops = {
+    .mac_locator_ops = &g_mock_mac_locator_ops,
+};
+
 static int mock_kernel_ifindex_for_vlan(int vlan_id) {
     return 1000 + vlan_id;
 }
@@ -505,6 +613,460 @@ static bool test_terminal_add_and_event(void) {
     }
 
 done:
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_point_lookup_success_sets_ifindex(void) {
+    const int vlan_id = 120;
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 8;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    mock_locator_reset();
+    g_mock_locator.version = 42;
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_OK, 55);
+    mock_locator_set_lookup(TD_ADAPTER_ERR_NOT_READY, 0);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            &g_mock_adapter_ops,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for point lookup success test\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x15, 0x16, 0x17, 0x18, 0x19};
+    build_arp_packet(&packet, &arp, mac, "203.0.113.70", "203.0.113.70", vlan_id, 0);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (g_mock_locator.lookup_by_vid_calls != 1) {
+        fprintf(stderr, "expected one lookup_by_vid call, got %zu\n", g_mock_locator.lookup_by_vid_calls);
+        ok = false;
+    }
+
+    if (g_mock_locator.lookup_calls != 0) {
+        fprintf(stderr, "unexpected full lookup count %zu\n", g_mock_locator.lookup_calls);
+        ok = false;
+    }
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_ADD) {
+        fprintf(stderr, "expected single ADD event after point lookup success, got %zu\n", events.count);
+        ok = false;
+    } else if (events.records[0].ifindex != 55U) {
+        fprintf(stderr, "expected ADD event ifindex 55, got %u\n", events.records[0].ifindex);
+        ok = false;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed in point lookup success test\n");
+        ok = false;
+    } else if (counter.count != 1 || counter.last_record.ifindex != 55U) {
+        fprintf(stderr, "expected query_all to report ifindex 55, count=%zu ifindex=%u\n",
+                counter.count,
+                counter.last_record.ifindex);
+        ok = false;
+    }
+
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_point_lookup_miss_triggers_refresh(void) {
+    const int vlan_id = 130;
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 8;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    mock_locator_reset();
+    g_mock_locator.version = 64;
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_ERR_NOT_FOUND, 0);
+    mock_locator_set_lookup(TD_ADAPTER_OK, 77);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            &g_mock_adapter_ops,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for point lookup miss test\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x25, 0x26, 0x27, 0x28, 0x29};
+    build_arp_packet(&packet, &arp, mac, "198.51.100.80", "198.51.100.80", vlan_id, 0);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (g_mock_locator.lookup_by_vid_calls != 1) {
+        fprintf(stderr, "expected one lookup_by_vid call on miss path, got %zu\n",
+                g_mock_locator.lookup_by_vid_calls);
+        ok = false;
+    }
+
+    if (g_mock_locator.lookup_calls != 1) {
+        fprintf(stderr, "expected one fallback lookup call, got %zu\n", g_mock_locator.lookup_calls);
+        ok = false;
+    }
+
+    if (events.count != 2) {
+        fprintf(stderr, "expected two events (ADD+MOD) after fallback, got %zu\n", events.count);
+        ok = false;
+    } else {
+        if (events.records[0].tag != TERMINAL_EVENT_TAG_ADD) {
+            fprintf(stderr, "expected first event ADD, got %d\n", events.records[0].tag);
+            ok = false;
+        }
+        if (events.records[1].tag != TERMINAL_EVENT_TAG_MOD || events.records[1].ifindex != 77U) {
+            fprintf(stderr, "expected MOD event with ifindex 77, got tag=%d ifindex=%u\n",
+                    events.records[1].tag,
+                    events.records[1].ifindex);
+            ok = false;
+        }
+        if (events.records[1].prev_ifindex != 0U) {
+            fprintf(stderr, "expected MOD prev_ifindex 0, got %u\n", events.records[1].prev_ifindex);
+            ok = false;
+        }
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed in point lookup miss test\n");
+        ok = false;
+    } else if (counter.count != 1 || counter.last_record.ifindex != 77U) {
+        fprintf(stderr, "expected query_all to report resolved ifindex 77, count=%zu ifindex=%u\n",
+                counter.count,
+                counter.last_record.ifindex);
+        ok = false;
+    }
+
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_point_lookup_retries_on_vlan_change(void) {
+    const int vlan_initial = 140;
+    const int vlan_migrated = 141;
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 8;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    mock_locator_reset();
+    g_mock_locator.version = 90;
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_OK, 88);
+    mock_locator_set_lookup(TD_ADAPTER_ERR_NOT_READY, 0);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            &g_mock_adapter_ops,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for vlan retry test\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x35, 0x36, 0x37, 0x38, 0x39};
+    build_arp_packet(&packet, &arp, mac, "192.0.2.90", "192.0.2.90", vlan_initial, 0);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_ADD ||
+        events.records[0].ifindex != 88U) {
+        int first_tag = events.count ? (int)events.records[0].tag : -1;
+        unsigned int first_ifindex = events.count ? events.records[0].ifindex : 0U;
+        fprintf(stderr,
+                "expected ADD event with resolved ifindex 88, got count=%zu tag=%d ifindex=%u\n",
+                events.count,
+                first_tag,
+                first_ifindex);
+        ok = false;
+    }
+
+    capture_reset(&events);
+    mock_locator_clear_counters();
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_ERR_NOT_FOUND, 0);
+    mock_locator_set_lookup(TD_ADAPTER_OK, 99);
+
+    build_arp_packet(&packet, &arp, mac, "192.0.2.90", "192.0.2.90", vlan_migrated, 0);
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    if (g_mock_locator.lookup_by_vid_calls != 0) {
+        fprintf(stderr, "did not expect lookup_by_vid call after vlan change, got %zu\n",
+                g_mock_locator.lookup_by_vid_calls);
+        ok = false;
+    }
+
+    if (g_mock_locator.lookup_calls != 1) {
+        fprintf(stderr, "expected full lookup call after vlan change, got %zu\n",
+                g_mock_locator.lookup_calls);
+        ok = false;
+    }
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_MOD ||
+        events.records[0].ifindex != 99U || events.records[0].prev_ifindex != 88U) {
+        int mod_tag = events.count ? (int)events.records[0].tag : -1;
+        unsigned int mod_ifindex = events.count ? events.records[0].ifindex : 0U;
+        unsigned int mod_prev_ifindex = events.count ? events.records[0].prev_ifindex : 0U;
+        fprintf(stderr,
+                "expected MOD event with new ifindex 99 prev 88, got count=%zu tag=%d ifindex=%u prev=%u\n",
+                events.count,
+                mod_tag,
+                mod_ifindex,
+                mod_prev_ifindex);
+        ok = false;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed in vlan retry test\n");
+        ok = false;
+    } else if (counter.count != 1 || counter.last_record.ifindex != 99U) {
+        fprintf(stderr, "expected query_all to report latest ifindex 99, count=%zu ifindex=%u\n",
+                counter.count,
+                counter.last_record.ifindex);
+        ok = false;
+    }
+
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_vlan_change_without_ingress_ifindex_retains_previous(void) {
+    const int vlan_initial = 150;
+    const int vlan_migrated = 151;
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 8;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    mock_locator_reset();
+    g_mock_locator.version = 10;
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_OK, 66);
+    mock_locator_set_lookup(TD_ADAPTER_ERR_NOT_READY, 0);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            &g_mock_adapter_ops,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for vlan retention test\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x55, 0x56, 0x57, 0x58, 0x59};
+    build_arp_packet(&packet, &arp, mac, "198.51.100.30", "198.51.100.30", vlan_initial, 0);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_ADD ||
+        events.records[0].ifindex != 66U) {
+        int tag = events.count ? (int)events.records[0].tag : -1;
+        unsigned int ifindex = events.count ? events.records[0].ifindex : 0U;
+        fprintf(stderr,
+                "expected ADD event with ifindex 66 on initial packet, got count=%zu tag=%d ifindex=%u\n",
+                events.count,
+                tag,
+                ifindex);
+        ok = false;
+    }
+
+    capture_reset(&events);
+    mock_locator_clear_counters();
+    g_mock_locator.version = 11;
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_ERR_NOT_FOUND, 0);
+    mock_locator_set_lookup(TD_ADAPTER_ERR_NOT_READY, 0);
+
+    build_arp_packet(&packet, &arp, mac, "198.51.100.30", "198.51.100.30", vlan_migrated, 0);
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    if (g_mock_locator.lookup_by_vid_calls != 0) {
+        fprintf(stderr, "did not expect lookup_by_vid call on vlan change, got %zu\n",
+                g_mock_locator.lookup_by_vid_calls);
+        ok = false;
+    }
+
+    if (g_mock_locator.lookup_calls != 1) {
+        fprintf(stderr, "expected one fallback lookup call on vlan change, got %zu\n",
+                g_mock_locator.lookup_calls);
+        ok = false;
+    }
+
+    if (events.count != 0) {
+        fprintf(stderr, "expected no events when lookup_by_vid misses, got %zu\n", events.count);
+        ok = false;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed after vlan change retention test\n");
+        ok = false;
+    } else if (counter.count != 1 || counter.last_record.ifindex != 66U) {
+        fprintf(stderr,
+                "expected query_all to retain previous ifindex 66, count=%zu ifindex=%u\n",
+                counter.count,
+                counter.last_record.ifindex);
+        ok = false;
+    }
+
+    terminal_manager_destroy(mgr);
+    return ok;
+}
+
+static bool test_mac_refresh_failure_preserves_ifindex(void) {
+    const int vlan_id = 150;
+    struct terminal_manager_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.keepalive_interval_sec = 5;
+    cfg.keepalive_miss_threshold = 3;
+    cfg.iface_invalid_holdoff_sec = 30;
+    cfg.scan_interval_ms = 60000;
+    cfg.vlan_iface_format = "vlan%u";
+    cfg.max_terminals = 8;
+
+    struct event_capture events;
+    capture_reset(&events);
+
+    mock_locator_reset();
+    g_mock_locator.version = 1;
+    mock_locator_set_lookup_by_vid(TD_ADAPTER_OK, 88);
+    mock_locator_set_lookup(TD_ADAPTER_ERR_NOT_READY, 0);
+
+    struct terminal_manager *mgr = terminal_manager_create(&cfg,
+                                                            &g_stub_adapter,
+                                                            &g_mock_adapter_ops,
+                                                            NULL,
+                                                            NULL);
+    if (!mgr) {
+        fprintf(stderr, "failed to create terminal manager for refresh failure test\n");
+        return false;
+    }
+
+    terminal_manager_set_event_sink(mgr, capture_callback, &events);
+
+    struct ether_arp arp;
+    struct td_adapter_packet_view packet;
+    const uint8_t mac[ETH_ALEN] = {0x00, 0x45, 0x46, 0x47, 0x48, 0x49};
+    build_arp_packet(&packet, &arp, mac, "192.0.2.110", "192.0.2.110", vlan_id, 0);
+
+    terminal_manager_on_packet(mgr, &packet);
+    terminal_manager_flush_events(mgr);
+
+    bool ok = true;
+
+    if (events.count != 1 || events.records[0].tag != TERMINAL_EVENT_TAG_ADD ||
+        events.records[0].ifindex != 88U) {
+        int tag = events.count ? (int)events.records[0].tag : -1;
+        unsigned int ifindex = events.count ? events.records[0].ifindex : 0U;
+        fprintf(stderr,
+                "expected ADD event with ifindex 88 before refresh, got count=%zu tag=%d ifindex=%u\n",
+                events.count,
+                tag,
+                ifindex);
+        ok = false;
+    }
+
+    capture_reset(&events);
+    mock_locator_clear_counters();
+
+    g_mock_locator.version = 2;
+    if (!g_mock_locator.refresh_cb) {
+        fprintf(stderr, "mock locator refresh callback not registered\n");
+        ok = false;
+    } else {
+        g_mock_locator.refresh_cb(g_mock_locator.version, g_mock_locator.refresh_ctx);
+        terminal_manager_flush_events(mgr);
+    }
+
+    if (g_mock_locator.lookup_calls != 1) {
+        fprintf(stderr, "expected one full lookup during refresh failure, got %zu\n",
+                g_mock_locator.lookup_calls);
+        ok = false;
+    }
+
+    if (events.count != 0) {
+        fprintf(stderr, "expected no events when refresh fails, got %zu\n", events.count);
+        ok = false;
+    }
+
+    struct query_counter counter = {0};
+    if (terminal_manager_query_all(mgr, query_counter_callback, &counter) != 0) {
+        fprintf(stderr, "query_all failed after refresh failure\n");
+        ok = false;
+    } else if (counter.count != 1 || counter.last_record.ifindex != 88U) {
+        fprintf(stderr,
+                "expected query_all to report preserved ifindex 88, count=%zu ifindex=%u\n",
+                counter.count,
+                counter.last_record.ifindex);
+        ok = false;
+    }
+
     terminal_manager_destroy(mgr);
     return ok;
 }
@@ -1355,6 +1917,12 @@ int main(void) {
     } tests[] = {
         {"default_log_timestamp", test_default_log_timestamp},
         {"terminal_add_and_event", test_terminal_add_and_event},
+        {"point_lookup_success_sets_ifindex", test_point_lookup_success_sets_ifindex},
+        {"point_lookup_miss_triggers_refresh", test_point_lookup_miss_triggers_refresh},
+        {"point_lookup_retries_on_vlan_change", test_point_lookup_retries_on_vlan_change},
+        {"mac_refresh_failure_preserves_ifindex", test_mac_refresh_failure_preserves_ifindex},
+        {"vlan_change_without_ingress_ifindex_retains_previous",
+         test_vlan_change_without_ingress_ifindex_retains_previous},
         {"terminal_packet_on_ignored_vlan", test_terminal_packet_on_ignored_vlan},
         {"terminal_ignored_vlan_runtime_update", test_terminal_ignored_vlan_runtime_update},
         {"gratuitous_arp_uses_target_ip", test_gratuitous_arp_uses_target_ip},
