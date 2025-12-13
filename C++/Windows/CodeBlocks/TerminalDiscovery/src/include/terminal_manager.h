@@ -14,10 +14,6 @@
 #define TD_MAX_IGNORED_VLANS 32U
 #endif
 
-#ifndef TD_PENDING_VLAN_DEBUG
-#define TD_PENDING_VLAN_DEBUG 1
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
