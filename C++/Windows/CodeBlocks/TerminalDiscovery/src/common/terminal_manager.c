@@ -1204,9 +1204,10 @@ static void pending_retry_vlan(struct terminal_manager *mgr,
             continue;
         }
 
-        bool resolved = resolve_tx_interface(mgr, entry);
-        if (resolved && is_iface_available(entry)) {
-    #ifdef TD_PENDING_VLAN_DEBUG
+#ifdef TD_PENDING_VLAN_DEBUG
+        if (pending_debug_detect_uaf("pending_retry_vlan", vlan_id, node, entry)) {
+            /* fallthrough: still attempt resolve so user can reproduce crash */
+        }
         /*
          * struct terminal_entry (leading bytes)
          *  +00 key.mac/ip          (struct terminal_key, 12 bytes)
@@ -1217,8 +1218,10 @@ static void pending_retry_vlan(struct terminal_manager *mgr,
          * Pending cookies now live on struct pending_vlan_entry so we can
          * correlate dangling nodes even if the entry storage is reused.
          */
-        pending_debug_detect_uaf("pending_retry_vlan", vlan_id, node, entry);
-    #endif
+#endif
+
+        bool resolved = resolve_tx_interface(mgr, entry);
+        if (resolved && is_iface_available(entry)) {
             set_state(entry, TERMINAL_STATE_PROBING);
             entry->failed_probes = 0;
         }
