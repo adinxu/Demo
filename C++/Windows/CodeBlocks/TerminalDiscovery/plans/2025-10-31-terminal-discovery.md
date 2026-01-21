@@ -144,7 +144,7 @@
 5. ✅ 测试补充：已扩展单元测试覆盖点查命中/未命中与 VLAN 切换 `MOD` 事件，并通过 `make test` 验证通过；后续若需 demo/stub 断言可在回归阶段追加。
 6. ✅ 文档同步：已更新规范与设计文档引用（demo 指南、适配器说明、调试手册），标注点查接口调用顺序与回退路径，并说明点查不返回版本号时由管理器写回当前版本的处理方式。
 
-### 阶段 10：构建与目录拆分（进行中）
+### 阶段 10：构建与目录拆分（已完成）
 1. ✅ 顶层分发器 + 子目录 Makefile：当前仅拆分 Realtek、Netforward 两个平台入口（对等命名的 `make realtek`、`make netforward`），跳转到对应子目录的独立 makefile；各平台 makefile 负责主进程（以及仅 Netforward 的 sidecar）与 `libtd_common.a` 的生成/清理，不暴露“仅编库”目标，并将对象/产物输出到私有目录（如 `out/<platform>/`）避免冲突。
 2. ✅ 平台白名单与 sidecar 目标：Realtek/Netforward 各自 makefile 采用白名单列出自身源文件，禁止跨平台引用；Realtek-only 源（`stub/td_switch_mac_stub.c`、`demo/td_switch_mac_demo.c`、`src/ref/realtek/*` 及依赖 Realtek SDK 头的文件）仅在 Realtek 构建入口参与，Netforward 排除。Netforward makefile 提供独立 `sidecar`/`sidecar-stub` 目标，sidecar 产出独立二进制，支持变量切换真实 IPC 对象或 stub。
 3. ✅ 测试矩阵梳理：平台无关测试标记为各平台必编必跑；平台相关测试仅在对应平台 makefile 中构建/执行，并保持输出目录隔离以便流水线并行（已在 x86 下通过 `make realtek-test`、`make netforward-test` 回归）。
@@ -153,7 +153,7 @@
 6. ✅ 平台适配编译边界：各平台适配器/桥接/stub（sidecar 除外）以对象文件复用并与应用链接，不再打包静态库，运行期不做动态选择。
 7. ✅ 构建脚本回归：在拆分后回归 x86 `make realtek-test`、`make netforward-test`，并在各平台流水线新增“平台无关测试”与“平台特定测试”两个步骤，完成一次 `cross-generic` 编译验证入口（`realtek-cross-generic`、`netforward-cross-generic`）。
 
-### 阶段 11：Netforward 平台实现（新增）
+### 阶段 11：Netforward 平台实现（进行中）
 1. ⏳ 适配器与收包通路：按规范完成 `netforward_adapter`，使用 Unix 域可靠流式 IPC 接收 `struct sockaddr_vlan + frame`，解析 `port` 为整机 ifindex、`vlanid` 为 VLAN，并在接入层直接驱动 `register_packet_rx`；路径全程不依赖 MAC 定位或 Realtek 桥接。
 2. ⏳ sidecar（stub 版）首期落地：当前阶段仅交付 sidecar-stub，自发/回放 ARP 完成验收，复用与 hsl 对接相同的 IPC 头部与“先 peek 头再读帧”的读写协议，为后续切换真实 sidecar/hsl 保留兼容性。
 3. ⏳ 发包通路：netforward 发送沿 VLAN 虚接口（前缀 `Vlan`，如 `Vlan1`）直出，不经 sidecar/IPC；补齐接口解析/命名配置、节流与 ignored_vlans 过滤，保持与收包 VLAN 一致。
