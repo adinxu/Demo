@@ -347,14 +347,20 @@ static void deliver_packet(struct td_adapter *adapter,
 static void *rx_thread_main(void *arg) {
     struct td_adapter *adapter = arg;
     uint8_t buffer[TD_NETFORWARD_MAX_FRAME + sizeof(struct sockaddr_vlan)];
+    int backoff_ms = 100;
 
     while (atomic_load(&adapter->running)) {
         if (adapter->sock_fd < 0) {
             if (connect_sidecar(adapter) != TD_ADAPTER_OK) {
-                struct timespec ts = {.tv_sec = 0, .tv_nsec = 100 * 1000000L};
+                if (backoff_ms > 300) {
+                    backoff_ms = 300;
+                }
+                struct timespec ts = {.tv_sec = backoff_ms / 1000, .tv_nsec = (backoff_ms % 1000) * 1000000L};
                 nanosleep(&ts, NULL);
+                backoff_ms = backoff_ms < 300 ? backoff_ms + 50 : 300;
                 continue;
             }
+            backoff_ms = 100;
         }
 
         struct sockaddr_vlan header;

@@ -15,8 +15,10 @@ AR := $(CROSS_PREFIX)ar
 
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 CFLAGS += -I$(SRC_DIR)/include -pthread -DTD_ENABLE_ADAPTER_NETFORWARD -DTD_DEFAULT_ADAPTER=\"netforward\"
+CFLAGS += -I$(SRC_DIR)/sidecar
 CXXFLAGS ?= -std=gnu++11 -O2 -Wall -Wextra -Wpedantic
 CXXFLAGS += -I$(SRC_DIR)/include -pthread -DTD_ENABLE_ADAPTER_NETFORWARD -DTD_DEFAULT_ADAPTER=\"netforward\"
+CXXFLAGS += -I$(SRC_DIR)/sidecar
 LDFLAGS ?=
 LDLIBS ?=
 LDLIBS += -pthread
@@ -42,7 +44,9 @@ APP_SRCS := main/terminal_main.c
 APP_OBJS := $(APP_SRCS:%.c=$(OBJ_DIR)/%.o)
 
 SIDE_CAR_BIN := $(BIN_DIR)/netforward_sidecar_stub
-SIDE_CAR_SRCS := stub/netforward_sidecar_stub.c
+SIDE_CAR_SRCS := \
+	stub/netforward_sidecar_stub.c \
+	sidecar/netforward_sidecar.c
 SIDE_CAR_OBJS := $(SIDE_CAR_SRCS:%.c=$(OBJ_DIR)/%.o)
 
 TEST_TARGETS := \

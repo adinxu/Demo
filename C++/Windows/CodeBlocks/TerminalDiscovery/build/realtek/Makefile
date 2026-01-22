@@ -14,9 +14,9 @@ CXX := $(CROSS_PREFIX)g++
 AR := $(CROSS_PREFIX)ar
 
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
-CFLAGS += -I$(SRC_DIR)/include -pthread -DTD_ENABLE_ADAPTER_REALTEK -DTD_DEFAULT_ADAPTER=\"realtek\"
+CFLAGS += -I$(SRC_DIR)/include -I$(SRC_DIR)/adapter/realtek -pthread -DTD_ENABLE_ADAPTER_REALTEK -DTD_DEFAULT_ADAPTER=\"realtek\"
 CXXFLAGS ?= -std=gnu++11 -O2 -Wall -Wextra -Wpedantic
-CXXFLAGS += -I$(SRC_DIR)/include -pthread -DTD_ENABLE_ADAPTER_REALTEK -DTD_DEFAULT_ADAPTER=\"realtek\"
+CXXFLAGS += -I$(SRC_DIR)/include -I$(SRC_DIR)/adapter/realtek -pthread -DTD_ENABLE_ADAPTER_REALTEK -DTD_DEFAULT_ADAPTER=\"realtek\"
 LDFLAGS ?=
 LDLIBS ?=
 LDLIBS += -pthread

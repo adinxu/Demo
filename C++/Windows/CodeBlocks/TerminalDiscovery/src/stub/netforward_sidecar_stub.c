@@ -1,6 +1,9 @@
+#define _DEFAULT_SOURCE
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <net/if.h>
+#include <net/if_arp.h>
 #include <netinet/if_ether.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TD_NETFORWARD_DEFAULT_SOCKET "/tmp/netforward_sidecar.sock"
+#include "netforward_sidecar.h"
 
 struct sockaddr_vlan {
     uint8_t dest_mac[ETH_ALEN];
@@ -81,22 +84,6 @@ static size_t build_arp_frame(uint8_t *buf, size_t cap, uint32_t sender_host, ui
     return sizeof(struct ethhdr) + sizeof(struct ether_arp);
 }
 
-static int write_full(int fd, const void *buf, size_t len) {
-    const uint8_t *p = buf;
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, p + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        off += (size_t)n;
-    }
-    return 0;
-}
-
 static void parse_args(int argc, char **argv, struct stub_opts *opts) {
     if (!opts) {
         return;
@@ -129,34 +116,6 @@ static void parse_args(int argc, char **argv, struct stub_opts *opts) {
     }
 }
 
-static int setup_listener(const char *path) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        return -1;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-
-    unlink(path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("bind");
-        close(fd);
-        return -1;
-    }
-
-    if (listen(fd, 1) != 0) {
-        perror("listen");
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
 int main(int argc, char **argv) {
     struct stub_opts opts;
     parse_args(argc, argv, &opts);
@@ -169,11 +128,6 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    int listen_fd = setup_listener(opts.socket_path);
-    if (listen_fd < 0) {
-        return EXIT_FAILURE;
-    }
-
     printf("[netforward-sidecar-stub] listening on %s vlan=%u ifindex=%u count=%d interval_ms=%d gratuitous=%d idle=%d\n",
            opts.socket_path,
            opts.vlan,
@@ -184,17 +138,14 @@ int main(int argc, char **argv) {
            opts.idle ? 1 : 0);
     fflush(stdout);
 
-    int conn_fd = accept(listen_fd, NULL, NULL);
-    if (conn_fd < 0) {
-        perror("accept");
-        close(listen_fd);
+    if (netforward_sidecar_start(opts.socket_path) != 0) {
+        perror("netforward_sidecar_start");
         return EXIT_FAILURE;
     }
 
     if (opts.idle) {
         pause();
-        close(conn_fd);
-        close(listen_fd);
+        netforward_sidecar_stop();
         return EXIT_SUCCESS;
     }
 
@@ -223,8 +174,14 @@ int main(int argc, char **argv) {
         header.length = (uint32_t)frame_len;
         header.eth_type = ETH_P_ARP;
 
-        if (write_full(conn_fd, &header, sizeof(header)) != 0 || write_full(conn_fd, frame, frame_len) != 0) {
-            perror("write");
+        uint8_t packet[sizeof(header) + sizeof(frame)];
+        size_t packet_len = sizeof(header) + frame_len;
+
+        memcpy(packet, &header, sizeof(header));
+        memcpy(packet + sizeof(header), frame, frame_len);
+
+        if (netforward_sidecar_forward(packet, (int)packet_len) != 0) {
+            perror("netforward_sidecar_forward");
             break;
         }
 
@@ -241,9 +198,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    close(conn_fd);
-    close(listen_fd);
-    unlink(opts.socket_path);
+    netforward_sidecar_stop();
     printf("[netforward-sidecar-stub] completed\n");
     return EXIT_SUCCESS;
 }
