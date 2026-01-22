@@ -2,7 +2,7 @@
 
 ## 范围与关联规范
 - **目标**：依据 `specs/2025-10-31-terminal-discovery.md` 中的最新需求与约束，构建可跨平台移植的终端发现代理，首期聚焦 Realtek 平台，并确保与外部 C++ 北向接口的 ABI 兼容，同时提供面向调试与验收的只读导出接口，能实时输出终端哈希桶、接口前缀/绑定表、MAC 查表队列及相关计数器。
-- **交付/构建模式**：遵循规范新增要求，`commonlib/src`、`commonlib/include` 等平台无关代码编译为静态库供各平台复用；平台相关适配器（如 Realtek、Netforward、Linux raw socket）由各平台工程单独编译、链接，运行期不做动态选择。分拆时优先确保 Realtek 现网编译链畅通，控制迁移成本。
+- **交付/构建模式**：遵循规范新增要求，`td_commonlib/src`、`td_commonlib/include` 等平台无关代码编译为静态库供各平台复用；平台相关适配器（如 Realtek、Netforward、Linux raw socket）由各平台工程单独编译、链接，运行期不做动态选择。分拆时优先确保 Realtek 现网编译链畅通，控制迁移成本。
 - **关联规范**：`specs/2025-10-31-terminal-discovery.md`
 
 ## 假设与非目标
@@ -35,7 +35,7 @@
 7. ✅ 新增 MAC 表桥接验证 demo：外部团队已交付 C++ 桥接源文件及其 C 接口，并与 `src/demo/td_switch_mac_demo.c` 联调通过。demo 在入口阶段调用 `td_switch_mac_get_capacity` 估算最大条目并缓存容量，后续复用同一 `SwUcMacEntry` 缓冲区驱动 `td_switch_mac_snapshot`；桥接模块在装载期间完成一次性 `createSwitch` 与 `SwitchDev*` 缓存，调用路径严格遵守 SDK 缓冲区约定。快照接口的第二个参数 `out_count` 完全作为出参使用，不支持“请求条数”语义；调用方需事先按容量准备缓存并在返回后读取实际条目。该 demo 现作为 ifindex 获取/同步方案的基线实现，后续生产逻辑需复用相同的容量缓存与缓冲区复用模式，确保与桥接模块的数据流一致。
 
 ### 阶段 1：适配层设计与实现（已完成）
-1. ✅ ABI 设计：`src/commonlib/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/commonlib/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
+1. ✅ ABI 设计：`src/td_commonlib/include/adapter_api.h` 定义错误码、日志级别、报文视图、接口事件、ARP 请求结构；`src/td_commonlib/include/td_adapter_registry.h` + `src/adapter/adapter_registry.c` 注册并解析唯一 Realtek 适配器描述符。
 2. ✅ Realtek 适配器：
    - RX：`realtek_start` 时创建 `AF_PACKET` 套接字，附加 BPF、`PACKET_AUXDATA`，在 `rx_thread_main` 中恢复 VLAN、ingress ifindex（Realtek 平台固定为物理口 `eth0`）与 MAC，并预留解析 CPU tag 所携带的 ifindex 线索；该 ifindex 仅用于日志或调试，不参与后续发包接口决策。
    - TX：`realtek_send_arp` 使用 `send_lock` 节流；默认在物理接口 `eth0` 的原始套接字中封装 802.1Q 头直接发包，优先采用请求内的 VLAN/接口信息生成帧；若驱动拒绝用户态 VLAN tag，则回退到绑定虚接口（如 `vlan1`），发送前仍会查询接口 IPv4/MAC，若接口无 IP 则跳过并记录日志。
@@ -149,7 +149,7 @@
 2. ✅ 平台白名单与 sidecar 目标：Realtek/Netforward 各自 makefile 采用白名单列出自身源文件，禁止跨平台引用；Realtek-only 源（`stub/td_switch_mac_stub.c`、`demo/td_switch_mac_demo.c`、`src/ref/realtek/*` 及依赖 Realtek SDK 头的文件）仅在 Realtek 构建入口参与，Netforward 排除。Netforward makefile 提供独立 `sidecar`/`sidecar-stub` 目标，sidecar 产出独立二进制，支持变量切换真实 IPC 对象或 stub。
 3. ✅ 测试矩阵梳理：平台无关测试标记为各平台必编必跑；平台相关测试仅在对应平台 makefile 中构建/执行，并保持输出目录隔离以便流水线并行（已在 x86 下通过 `make realtek-test`、`make netforward-test` 回归）。
 4. ✅ cross-generic 支撑：各平台 makefile 增设 `CROSS_PREFIX`/`cross-generic` 目标，使用通用交叉工具链完成一次编译验证并记录结果；默认通用前缀为 Realtek/MIPS `mips-linux-gnu-`，Netforward/ARM64 `aarch64-linux-gnu-`。厂商专有前缀（如 `mips-rtl83xx-linux-`/`aarch64-none-linux-gnu-`）仅在可用时供 `cross` 目标选择性使用，不作为默认或必备。
-5. ✅ 公共代码静态库化：`libtd_common.a` 汇总 `commonlib/src` 与北向 C++ 代码，默认随平台构建产生并在各平台 makefile 内负责清理。
+5. ✅ 公共代码静态库化：`libtd_common.a` 汇总 `td_commonlib/src` 与北向 C++ 代码，默认随平台构建产生并在各平台 makefile 内负责清理。
 6. ✅ 平台适配编译边界：各平台适配器/桥接/stub（sidecar 除外）以对象文件复用并与应用链接，不再打包静态库，运行期不做动态选择。
 7. ✅ 构建脚本回归：在拆分后回归 x86 `make realtek-test`、`make netforward-test`，并在各平台流水线新增“平台无关测试”与“平台特定测试”两个步骤，完成一次 `cross-generic` 编译验证入口（`realtek-cross-generic`、`netforward-cross-generic`）。
 
@@ -163,7 +163,7 @@
 7. ✅ sidecar 代码拆分与复用：新增 `src/sidecar/` 目录，创建可复用的 Unix Socket 服务端源文件，从 `src/stub/netforward_sidecar_stub.c` 剪切共享逻辑，并导出 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf`= `sockaddr_vlan` + 以太帧，`len` 为总长度）；保持 stub 版本仅承担 `main`、参数解析、hsl 收包模拟与信号处理，重用共享实现完成透传。
 8. ✅ 单客户端可重连策略落地：sidecar 持续 accept，单连接断开后关闭并重新 accept；适配器在读写错误或对端关闭时关闭 fd、置 -1，并按短退避重连，RX 线程常驻；协议保持 `sockaddr_vlan + frame`，不引入握手。
 9. ✅ sidecar 构建与测试：补全 netforward sidecar makefile（纳入共享实现），修复 stub 依赖并通过 `make netforward-sidecar` 与 `make netforward-test` 本地编译/测试。
-10. ✅ 头文件分层落地：平台无关头全部放在 `src/commonlib/include/` 随公共静态库交付；`src/include/` 仅保留平台专属命名空间头（例如 `src/include/realtek/td_switch_mac_bridge.h`），对应平台 makefile 定向 `-I`；netforward sidecar 头（如 `netforward_sidecar.h`）放在 `src/sidecar/`，仅在 netforward 构建包含。
+10. ✅ 头文件分层落地：平台无关头全部放在 `src/td_commonlib/include/` 随公共静态库交付；`src/include/` 仅保留平台专属命名空间头（例如 `src/include/realtek/td_switch_mac_bridge.h`），对应平台 makefile 定向 `-I`；netforward sidecar 头（如 `netforward_sidecar.h`）放在 `src/sidecar/`，仅在 netforward 构建包含。
 11. ✅ 公共静态库独立化：将平台无关源码/头文件放入独立目录并编写独立 makefile，可单独（仓库/SVN）构建产出静态库；Realtek/Netforward 平台的 makefile 通过调用该公共 makefile 获取产物后再链接平台代码，保持物理与编译解耦。
 
 ## 依赖与风险

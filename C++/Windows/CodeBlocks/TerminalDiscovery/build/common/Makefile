@@ -1,6 +1,6 @@
 ROOT := $(abspath ../..)
 SRC_DIR := $(ROOT)/src
-COMMON_INC_DIR := $(ROOT)/src/commonlib/include
+COMMON_INC_DIR := $(ROOT)/src/td_commonlib/include
 OUT_DIR := $(ROOT)/out/common
 OBJ_DIR := $(OUT_DIR)/obj
 LIB_DIR := $(OUT_DIR)/lib
@@ -18,12 +18,12 @@ LDLIBS ?=
 LDLIBS += -pthread
 
 COMMON_C_SRCS := \
-	commonlib/src/td_logging.c \
-	commonlib/src/td_config.c \
-	commonlib/src/terminal_manager.c \
-	commonlib/src/terminal_netlink.c
+	td_commonlib/src/td_logging.c \
+	td_commonlib/src/td_config.c \
+	td_commonlib/src/terminal_manager.c \
+	td_commonlib/src/terminal_netlink.c
 COMMON_CPP_SRCS := \
-	commonlib/src/terminal_northbound.cpp
+	td_commonlib/src/terminal_northbound.cpp
 COMMON_C_OBJS := $(COMMON_C_SRCS:%.c=$(OBJ_DIR)/%.o)
 COMMON_CPP_OBJS := $(COMMON_CPP_SRCS:%.cpp=$(OBJ_DIR)/%.o)
 COMMON_OBJS := $(COMMON_C_OBJS) $(COMMON_CPP_OBJS)

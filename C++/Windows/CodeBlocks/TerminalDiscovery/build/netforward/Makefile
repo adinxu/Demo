@@ -2,7 +2,7 @@
 
 ROOT := $(abspath ../..)
 SRC_DIR := $(ROOT)/src
-COMMON_INC_DIR := $(ROOT)/src/commonlib/include
+COMMON_INC_DIR := $(ROOT)/src/td_commonlib/include
 OUT_DIR := $(ROOT)/out/netforward
 OBJ_DIR := $(OUT_DIR)/obj
 BIN_DIR := $(OUT_DIR)/bin
@@ -50,8 +50,8 @@ TEST_C_SRCS := \
 	tests/terminal_manager_tests.c \
 	tests/terminal_embedded_init_tests.c \
 	main/terminal_main.c \
-	commonlib/src/td_config.c \
-	commonlib/src/td_logging.c
+	td_commonlib/src/td_config.c \
+	td_commonlib/src/td_logging.c
 TEST_CPP_SRCS := tests/terminal_integration_tests.cpp
 TEST_OBJS := $(TEST_C_SRCS:%.c=$(OBJ_DIR)/%.o) $(TEST_CPP_SRCS:%.cpp=$(OBJ_DIR)/%.o)
 
@@ -82,7 +82,7 @@ $(TEST_DIR)/terminal_discovery_tests: $(OBJ_DIR)/tests/terminal_manager_tests.o 
 $(TEST_DIR)/terminal_integration_tests: $(OBJ_DIR)/tests/terminal_integration_tests.o $(COMMON_LIB) | $(TEST_DIR)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(TEST_DIR)/terminal_embedded_init_tests: $(OBJ_DIR)/tests/terminal_embedded_init_tests.o $(OBJ_DIR)/tests/terminal_main_for_tests.o $(OBJ_DIR)/commonlib/src/td_config.o $(OBJ_DIR)/commonlib/src/td_logging.o | $(TEST_DIR)
+$(TEST_DIR)/terminal_embedded_init_tests: $(OBJ_DIR)/tests/terminal_embedded_init_tests.o $(OBJ_DIR)/tests/terminal_main_for_tests.o $(OBJ_DIR)/td_commonlib/src/td_config.o $(OBJ_DIR)/td_commonlib/src/td_logging.o | $(TEST_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_DIR)/netforward_adapter_tests: $(OBJ_DIR)/tests/netforward_adapter_tests.o $(ADAPTER_OBJS) $(COMMON_LIB) | $(TEST_DIR)

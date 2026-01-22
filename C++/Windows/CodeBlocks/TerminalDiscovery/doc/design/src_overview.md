@@ -10,7 +10,7 @@ src/
  │   ├── adapter_registry.c/.h
  │   ├── realtek_adapter.c/.h
  │   └── netforward_adapter.c/.h
- ├── commonlib/
+ ├── td_commonlib/
  │   ├── include/            # 平台无关公共头（对外暴露，供 libtd_common.a 与平台复用）
  │   └── src/                # 平台无关公共源码（td_logging/td_config/terminal_manager/terminal_netlink/terminal_northbound）
  ├── include/
@@ -33,8 +33,8 @@ src/
 ```
 
 - `adapter/` 集中适配层实现，当前涵盖 `realtek_adapter` 与 `netforward_adapter`；适配器代码在各平台工程内以对象形式链接，不再打包为独立静态库。
-- `commonlib/` 承载跨平台公共逻辑（终端管理器、配置、日志、netlink、北向桥接）与平台无关头文件，统一产出 `libtd_common.a` 供各平台复用。
-- `include/` 仅存放平台命名空间专属头（如 `include/realtek/td_switch_mac_bridge.h`）；公共头已搬迁至 `commonlib/include/` 并随静态库交付。
+- `td_commonlib/` 承载跨平台公共逻辑（终端管理器、配置、日志、netlink、北向桥接）与平台无关头文件，统一产出 `libtd_common.a` 供各平台复用。
+- `include/` 仅存放平台命名空间专属头（如 `include/realtek/td_switch_mac_bridge.h`）；公共头已搬迁至 `td_commonlib/include/` 并随静态库交付。
 - `sidecar/` 放置可复用的 netforward sidecar 服务端逻辑；stub 版在 `stub/` 内包含 `main` 入口。
 - `main/` 暴露 CLI/嵌入式入口与只读 accessor。
 - `stub/` 提供 MAC 桥接与 sidecar 等模拟组件，服务单元/集成测试与无硬件环境。
@@ -44,7 +44,7 @@ src/
 
 ### 构建形式
 
-- 公共跨平台代码（`commonlib/src` + `commonlib/include` + 公共对外头）由独立的 `build/common/Makefile` 产出静态库 `libtd_common.a`（输出至 `out/common/lib/`）；平台 makefile 仅调用该公共 makefile，不再重复列出公共源码。
+- 公共跨平台代码（`td_commonlib/src` + `td_commonlib/include` + 公共对外头）由独立的 `build/common/Makefile` 产出静态库 `libtd_common.a`（输出至 `out/common/lib/`）；平台 makefile 仅调用该公共 makefile，不再重复列出公共源码。
 - 平台适配器以对象文件直接链接：Realtek/Netforward 主进程从各自 `adapter/*.o`（及 Realtek 桥接头 `include/realtek/`）、必要的 stub/sidecar 对象取用，不生成适配器静态库。
 - 典型命令：
   - `make realtek-test` / `make netforward-test`：x86 本地构建并运行平台对应的单元/集成/嵌入初始化测试；构建过程中会先调用 `build/common` 生成 `libtd_common.a`。
@@ -56,7 +56,7 @@ src/
 ### 平台适配落地指南
 
 1) 物理分离与编译方式
-- 公共跨平台逻辑：仅限 `commonlib/src` 与 `commonlib/include`（北向桥接具体为 `commonlib/src/terminal_northbound.cpp` + `commonlib/include/terminal_discovery_api.hpp`），通过 `build/common/Makefile` 先行编译为 `libtd_common.a`，保持与平台无关。公共头不承载平台专属接口。
+- 公共跨平台逻辑：仅限 `td_commonlib/src` 与 `td_commonlib/include`（北向桥接具体为 `td_commonlib/src/terminal_northbound.cpp` + `td_commonlib/include/terminal_discovery_api.hpp`），通过 `build/common/Makefile` 先行编译为 `libtd_common.a`，保持与平台无关。公共头不承载平台专属接口。
 - 平台相关逻辑：位于 `adapter/`（及可选的 `stub/`/`sidecar/`），按目标平台在各自工程中直接编译为对象文件并与 `libtd_common.a` 链接；不要求生成适配器静态库，便于按需裁剪或替换编译选项。
 - 引入新平台时，新建 `adapter/<platform>.*`，在对应平台 makefile 中列入白名单编译并与 `libtd_common.a` 链接；运行期不支持动态选择，构建期必须唯一确定适配器。
 
@@ -94,7 +94,7 @@ flowchart TD
         REG["adapter_registry.c"]
     end
 
-    subgraph Common["commonlib/"]
+    subgraph Common["td_commonlib/"]
         LOG["td_logging"]
         CFG["td_config"]
         TM["terminal_manager"]
@@ -102,7 +102,7 @@ flowchart TD
         NB["terminal_northbound"]
     end
 
-  subgraph CommonInclude["commonlib/include/"]
+  subgraph CommonInclude["td_commonlib/include/"]
     API["adapter_api.h"]
     TMH["terminal_manager.h"]
   end
@@ -159,12 +159,12 @@ flowchart TD
 
 上述组件关系对应 `terminal_main.c` 的初始化流程：主程序拉起配置与日志组件、从 `adapter_registry` 解析适配器、构造 `terminal_manager` 并串联 netlink 监听与北向回调。`include/` 提供各层共享 API，`stub/` 的 `td_switch_mac_stub` 通过同一接口模拟 MAC 桥接，`tests/` 下的单元/集成测试既验证管理器行为，也验证北向回调与 MAC stub 的协同。
 
-### 1. 日志子系统 `commonlib/td_logging`
+### 1. 日志子系统 `td_commonlib/td_logging`
 - 提供线程安全的日志级别、输出接口（`td_log_writef`）。
 - 默认写 `stderr`，并在未注入自定义 sink 时为每条日志添加 `YYYY-MM-DD HH:MM:SS` 的系统时间戳；可通过 `td_log_set_sink` 注入外部回调（适配层使用）。
 - `td_log_level_from_string` 支持 CLI 级别解析。
 
-### 2. 运行时配置 `commonlib/td_config`
+### 2. 运行时配置 `td_commonlib/td_config`
 - `td_config_load_defaults` 输出运行所需的基础参数（适配器名、收发接口、保活周期、容量上限等）。
 - `td_config_to_manager_config` 将运行时结构体映射为 `terminal_manager` 的内部配置。
 - 默认值与 Stage 4 文档保持一致，可通过 CLI 修改（见 `terminal_main.c`）。
@@ -189,7 +189,7 @@ flowchart TD
   - `netforward_adapter`
     - 暴露同样的 `td_adapter_ops` 契约；如果平台需要侧车进程，可复用 `sidecar/netforward_sidecar.c` 作为共享逻辑，或在 `stub/netforward_sidecar_stub.c` 以独立 `main` 形式运行。
 
-### 4. 核心引擎 `commonlib/terminal_manager`
+### 4. 核心引擎 `td_commonlib/terminal_manager`
 - **主要数据结构**：
   - `terminal_manager`
     - 哈希桶 `table[256]` 存储终端条目。
@@ -456,13 +456,13 @@ classDiagram
 - Realtek 适配器的 `mac_cache_worker` 线程在刷新 `td_switch_mac_snapshot` 成功后调用订阅回调 `mac_locator_on_refresh(version)`；若失败则上报 `version=0`，管理器会保留待处理任务等待下一轮刷新。
 - `pending_vlans` 桶数组在持锁情况下由 `pending_attach/pending_detach` 维护，`pending_retry_vlan` 与 `pending_retry_for_ifindex` 会在重试时遍历桶内链表；成功解析后的终端会在同一锁保护下清除 Pending 记录并复位至可探测状态。
 
-### 5. Netlink 监听器 `commonlib/terminal_netlink`
+### 5. Netlink 监听器 `td_commonlib/terminal_netlink`
 - `terminal_netlink_start/stop`：管理基于 `NETLINK_ROUTE` 的后台线程，订阅 `RTM_NEWADDR/DELADDR` 并调用 `terminal_manager_on_address_update`。
 - 内部线程使用 `poll` 阻塞等待消息，解析 `ifaddrmsg` + `IFA_LOCAL/IFA_ADDRESS` 提取前缀信息，只处理 IPv4 事件。
 - 启动阶段会通过 `terminal_manager_set_address_sync_handler` 注册同步回调并立即请求一次地址抓取：优先向内核发起 `RTM_GETADDR` dump，若失败则回退到 `getifaddrs`，并统一记录 WARN 以便部署排查；返回非 0 时管理器会保留挂起标记，由 worker 线程在后续周期自动重试。
 - 在 `terminal_main.c` 中随管理器创建启动，销毁流程会优雅退出线程并关闭套接字。
 
-### 6. 北向桥接 `commonlib/terminal_northbound.cpp`
+### 6. 北向桥接 `td_commonlib/terminal_northbound.cpp`
 - 向外导出稳定 ABI：`getAllTerminalInfo`、`setIncrementReport`。
 - `setIncrementReport`：注册 C++ 回调 `IncReportCb`，内部通过 `terminal_manager_set_event_sink` 绑定事件入口。
 - `getAllTerminalInfo`：调用 `terminal_manager_query_all` 生成快照，转换为携带 `ifindex/prev_ifindex` 与 ModifyTag 的 `MAC_IP_INFO`。

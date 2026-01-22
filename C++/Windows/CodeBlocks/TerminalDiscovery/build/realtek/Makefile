@@ -3,7 +3,7 @@
 ROOT := $(abspath ../..)
 SRC_DIR := $(ROOT)/src
 REALTEK_INC_DIR := $(SRC_DIR)/include/realtek
-COMMON_INC_DIR := $(ROOT)/src/commonlib/include
+COMMON_INC_DIR := $(ROOT)/src/td_commonlib/include
 OUT_DIR := $(ROOT)/out/realtek
 OBJ_DIR := $(OUT_DIR)/obj
 BIN_DIR := $(OUT_DIR)/bin
@@ -45,8 +45,8 @@ TEST_C_SRCS := \
 	tests/td_switch_mac_stub_tests.c \
 	tests/terminal_embedded_init_tests.c \
 	main/terminal_main.c \
-	commonlib/src/td_config.c \
-	commonlib/src/td_logging.c
+	td_commonlib/src/td_config.c \
+	td_commonlib/src/td_logging.c
 TEST_CPP_SRCS := tests/terminal_integration_tests.cpp
 TEST_OBJS := $(TEST_C_SRCS:%.c=$(OBJ_DIR)/%.o) $(TEST_CPP_SRCS:%.cpp=$(OBJ_DIR)/%.o)
 
@@ -73,7 +73,7 @@ $(TEST_DIR)/terminal_integration_tests: $(OBJ_DIR)/tests/terminal_integration_te
 $(TEST_DIR)/td_switch_mac_stub_tests: $(OBJ_DIR)/tests/td_switch_mac_stub_tests.o $(OBJ_DIR)/stub/td_switch_mac_stub.o | $(TEST_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(TEST_DIR)/terminal_embedded_init_tests: $(OBJ_DIR)/tests/terminal_embedded_init_tests.o $(OBJ_DIR)/tests/terminal_main_for_tests.o $(OBJ_DIR)/commonlib/src/td_config.o $(OBJ_DIR)/commonlib/src/td_logging.o | $(TEST_DIR)
+$(TEST_DIR)/terminal_embedded_init_tests: $(OBJ_DIR)/tests/terminal_embedded_init_tests.o $(OBJ_DIR)/tests/terminal_main_for_tests.o $(OBJ_DIR)/td_commonlib/src/td_config.o $(OBJ_DIR)/td_commonlib/src/td_logging.o | $(TEST_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(OBJ_DIR)/tests/terminal_main_for_tests.o: $(SRC_DIR)/main/terminal_main.c | $(OBJ_DIR)/tests
