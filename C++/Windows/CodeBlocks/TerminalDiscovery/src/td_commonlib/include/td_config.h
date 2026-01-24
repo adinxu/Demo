@@ -16,6 +16,8 @@ struct terminal_manager_config;
 #define TD_DEFAULT_MAX_TERMINALS 1000U
 #define TD_DEFAULT_IFACE_INVALID_HOLDOFF_SEC 1800U
 #define TD_DEFAULT_STATS_LOG_INTERVAL_SEC 0U
+#define TD_DEFAULT_SCAN_INTERVAL_MS 1000U
+#define TD_VLAN_IFACE_FORMAT_MAX 32
 #ifndef TD_MAX_IGNORED_VLANS
 #define TD_MAX_IGNORED_VLANS 32U
 #endif
@@ -28,11 +30,13 @@ struct td_runtime_config {
     unsigned int keepalive_interval_sec;
     unsigned int keepalive_miss_threshold;
     unsigned int iface_invalid_holdoff_sec;
+    unsigned int scan_interval_ms;
     unsigned int max_terminals;
     unsigned int stats_log_interval_sec;
     td_log_level_t log_level;
     size_t ignored_vlan_count;
     uint16_t ignored_vlans[TD_MAX_IGNORED_VLANS];
+    char vlan_iface_format[TD_VLAN_IFACE_FORMAT_MAX];
 };
 
 int td_config_load_defaults(struct td_runtime_config *cfg);
