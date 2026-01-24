@@ -26,7 +26,7 @@ struct sockaddr_vlan {
     uint32_t port;
     uint16_t vlanid;
     uint16_t svlanid;
-    uint32_t length;
+    uint32_t length; /* total length: header + payload */
     uint16_t eth_type;
 };
 
@@ -78,36 +78,21 @@ static void wait_ready(struct server_args *args) {
     pthread_mutex_unlock(&args->lock);
 }
 
-static size_t build_frame(bool arp, uint8_t *buf, size_t cap, uint16_t ether_type) {
-    if (cap < sizeof(struct ethhdr)) {
-        return 0;
-    }
-    struct ethhdr *eth = (struct ethhdr *)buf;
-    memset(eth->h_dest, 0xFF, ETH_ALEN);
-    eth->h_dest[0] = 0xFF;
-    eth->h_dest[1] = 0xFF;
-    eth->h_dest[2] = 0xFF;
-    eth->h_dest[3] = 0xFF;
-    eth->h_dest[4] = 0xFF;
-    eth->h_dest[5] = 0xFF;
-    eth->h_source[0] = 0x00;
-    eth->h_source[1] = 0x11;
-    eth->h_source[2] = 0x22;
-    eth->h_source[3] = 0x33;
-    eth->h_source[4] = 0x44;
-    eth->h_source[5] = 0x55;
-    eth->h_proto = htons(ether_type);
-
+static size_t build_payload(bool arp, uint8_t *buf, size_t cap, uint16_t ether_type) {
     if (!arp) {
-        memset(buf + sizeof(struct ethhdr), 0xAA, 32);
-        return sizeof(struct ethhdr) + 32;
+        if (cap < 32) {
+            return 0;
+        }
+        memset(buf, 0xAA, 32);
+        (void)ether_type;
+        return 32;
     }
 
-    if (cap < sizeof(struct ethhdr) + sizeof(struct ether_arp)) {
+    if (cap < sizeof(struct ether_arp)) {
         return 0;
     }
 
-    struct ether_arp *arp_hdr = (struct ether_arp *)(buf + sizeof(struct ethhdr));
+    struct ether_arp *arp_hdr = (struct ether_arp *)buf;
     memset(arp_hdr, 0, sizeof(*arp_hdr));
     arp_hdr->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
     arp_hdr->ea_hdr.ar_pro = htons(ETH_P_IP);
@@ -115,14 +100,16 @@ static size_t build_frame(bool arp, uint8_t *buf, size_t cap, uint16_t ether_typ
     arp_hdr->ea_hdr.ar_pln = 4;
     arp_hdr->ea_hdr.ar_op = htons(ARPOP_REQUEST);
 
+    uint8_t src_mac[ETH_ALEN] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
     uint32_t spa = inet_addr("192.0.2.10");
     uint32_t tpa = inet_addr("192.0.2.1");
-    memcpy(&arp_hdr->arp_sha, eth->h_source, ETH_ALEN);
+    memcpy(&arp_hdr->arp_sha, src_mac, ETH_ALEN);
     memcpy(&arp_hdr->arp_spa, &spa, sizeof(spa));
     memcpy(&arp_hdr->arp_tpa, &tpa, sizeof(tpa));
     memset(&arp_hdr->arp_tha, 0, ETH_ALEN);
 
-    return sizeof(struct ethhdr) + sizeof(struct ether_arp);
+    (void)ether_type;
+    return sizeof(struct ether_arp);
 }
 
 static void *sidecar_server(void *arg) {
@@ -163,23 +150,24 @@ static void *sidecar_server(void *arg) {
         return NULL;
     }
 
-    uint8_t frame[128];
-    size_t frame_len = build_frame(args->send_arp, frame, sizeof(frame), args->send_arp ? ETH_P_ARP : ETH_P_IP);
-    if (args->short_length && frame_len > 8) {
-        frame_len = 8;
+    uint8_t payload[128];
+    size_t payload_len = build_payload(args->send_arp, payload, sizeof(payload), args->send_arp ? ETH_P_ARP : ETH_P_IP);
+    if (args->short_length && payload_len > 8) {
+        payload_len = 8;
     }
 
     struct sockaddr_vlan header;
     memset(&header, 0, sizeof(header));
-    memcpy(header.dest_mac, frame, ETH_ALEN);
-    memcpy(header.src_mac, frame + ETH_ALEN, ETH_ALEN);
+    memset(header.dest_mac, 0xFF, ETH_ALEN);
+    uint8_t src_mac[ETH_ALEN] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    memcpy(header.src_mac, src_mac, ETH_ALEN);
     header.port = args->port;
     header.vlanid = args->vlan;
-    header.length = (uint32_t)frame_len;
+    header.length = (uint32_t)(sizeof(header) + payload_len);
     header.eth_type = args->send_arp ? ETH_P_ARP : ETH_P_IP;
 
     write_full_or_fail(conn, &header, sizeof(header));
-    write_full_or_fail(conn, frame, frame_len);
+    write_full_or_fail(conn, payload, payload_len);
 
     close(conn);
     close(fd);

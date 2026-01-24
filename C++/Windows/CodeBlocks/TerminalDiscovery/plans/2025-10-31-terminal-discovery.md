@@ -154,14 +154,14 @@
 7. ✅ 构建脚本回归：在拆分后回归 x86 `make realtek-test`、`make netforward-test`，并在各平台流水线新增“平台无关测试”与“平台特定测试”两个步骤，完成一次 `cross-generic` 编译验证入口（`realtek-cross-generic`、`netforward-cross-generic`）。
 
 ### 阶段 11：Netforward 平台实现（已完成）
-1. ✅ 适配器与收包通路：按规范完成 `netforward_adapter`，使用 Unix 域可靠流式 IPC 接收 `struct sockaddr_vlan + frame`，解析 `port` 为整机 ifindex、`vlanid` 为 VLAN，并在接入层直接驱动 `register_packet_rx`；路径全程不依赖 MAC 定位或 Realtek 桥接。
+1. ✅ 适配器与收包通路：按规范完成 `netforward_adapter`，使用 Unix 域可靠流式 IPC 接收 `struct sockaddr_vlan + payload`（现网 ARP 负载紧随其后且首字段为 Hardware Type），解析 `port` 为整机 ifindex、`vlanid` 为 VLAN，并在接入层直接驱动 `register_packet_rx`；路径全程不依赖 MAC 定位或 Realtek 桥接。
 2. ✅ sidecar（stub 版）首期落地：当前阶段仅交付 sidecar-stub，自发/回放 ARP 完成验收，复用与 hsl 对接相同的 IPC 头部与“先 peek 头再读帧”的读写协议，为后续切换真实 sidecar/hsl 保留兼容性。
 3. ✅ 发包通路：netforward 发送沿 VLAN 虚接口（前缀 `Vlan`，如 `Vlan1`）直出，不经 sidecar/IPC；补齐接口解析/命名配置、节流与 ignored_vlans 过滤，保持与收包 VLAN 一致。
 4. ✅ 构建与目标：完善 `make netforward`/`make sidecar-stub` 规则，输出至独立目录，默认使用 `aarch64-linux-gnu-` 进行 `netforward-cross-generic` 交叉验证；若后续引入真实 sidecar，再追加对应目标（非本阶段必需）。
 5. ✅ 测试与验收：在 x86 stub 场景补充单元/集成测试覆盖头+帧封装、逐报文读取、长度一致性、ignored_vlans、免费 ARP/异常源 MAC 丢弃；规划 ARM64 目标环境一次自发报文演练，并在未来接入 hsl 时回归 IPC 兼容性。
 6. ✅ 观测与日志：对齐通用结构化日志标签，侧重报文长度/头部校验、IPC 连接状态与丢帧计数；在 sidecar-stub 提供可控流量开关与速率配置，便于压力与一致性测试。
-7. ✅ sidecar 代码拆分与复用：新增 `src/sidecar/` 目录，创建可复用的 Unix Socket 服务端源文件，从 `src/stub/netforward_sidecar_stub.c` 剪切共享逻辑，并导出 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf`= `sockaddr_vlan` + 以太帧，`len` 为总长度）；保持 stub 版本仅承担 `main`、参数解析、hsl 收包模拟与信号处理，重用共享实现完成透传。
-8. ✅ 单客户端可重连策略落地：sidecar 持续 accept，单连接断开后关闭并重新 accept；适配器在读写错误或对端关闭时关闭 fd、置 -1，并按短退避重连，RX 线程常驻；协议保持 `sockaddr_vlan + frame`，不引入握手。
+7. ✅ sidecar 代码拆分与复用：新增 `src/sidecar/` 目录，创建可复用的 Unix Socket 服务端源文件，从 `src/stub/netforward_sidecar_stub.c` 剪切共享逻辑，并导出 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf`= `sockaddr_vlan` + payload，现网 ARP 负载紧随其后且首字段为 Hardware Type，`len` 为总长度）；保持 stub 版本仅承担 `main`、参数解析、hsl 收包模拟与信号处理，重用共享实现完成透传。
+8. ✅ 单客户端可重连策略落地：sidecar 持续 accept，单连接断开后关闭并重新 accept；适配器在读写错误或对端关闭时关闭 fd、置 -1，并按短退避重连，RX 线程常驻；协议保持 `sockaddr_vlan + payload`，不引入握手。
 9. ✅ sidecar 构建与测试：补全 netforward sidecar makefile（纳入共享实现），修复 stub 依赖并通过 `make netforward-sidecar` 与 `make netforward-test` 本地编译/测试。
 10. ✅ 头文件分层落地：平台无关头全部放在 `src/td_commonlib/include/` 随公共静态库交付；`src/include/` 仅保留平台专属命名空间头（例如 `src/include/realtek/td_switch_mac_bridge.h`），对应平台 makefile 定向 `-I`；netforward sidecar 头（如 `netforward_sidecar.h`）放在 `src/sidecar/`，仅在 netforward 构建包含。
 11. ✅ 公共静态库独立化：将平台无关源码/头文件放入独立目录并编写独立 makefile，可单独（仓库/SVN）构建产出静态库；Realtek/Netforward 平台的 makefile 通过调用该公共 makefile 获取产物后再链接平台代码，保持物理与编译解耦。

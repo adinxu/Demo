@@ -143,12 +143,12 @@
     - sidecar 由来：与 hsl 进程间通信收包需要引入平台特定的进程框架，为避免污染/耦合集成本项目的主进程，采用 cloud-native sidecar 模式：sidecar 引入平台框架并完成与 hsl 的通信，再将报文透传给主进程。
     - sidecar 形态拆分：
        1) `src/stub/` 下的 sidecar 源文件用于模拟独立 sidecar 进程，包含 `main`，负责参数解析、模拟 hsl 收包、信号处理等；用于无 hsl 环境的本地演练。
-       2) `src/sidecar/` 下的 sidecar 源文件负责与终端发现进程的 Unix Socket 建连与维护，作为服务端将模拟自 hsl 收到的 `sockaddr_vlan + 以太帧` 通过 Unix Socket 透传给终端发现进程；该目录代码需在正式项目中复用，并实现 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf` 含 `sockaddr_vlan` 头部加完整以太帧，`len` 为总长度），实际环境中 epoll 从 hsl 读满报文后调用该函数完成转发。
+      2) `src/sidecar/` 下的 sidecar 源文件负责与终端发现进程的 Unix Socket 建连与维护，作为服务端将模拟自 hsl 收到的 `sockaddr_vlan + payload` 通过 Unix Socket 透传给终端发现进程；该目录代码需在正式项目中复用，并实现 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf` 含 `sockaddr_vlan` 头部加协议负载，netforward 现网 ARP 报文在头后直接以 Hardware Type 开始的 ARP 负载，不再附带以太网头，`len` 为总长度），实际环境中 epoll 从 hsl 读满报文后调用该函数完成转发。
    - 现阶段 sidecar 可不接入 hsl，默认以 stub/自发模拟报文完成终端发现链路验收；但需保持与 hsl 对接的兼容性（沿用相同 IPC 头部与收包流程），便于后续无缝切换为真实 hsl 数据源。
    - 收包链路：参考 `src/ref/netforward`，通过与用户态核心转发进程 hsl 的 IPC 收包，不再使用 Raw Socket。sidecar 负责接入平台框架并与 hsl 通信，将报文透传给主进程；主进程在适配器内解析后喂给已注册的 `register_packet_rx` 回调。提供 sidecar 打桩以便无 hsl 环境下验收。
    - 元数据解析：报文自带 CPU tag，`port` 字段即整机 ifindex（物理口），无需 `td_adapter_mac_locator_ops`。VLAN 取自 `vlanid` 字段；整机 ifindex 与 VLANIF 的 `kernel_ifindex` 语义独立，不混用。
    - 发包路径：主进程直接在对应 VLAN 虚接口（前缀 `Vlan`，如 `Vlan1`）发送，不经过 IPC/sidecar，也不使用“全局” `eth0`。平台不依赖且不提供 `libswitchapp.so`。
-   - IPC 报文格式（sidecar↔hsl）：地址头为 `struct sockaddr_vlan`，后随完整以太网帧。
+   - IPC 报文格式（sidecar↔hsl）：地址头为 `struct sockaddr_vlan`，后随协议负载；在 netforward 实际场景中 ARP 报文直接在 `struct sockaddr_vlan` 之后紧跟 ARP 头/体（首字段为 Hardware Type），不携带以太网头。
 
 ```
 struct sockaddr_vlan {
@@ -157,7 +157,7 @@ struct sockaddr_vlan {
    unsigned int port;        /* Outgoing/Incoming interface index */
    unsigned short vlanid;    /* Vlan id */
    unsigned short svlanid;   /* SVlan id */
-   unsigned int length;      /* Length of the Packet */
+   unsigned int length;      /* Total bytes = sizeof(sockaddr_vlan) + payload */
    unsigned short eth_type;  /* Ethernet type */
 };
 
@@ -165,10 +165,10 @@ struct sockaddr_vlan {
 ```
 
     sidecar 仅做透传，不修改报文；适配器负责将 `port`/`vlanid` 整理为平台无关层可用的 VLAN 和整机 ifindex。
-   - 参考收包链路（便于 sidecar 模拟）：参考代码中通过 `message_client` 异步连接 HSL（Unix 域 `HSL_ASYNC_PATH` 或 TCP `HSL_ASYNC_PORT`），epoll 激活后进入“先 peek 头、再按长度读全帧”的流程：先用 `MSG_PEEK` 读取 `struct sockaddr_vlan` 拿到 `length`，再按该长度读完完整报文，拷贝头部后将余下以太帧交给平台解析。sidecar stub 需保持同一封装（头部 + 完整二层帧）以复用解析逻辑。
-   - sidecar 与主进程（netforward 适配器）间的报文透传统一使用 Unix 域可靠流式 IPC，保证头部与帧数据的字节序、完整性与有序性，并与参考代码的 epoll/peek 读法天然对齐；本地同机场景无需退化到 UDP 或无序报文模式。
-   - 单客户端、可重连策略：sidecar 只接受单个客户端连接，循环 accept；客户端断开或写失败即关闭并重新 accept，不做多客户端复用。适配器在读写错误或对端关闭时立即关闭 fd、置 -1，并按短暂退避（100–300ms，上限封顶）重连，RX 线程常驻。协议仍为 `sockaddr_vlan + frame`，此阶段不增加握手，仅依赖连接成功；sidecar 响应 SIGINT/SIGTERM 清理 socket 路径。
-   - sidecar模拟补充：参考代码的收包回调按报文粒度触发，每次 epoll 可读只消费一个完整报文（`struct sockaddr_vlan` 头 + 长度为 `length` 的以太帧），不会合并多帧或拆分半帧；`length` 表示纯以太网帧长度（不含 `struct sockaddr_vlan`），sidecar/hsl 应保证 `length` 与后续帧字节数一致。stub 发送时需先写完整头，再紧跟帧内容，避免出现短读或多帧黏连导致解析偏移。
+   - 参考收包链路（便于 sidecar 模拟）：参考代码中通过 `message_client` 异步连接 HSL（Unix 域 `HSL_ASYNC_PATH` 或 TCP `HSL_ASYNC_PORT`），epoll 激活后进入“先 peek 头、再按长度读负载”的流程：先用 `MSG_PEEK` 读取 `struct sockaddr_vlan` 拿到 `length`（总长度，含头），再按该长度读完报文，将头部与 payload 拆开后交给平台解析。sidecar stub 需保持同一封装（头部 + payload）以复用解析逻辑。
+   - sidecar 与主进程（netforward 适配器）间的报文透传统一使用 Unix 域可靠流式 IPC，保证头部与负载数据的字节序、完整性与有序性，并与参考代码的 epoll/peek 读法天然对齐；本地同机场景无需退化到 UDP 或无序报文模式。
+   - 单客户端、可重连策略：sidecar 只接受单个客户端连接，循环 accept；客户端断开或写失败即关闭并重新 accept，不做多客户端复用。适配器在读写错误或对端关闭时立即关闭 fd、置 -1，并按短暂退避（100–300ms，上限封顶）重连，RX 线程常驻。协议仍为 `sockaddr_vlan + payload`（ARP 负载首字段为 Hardware Type），此阶段不增加握手，仅依赖连接成功；sidecar 响应 SIGINT/SIGTERM 清理 socket 路径。
+   - sidecar模拟补充：参考代码的收包回调按报文粒度触发，每次 epoll 可读只消费一个完整报文（`struct sockaddr_vlan` 头 + 长度为 `length` 的 payload），不会合并多帧或拆分半帧；`length` 表示协议负载长度（例如 ARP 头/体，不含 `struct sockaddr_vlan` 也不含以太网头），sidecar/hsl 应保证 `length` 与后续负载字节数一致。stub 发送时需先写完整头，再紧跟 payload，避免出现短读或多帧黏连导致解析偏移。
    - 运行步骤：sidecar stub 模拟 hsl IPC→适配器解析 VLAN/CPU tag→`register_packet_rx` 驱动终端发现；上行发包沿 VLANIF 直出。
    - 构建提示：直接使用通用 ARM64 交叉工具链（如 `aarch64-linux-gnu-`），无需依赖 `aarch64-none-linux-gnu-`。
 - **北向 API 约束**：

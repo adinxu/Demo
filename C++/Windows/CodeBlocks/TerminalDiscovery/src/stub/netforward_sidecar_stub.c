@@ -56,17 +56,12 @@ static void write_mac(uint8_t mac[ETH_ALEN], uint8_t base, uint8_t step) {
     mac[5] = step;
 }
 
-static size_t build_arp_frame(uint8_t *buf, size_t cap, uint32_t sender_host, uint32_t target_host, bool gratuitous, uint8_t src_mac[ETH_ALEN]) {
-    if (cap < sizeof(struct ethhdr) + sizeof(struct ether_arp)) {
+static size_t build_arp_payload(uint8_t *buf, size_t cap, uint32_t sender_host, uint32_t target_host, bool gratuitous, uint8_t src_mac[ETH_ALEN]) {
+    if (cap < sizeof(struct ether_arp)) {
         return 0;
     }
 
-    struct ethhdr *eth = (struct ethhdr *)buf;
-    memset(eth->h_dest, 0xFF, ETH_ALEN);
-    memcpy(eth->h_source, src_mac, ETH_ALEN);
-    eth->h_proto = htons(ETH_P_ARP);
-
-    struct ether_arp *arp = (struct ether_arp *)(buf + sizeof(struct ethhdr));
+    struct ether_arp *arp = (struct ether_arp *)buf;
     memset(arp, 0, sizeof(*arp));
     arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);
     arp->ea_hdr.ar_pro = htons(ETH_P_IP);
@@ -81,7 +76,7 @@ static size_t build_arp_frame(uint8_t *buf, size_t cap, uint32_t sender_host, ui
     memcpy(&arp->arp_tha, src_mac, ETH_ALEN);
     memcpy(&arp->arp_tpa, gratuitous ? &sender_ip : &target_ip, sizeof(target_ip));
 
-    return sizeof(struct ethhdr) + sizeof(struct ether_arp);
+    return sizeof(struct ether_arp);
 }
 
 static void parse_args(int argc, char **argv, struct stub_opts *opts) {
@@ -149,7 +144,7 @@ int main(int argc, char **argv) {
         return EXIT_SUCCESS;
     }
 
-    uint8_t frame[sizeof(struct ethhdr) + sizeof(struct ether_arp)];
+    uint8_t payload[sizeof(struct ether_arp)];
     uint8_t src_mac[ETH_ALEN];
 
     int to_send = opts.count <= 0 ? 1 : opts.count;
@@ -159,26 +154,26 @@ int main(int argc, char **argv) {
         }
 
         write_mac(src_mac, 0x10, (uint8_t)i);
-        size_t frame_len = build_arp_frame(frame, sizeof(frame), 0x0A000000 | (uint32_t)(10 + i), 0x0A000064, opts.gratuitous, src_mac);
-        if (frame_len == 0) {
-            fprintf(stderr, "failed to build ARP frame\n");
+        size_t payload_len = build_arp_payload(payload, sizeof(payload), 0x0A000000 | (uint32_t)(10 + i), 0x0A000064, opts.gratuitous, src_mac);
+        if (payload_len == 0) {
+            fprintf(stderr, "failed to build ARP payload\n");
             break;
         }
 
         struct sockaddr_vlan header;
         memset(&header, 0, sizeof(header));
-        memcpy(header.dest_mac, frame, ETH_ALEN);
-        memcpy(header.src_mac, frame + ETH_ALEN, ETH_ALEN);
+        memset(header.dest_mac, 0xFF, ETH_ALEN);
+        memcpy(header.src_mac, src_mac, ETH_ALEN);
         header.port = opts.port;
         header.vlanid = opts.vlan;
-        header.length = (uint32_t)frame_len;
+        header.length = (uint32_t)(sizeof(header) + payload_len);
         header.eth_type = ETH_P_ARP;
 
-        uint8_t packet[sizeof(header) + sizeof(frame)];
-        size_t packet_len = sizeof(header) + frame_len;
+        uint8_t packet[sizeof(header) + sizeof(payload)];
+        size_t packet_len = sizeof(header) + payload_len;
 
         memcpy(packet, &header, sizeof(header));
-        memcpy(packet + sizeof(header), frame, frame_len);
+        memcpy(packet + sizeof(header), payload, payload_len);
 
         if (netforward_sidecar_forward(packet, (int)packet_len) != 0) {
             perror("netforward_sidecar_forward");
