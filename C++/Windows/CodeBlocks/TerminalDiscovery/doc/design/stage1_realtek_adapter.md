@@ -62,7 +62,7 @@
 - 适配器调用链在遇到桥接不可达、快照失败或查不到指定 MAC 时不会阻塞收包线程：查询函数仅返回错误码，终端管理器可选择保留 `ifindex=0` 并等待下次成功刷新；`mac_cache_worker` 将自动在后台重试刷新，避免在报文路径等待；点查路径也遵循同样策略，`TD_ADAPTER_ERR_NOT_READY` 直接透传回管理器，由其按需重新排队，`TD_ADAPTER_ERR_NOT_FOUND` 则用于阻止在同一 VLAN 内的重复点查。
 - `src/stub/realtek_mac_stub.c` 为 `td_switch_mac_get_ifindex_by_vid` 提供弱符号桩实现，可通过 `TD_SWITCH_MAC_STUB_LOOKUP` 环境变量控制行为：默认按内建样例匹配 VLAN/MAC，设置为 `hit`/`miss`/具体下标可强制命中或未命中。桩命中时会打印 `[switch-mac-stub] td_switch_mac_get_ifindex_by_vid hit ...` 并写回样例 ifindex，未命中返回 `-ENOENT`，便于在 x86 环境验证终端管理器的点查与回退路径。
 ## 配置与日志
-- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口 `eth0`、ARP 节流间隔 100 ms、日志级别 INFO。
+- `td_config_load_defaults` 输出统一默认配置：适配器名取自编译期宏 `TD_DEFAULT_ADAPTER`（由各平台 makefile 通过 `-DTD_DEFAULT_ADAPTER="<name>"` 注入，Realtek 构建默认值为 `realtek`），收包口 `eth0`、发包口 `eth0`、ARP 节流间隔 100 ms、日志级别 INFO。
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
 
 ## 构建产物

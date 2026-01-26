@@ -782,7 +782,7 @@ static void print_usage(FILE *stream) {
     fprintf(stream,
             "Usage: %s [options]\n"
             "Options:\n"
-            "  --adapter NAME            Adapter name (default: realtek)\n"
+            "  --adapter NAME            Adapter name (default: " TD_DEFAULT_ADAPTER ")\n"
             "  --rx-iface NAME           Interface to capture ARP (default: eth0)\n"
             "  --tx-iface NAME           Interface to transmit ARP (default: eth0)\n"
             "  --tx-interval MS          Minimum milliseconds between probes (default: 100)\n"
