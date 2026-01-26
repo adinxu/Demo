@@ -5,12 +5,12 @@
 - 说明在核心终端引擎落地前，如何完成入方向 ARP 抓取与出方向保活探测。
 
 ## 主要模块
-- `src/include/adapter_api.h`：定义 `td_adapter_ops` 与 `td_adapter_mac_locator_ops` 以及报文视图、接口信息、计时器、ARP 发送请求等数据结构，是引擎与适配器之间的 ABI；`td_adapter_mac_locator_ops` 新增 `lookup_by_vid` 指针，用于承载 VLAN 点查接口。
+- `td_commonlib/include/adapter_api.h`：定义 `td_adapter_ops` 与 `td_adapter_mac_locator_ops` 以及报文视图、接口信息、计时器、ARP 发送请求等数据结构，是引擎与适配器之间的 ABI；`td_adapter_mac_locator_ops` 新增 `lookup_by_vid` 指针，用于承载 VLAN 点查接口。
 - `src/adapter/adapter_registry.c`：延迟注册内置适配器并按名称解析，目前仅暴露 Realtek 描述符。
 - `src/adapter/realtek_adapter.c/.h`：阶段 1 的 Realtek 实现，负责原始套接字生命周期、收包回调、ARP 发送与日志透传。
-- `src/include/td_logging.h` + `src/common/td_logging.c`：进程内轻量日志器，可配置日志级别与输出函数。
-- `src/include/td_config.h` + `src/common/td_config.c`：提供统一默认配置装载器，方便核心模块在引入配置文件前使用既定的适配器/RX/TX/节流/日志默认值。
-- `src/Makefile`：生成可执行程序 `terminal_discovery` 及测试二进制（`terminal_discovery_tests`、`terminal_integration_tests`、`td_switch_mac_stub_tests`），并提供 `cross`/`cross-generic` 目标快速验证交叉编译链路。
+- `td_commonlib/include/td_logging.h` + `td_commonlib/src/td_logging.c`：进程内轻量日志器，可配置日志级别与输出函数。
+- `td_commonlib/include/td_config.h` + `td_commonlib/src/td_config.c`：提供统一默认配置装载器，方便核心模块在引入配置文件前使用既定的适配器/RX/TX/节流/日志默认值。
+- `build/realtek/Makefile`：调用 `build/common` 生成 `libtd_common.a` 后，构建可执行程序 `terminal_discovery` 及测试二进制（`terminal_discovery_tests`、`terminal_integration_tests`、`realtek_mac_stub_tests`、`terminal_embedded_init_tests`），并提供 `cross`/`cross-generic` 目标快速验证交叉编译链路。
 
 ## 关键数据结构
 - `struct td_adapter_ops`：适配器必须实现的函数表（`init/start/stop`、收包注册、`send_arp`、接口查询、计时器、日志桥接等）。
@@ -66,8 +66,8 @@
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
 
 ## 构建产物
-- `src/Makefile` 默认构建可执行文件 `terminal_discovery` 以及测试二进制 `terminal_discovery_tests`、`terminal_integration_tests`、`realtek_mac_stub_tests`。`make` 使用本地工具链直接产出这些目标；`make test` 会依次运行三组测试。
-- 通过 `make cross` 可指定 `mips-rtl83xx-linux-` 前缀完成 Realtek 平台交叉编译，`make cross-generic` 使用 `mips-linux-gnu-` 前缀进行通用 MIPS 交叉验证。
+- `build/realtek/Makefile` 默认先调用 `build/common` 产出 `libtd_common.a`，再构建可执行文件 `terminal_discovery` 以及测试二进制 `terminal_discovery_tests`、`terminal_integration_tests`、`realtek_mac_stub_tests`、`terminal_embedded_init_tests`。在 `build/realtek` 目录下执行 `make` 构建主程序，`make test` 会依次运行四组测试。
+- 在 `build/realtek` 目录下通过 `make cross` 可指定 `mips-rtl83xx-linux-` 前缀完成 Realtek 平台交叉编译，`make cross-generic` 使用 `mips-linux-gnu-` 前缀进行通用 MIPS 交叉验证。
 
 ## 集成建议
 - 阶段 2/3 代码应：

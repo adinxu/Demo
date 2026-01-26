@@ -4,7 +4,7 @@
 
 ## API 概览
 
-- 头文件：`src/include/terminal_discovery_embed.h`
+- 头文件：`td_commonlib/include/terminal_discovery_embed.h`
 - 初始化入口：`int terminal_discovery_initialize(const struct terminal_discovery_init_params *params);`
 - 只读 accessor：
   - `struct terminal_manager *terminal_discovery_get_manager(void);`

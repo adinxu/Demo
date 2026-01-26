@@ -103,5 +103,5 @@ mac_locator version=42 subscribed=1 last_refresh_ms=500
 - `tests/terminal_integration_tests.cpp`：通过 `TerminalDebugSnapshot` 校验 C++ 包装行为，覆盖警告日志与部分文本返回逻辑。
 
 ## 集成要点
-- C 端 API 暴露于 `src/include/terminal_manager.h`，北向包装位于 `src/common/terminal_northbound.cpp` 与 `src/include/terminal_discovery_api.hpp`。
+- C 端 API 暴露于 `td_commonlib/include/terminal_manager.h`，北向包装位于 `td_commonlib/src/terminal_northbound.cpp` 与 `td_commonlib/include/terminal_discovery_api.hpp`。
 - 文档与示例输出为验收提供统一参考，便于运维比对实际日志；上线前建议脚本化保存 `terminal_table` 与 `mac_lookup_queue` 输出以追踪趋势。

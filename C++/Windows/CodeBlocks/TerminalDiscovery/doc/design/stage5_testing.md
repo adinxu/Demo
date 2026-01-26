@@ -10,7 +10,8 @@
 | --- | --- | --- |
 | `terminal_discovery_tests` | `tests/terminal_manager_tests.c` | C 侧单元测试（状态机、事件、日志） |
 | `terminal_integration_tests` | `tests/terminal_integration_tests.cpp` | C++ 北向 ABI、增量/全量接口、统计口径 |
-| `td_switch_mac_stub_tests` | `tests/td_switch_mac_stub_tests.c` | 桩实现的容量/快照与参数校验 |
+| `realtek_mac_stub_tests` | `tests/realtek_mac_stub_tests.c` | Realtek MAC 桥接桩的容量/快照/参数校验 |
+| `terminal_embedded_init_tests` | `tests/terminal_embedded_init_tests.c` | 嵌入式入口初始化/清理流程（适配器注册表、netlink、北向回调桩） |
 
 ## 单元测试：`terminal_discovery_tests`
 
@@ -33,7 +34,7 @@
 
 测试过程同样关闭日志噪声，并通过全局捕获器记录增量批次；最终输出 `integration tests passed/failed` 便于自动化脚本判定结果。
 
-## 桩验证：`td_switch_mac_stub_tests`
+## 桩验证：`realtek_mac_stub_tests`
 
 - `test_invalid_arguments`：传入空指针，确认桩实现返回 `-EINVAL`。
 - `test_get_capacity`：校验容量查询返回值 ≥1。
@@ -42,14 +43,19 @@
 
 这些测试确保弱符号桩满足适配器预期：调用方需先通过 `get_capacity` 预分配缓冲区，`snapshot` 使用输出参数回传实际条目数。
 
+## 嵌入式初始化：`terminal_embedded_init_tests`
+
+- 验证 `terminal_discovery_initialize/cleanup` 在适配器初始化失败、管理器创建失败、netlink 启动失败、北向封装失败等场景下的清理路径（停止适配器、销毁管理器、重置事件 sink、刷新计数器）。
+- 覆盖成功路径下的单例访问器与事件回调注册，确认初始化后 `terminal_discovery_get_manager()`/`terminal_discovery_get_app_context()` 可用，清理后被复位。
+
 ## 运行方式
 
 ```sh
-cd src
+cd build/realtek
 make test
 ```
 
-命令会顺序执行三组测试；如任一失败，将直接以非零退出码告知调用方。`make clean` 可清理生成的目标文件与测试二进制。
+命令会顺序执行四组测试；如任一失败，将直接以非零退出码告知调用方。`make clean` 可清理生成的目标文件与测试二进制。
 
 ## 后续工作
 

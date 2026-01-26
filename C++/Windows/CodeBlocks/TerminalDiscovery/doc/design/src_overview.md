@@ -108,7 +108,7 @@ flowchart TD
   end
 
   subgraph PlatformInclude["include/"]
-    RTLH["realtek/td_switch_mac_bridge.h"]
+    RTLH["realtek_mac_bridge.h"]
   end
 
   subgraph Sidecar["sidecar/"]
@@ -116,7 +116,7 @@ flowchart TD
   end
 
   subgraph Stub["stub/"]
-    MACStub["td_switch_mac_stub"]
+    MACStub["realtek_mac_stub"]
     NFStub["netforward_sidecar_stub"]
   end
 
@@ -157,7 +157,7 @@ flowchart TD
   TiIT --> MACStub
 ```
 
-上述组件关系对应 `terminal_main.c` 的初始化流程：主程序拉起配置与日志组件、从 `adapter_registry` 解析适配器、构造 `terminal_manager` 并串联 netlink 监听与北向回调。`include/` 提供各层共享 API，`stub/` 的 `td_switch_mac_stub` 通过同一接口模拟 MAC 桥接，`tests/` 下的单元/集成测试既验证管理器行为，也验证北向回调与 MAC stub 的协同。
+上述组件关系对应 `terminal_main.c` 的初始化流程：主程序拉起配置与日志组件、从 `adapter_registry` 解析适配器、构造 `terminal_manager` 并串联 netlink 监听与北向回调。`include/` 提供各层共享 API，`stub/` 的 `realtek_mac_stub` 通过同一接口模拟 MAC 桥接，`tests/` 下的单元/集成测试既验证管理器行为，也验证北向回调与 MAC stub 的协同。
 
 ### 1. 日志子系统 `td_commonlib/td_logging`
 - 提供线程安全的日志级别、输出接口（`td_log_writef`）。

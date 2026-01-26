@@ -4,7 +4,7 @@
 - **目标**：依据 `specs/2025-10-31-terminal-discovery.md` 中的最新需求与约束，构建可跨平台移植的终端发现代理，首期聚焦 Realtek 平台，并确保与外部 C++ 北向接口的 ABI 兼容，同时提供面向调试与验收的只读导出接口，能实时输出终端哈希桶、接口前缀/绑定表、MAC 查表队列及相关计数器。
 - **交付/构建模式**：遵循规范新增要求，`td_commonlib/src`、`td_commonlib/include` 等平台无关代码编译为静态库供各平台复用；平台相关适配器（如 Realtek、Netforward、Linux raw socket）由各平台工程单独编译、链接，运行期不做动态选择。分拆时优先确保 Realtek 现网编译链畅通，控制迁移成本。
 - **关联规范**：`specs/2025-10-31-terminal-discovery.md`
-- **平台文件命名与目录**：平台相关源/头（含 demo、stub、测试、桥接等）必须以平台名前缀命名（如 `realtek_*.c/.h`）；命名合规后可与其他平台文件共存于同一目录（如 `src/adapter/` 同时存放 `realtek_*` 与 `netforward_*`），无需额外子目录区分；`src/include/` 仍按命名空间子目录存放平台专属头。
+- **平台文件命名与目录**：平台相关源/头（含 demo、stub、测试、桥接等）必须以平台名前缀命名（如 `realtek_*.c/.h`）；命名合规后可与其他平台文件共存于同一目录（如 `src/adapter/` 同时存放 `realtek_*` 与 `netforward_*`），无需额外子目录区分；
 
 ## 假设与非目标
 - Realtek 平台具备 Raw Socket 能力并允许在物理口（如 `eth0`）直接封装 802.1Q VLAN tag 发包；若目标环境禁止用户态插入 VLAN tag，再回退到绑定 VLAN 虚接口（如 `vlan1`）。推荐交叉编译前缀为 `mips-rtl83xx-linux-`（如 `mips-rtl83xx-linux-gcc`）；若该工具链暂不可用，可使用通用 MIPS 交叉工具链验证代码可编译性。
