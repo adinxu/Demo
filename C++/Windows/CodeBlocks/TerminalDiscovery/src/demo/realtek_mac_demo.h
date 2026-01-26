@@ -1,5 +1,5 @@
-#ifndef TD_SWITCH_MAC_DEMO_H
-#define TD_SWITCH_MAC_DEMO_H
+#ifndef REALTEK_MAC_DEMO_H
+#define REALTEK_MAC_DEMO_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,4 +11,4 @@ int td_switch_mac_demo_dump(void);
 }
 #endif
 
-#endif /* TD_SWITCH_MAC_DEMO_H */
+#endif /* REALTEK_MAC_DEMO_H */
