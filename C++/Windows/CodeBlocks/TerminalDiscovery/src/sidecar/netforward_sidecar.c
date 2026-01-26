@@ -1,6 +1,7 @@
 #include "netforward_sidecar.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -10,6 +11,17 @@
 static int g_listen_fd = -1;
 static int g_conn_fd = -1;
 static char g_socket_path[108];
+
+static const char *resolve_socket_path(char buf[108]) {
+    const char *env_path = getenv("TD_NETFORWARD_SIDECAR_SOCK");
+    const char *path = (env_path && env_path[0]) ? env_path : TD_NETFORWARD_DEFAULT_SOCKET;
+    size_t len = strlen(path);
+    if (len >= 108) {
+        return NULL;
+    }
+    memcpy(buf, path, len + 1);
+    return buf;
+}
 
 static int write_full(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
@@ -70,15 +82,15 @@ static int accept_client(void) {
     }
 }
 
-int netforward_sidecar_start(const char *socket_path) {
-    const char *path = socket_path && socket_path[0] ? socket_path : TD_NETFORWARD_DEFAULT_SOCKET;
+int netforward_sidecar_start(void) {
+    const char *path = resolve_socket_path(g_socket_path);
+    if (!path) {
+        return -1;
+    }
 
     if (g_conn_fd != -1 || g_listen_fd != -1) {
         netforward_sidecar_stop();
     }
-
-    memset(g_socket_path, 0, sizeof(g_socket_path));
-    snprintf(g_socket_path, sizeof(g_socket_path), "%s", path);
 
     g_listen_fd = setup_listener(g_socket_path);
     if (g_listen_fd < 0) {

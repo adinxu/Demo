@@ -31,7 +31,6 @@ struct sockaddr_vlan {
 };
 
 struct stub_opts {
-    char socket_path[108];
     uint32_t port;
     uint16_t vlan;
     int count;
@@ -84,7 +83,6 @@ static void parse_args(int argc, char **argv, struct stub_opts *opts) {
         return;
     }
     memset(opts, 0, sizeof(*opts));
-    snprintf(opts->socket_path, sizeof(opts->socket_path), "%s", TD_NETFORWARD_DEFAULT_SOCKET);
     opts->port = 3;
     opts->vlan = 1;
     opts->count = 10;
@@ -93,9 +91,7 @@ static void parse_args(int argc, char **argv, struct stub_opts *opts) {
     opts->idle = false;
 
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
-            snprintf(opts->socket_path, sizeof(opts->socket_path), "%s", argv[++i]);
-        } else if (strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
             opts->count = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--interval-ms") == 0 && i + 1 < argc) {
             opts->interval_ms = atoi(argv[++i]);
@@ -115,16 +111,10 @@ int main(int argc, char **argv) {
     struct stub_opts opts;
     parse_args(argc, argv, &opts);
 
-    const char *env_sock = getenv("TD_NETFORWARD_SIDECAR_SOCK");
-    if (env_sock && env_sock[0]) {
-        snprintf(opts.socket_path, sizeof(opts.socket_path), "%s", env_sock);
-    }
-
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    printf("[netforward-sidecar-stub] listening on %s vlan=%u ifindex=%u count=%d interval_ms=%d gratuitous=%d idle=%d\n",
-           opts.socket_path,
+    printf("[netforward-sidecar-stub] listening (path=auto env TD_NETFORWARD_SIDECAR_SOCK or default) vlan=%u ifindex=%u count=%d interval_ms=%d gratuitous=%d idle=%d\n",
            opts.vlan,
            opts.port,
            opts.count,
@@ -133,7 +123,7 @@ int main(int argc, char **argv) {
            opts.idle ? 1 : 0);
     fflush(stdout);
 
-    if (netforward_sidecar_start(opts.socket_path) != 0) {
+    if (netforward_sidecar_start() != 0) {
         perror("netforward_sidecar_start");
         return EXIT_FAILURE;
     }
