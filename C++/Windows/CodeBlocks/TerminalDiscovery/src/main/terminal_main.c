@@ -793,7 +793,7 @@ static void print_usage(FILE *stream) {
             "  --max-terminals COUNT     Maximum tracked terminals (default: 1000)\n"
             "  --ignore-vlan VID         Ignore ARP seen on VLAN VID (repeatable)\n"
             "  --stats-interval SEC      Stats log interval seconds, 0 disables (default: 0)\n"
-            "  --vlan-iface-format STR   VLAN L3 iface name format with %u placeholder (default: vlan%u)\n"
+            "  --vlan-iface-format STR   VLAN L3 iface name format with %%u placeholder (default: vlan%%u)\n"
             "  --log-level LEVEL         Log level trace|debug|info|warn|error|none (default: info)\n"
             "  --help                    Show this help message\n",
             g_program_name);
