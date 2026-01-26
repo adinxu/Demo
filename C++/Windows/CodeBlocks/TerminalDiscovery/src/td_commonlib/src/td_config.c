@@ -33,7 +33,7 @@ int td_config_load_defaults(struct td_runtime_config *cfg) {
     cfg->max_terminals = TD_DEFAULT_MAX_TERMINALS;
     cfg->stats_log_interval_sec = TD_DEFAULT_STATS_LOG_INTERVAL_SEC;
     cfg->log_level = TD_LOG_INFO;
-    cfg->vlan_iface_format[0] = '\0';
+    cfg->vlan_iface_format = NULL;
 
     return 0;
 }
@@ -49,7 +49,7 @@ int td_config_to_manager_config(const struct td_runtime_config *runtime,
     out->keepalive_miss_threshold = runtime->keepalive_miss_threshold;
     out->iface_invalid_holdoff_sec = runtime->iface_invalid_holdoff_sec;
     out->scan_interval_ms = runtime->scan_interval_ms;
-    out->vlan_iface_format = runtime->vlan_iface_format[0] ? runtime->vlan_iface_format : NULL;
+    out->vlan_iface_format = runtime->vlan_iface_format;
     out->max_terminals = runtime->max_terminals;
 
     if (runtime->ignored_vlan_count > TD_MAX_IGNORED_VLANS) {
