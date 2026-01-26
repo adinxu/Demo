@@ -6,10 +6,10 @@
 - 补充本阶段的验证动作，方便后续阶段在同一基线上继续扩展。
 
 ## 运行时配置桥接
-- `td_runtime_config` 新增 `keepalive_interval_sec`、`keepalive_miss_threshold`、`iface_invalid_holdoff_sec`、`max_terminals`、`stats_log_interval_sec` 与 `log_level` 字段，`td_config_load_defaults` 输出 Realtek Demo 默认值（120s/3 次/1800s/1000/0s/INFO）。
+- `td_runtime_config` 新增 `keepalive_interval_sec`、`keepalive_miss_threshold`、`iface_invalid_holdoff_sec`、`max_terminals`、`stats_log_interval_sec`、`scan_interval_ms`、`vlan_iface_format` 与 `log_level` 字段，`td_config_load_defaults` 输出 Realtek Demo 默认值（120s/3 次/1800s/1000ms/1000/`vlan%u`/INFO，其中 `vlan_iface_format` 留空以沿用管理器默认）。
 - `stats_log_interval_sec` 支持通过 `--stats-interval` CLI 参数动态调整，默认 `0`（仅按需打印），可设置为 >0 启用周期性统计日志。
 - `td_config_to_manager_config` 负责将上述字段映射到 `terminal_manager_config`，缺省值依旧在 `terminal_manager_create` 内兜底，避免旧调用栈遗漏配置时出现 0 值。
-- 当前仍沿用 `scan_interval_ms` 默认值，后续若需要从配置文件调优扫描节奏，仅需在 `td_runtime_config` 补充同名字段并透传即可。
+- `scan_interval_ms` 与 `vlan_iface_format` 现已对应 CLI 参数 `--scan-interval` 与 `--vlan-iface-format`：前者控制后台扫描周期（毫秒，默认为 1000），后者指定按 VLAN ID 生成 L3 虚接口名的格式串（保留 `%u` 占位，缺省由管理器回落到 `vlan%u`）。
 - `terminal_main` 在加载完配置后会按 CLI 参数更新 `runtime_cfg`，并把 `stats_log_interval_sec` 传入主循环；循环内部跟踪 `stats_elapsed_sec`，只要到达阈值或收到信号触发都会调用 `terminal_manager_log_stats`。
 
 ## 日志强化
