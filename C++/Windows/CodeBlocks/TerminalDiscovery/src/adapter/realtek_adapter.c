@@ -28,7 +28,7 @@
 
 #include "td_logging.h"
 #include "td_time_utils.h"
-#include "td_switch_mac_bridge.h"
+#include "realtek_mac_bridge.h"
 
 #ifndef TD_REALTEK_RX_BUFFER_SIZE
 #define TD_REALTEK_RX_BUFFER_SIZE 2048

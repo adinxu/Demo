@@ -2,7 +2,7 @@
 
 ROOT := $(abspath ../..)
 SRC_DIR := $(ROOT)/src
-REALTEK_INC_DIR := $(SRC_DIR)/include/realtek
+REALTEK_INC_DIR := $(SRC_DIR)/include
 COMMON_INC_DIR := $(ROOT)/src/td_commonlib/include
 OUT_DIR := $(ROOT)/out/realtek
 OBJ_DIR := $(OUT_DIR)/obj
@@ -28,7 +28,7 @@ COMMON_LIB := $(ROOT)/out/common/lib/libtd_common.a
 ADAPTER_SRCS := \
 	adapter/adapter_registry.c \
 	adapter/realtek_adapter.c \
-	stub/td_switch_mac_stub.c
+	stub/realtek_mac_stub.c
 ADAPTER_OBJS := $(ADAPTER_SRCS:%.c=$(OBJ_DIR)/%.o)
 
 APP_SRCS := main/terminal_main.c
@@ -37,12 +37,12 @@ APP_OBJS := $(APP_SRCS:%.c=$(OBJ_DIR)/%.o)
 TEST_TARGETS := \
 	$(TEST_DIR)/terminal_discovery_tests \
 	$(TEST_DIR)/terminal_integration_tests \
-	$(TEST_DIR)/td_switch_mac_stub_tests \
+	$(TEST_DIR)/realtek_mac_stub_tests \
 	$(TEST_DIR)/terminal_embedded_init_tests
 
 TEST_C_SRCS := \
 	tests/terminal_manager_tests.c \
-	tests/td_switch_mac_stub_tests.c \
+	tests/realtek_mac_stub_tests.c \
 	tests/terminal_embedded_init_tests.c \
 	main/terminal_main.c \
 	td_commonlib/src/td_config.c \
@@ -70,7 +70,8 @@ $(TEST_DIR)/terminal_discovery_tests: $(OBJ_DIR)/tests/terminal_manager_tests.o 
 $(TEST_DIR)/terminal_integration_tests: $(OBJ_DIR)/tests/terminal_integration_tests.o $(COMMON_LIB) | $(TEST_DIR)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(TEST_DIR)/td_switch_mac_stub_tests: $(OBJ_DIR)/tests/td_switch_mac_stub_tests.o $(OBJ_DIR)/stub/td_switch_mac_stub.o | $(TEST_DIR)
+
+$(TEST_DIR)/realtek_mac_stub_tests: $(OBJ_DIR)/tests/realtek_mac_stub_tests.o $(OBJ_DIR)/stub/realtek_mac_stub.o | $(TEST_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(TEST_DIR)/terminal_embedded_init_tests: $(OBJ_DIR)/tests/terminal_embedded_init_tests.o $(OBJ_DIR)/tests/terminal_main_for_tests.o $(OBJ_DIR)/td_commonlib/src/td_config.o $(OBJ_DIR)/td_commonlib/src/td_logging.o | $(TEST_DIR)
@@ -109,5 +110,5 @@ cross-test:
 test: $(TEST_TARGETS)
 	$(TEST_DIR)/terminal_discovery_tests
 	$(TEST_DIR)/terminal_integration_tests
-	$(TEST_DIR)/td_switch_mac_stub_tests
+	$(TEST_DIR)/realtek_mac_stub_tests
 	$(TEST_DIR)/terminal_embedded_init_tests

@@ -164,7 +164,7 @@
 7. ✅ sidecar 代码拆分与复用：新增 `src/sidecar/` 目录，创建可复用的 Unix Socket 服务端源文件，从 `src/stub/netforward_sidecar_stub.c` 剪切共享逻辑，并导出 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf`= `sockaddr_vlan` + payload，现网 ARP 负载紧随其后且首字段为 Hardware Type，`len` 为总长度）；保持 stub 版本仅承担 `main`、参数解析、hsl 收包模拟与信号处理，重用共享实现完成透传。
 8. ✅ 单客户端可重连策略落地：sidecar 持续 accept，单连接断开后关闭并重新 accept；适配器在读写错误或对端关闭时关闭 fd、置 -1，并按短退避重连，RX 线程常驻；协议保持 `sockaddr_vlan + payload`，不引入握手。
 9. ✅ sidecar 构建与测试：补全 netforward sidecar makefile（纳入共享实现），修复 stub 依赖并通过 `make netforward-sidecar` 与 `make netforward-test` 本地编译/测试。
-10. ✅ 头文件分层落地：平台无关头全部放在 `src/td_commonlib/include/` 随公共静态库交付；`src/include/` 仅保留平台专属命名空间头（例如 `src/include/realtek/td_switch_mac_bridge.h`），对应平台 makefile 定向 `-I`；netforward sidecar 头（如 `netforward_sidecar.h`）放在 `src/sidecar/`，仅在 netforward 构建包含。
+10. ✅ 头文件分层落地：平台无关头全部放在 `src/td_commonlib/include/` 随公共静态库交付；平台专属头直接放在 `src/include/`（例如 `src/include/realtek_mac_bridge.h`），对应平台 makefile 定向 `-I`；netforward sidecar 头（如 `netforward_sidecar.h`）放在 `src/sidecar/`，仅在 netforward 构建包含。
 11. ✅ 公共静态库独立化：将平台无关源码/头文件放入独立目录并编写独立 makefile，可单独（仓库/SVN）构建产出静态库；Realtek/Netforward 平台的 makefile 通过调用该公共 makefile 获取产物后再链接平台代码，保持物理与编译解耦。
 
 ## 依赖与风险

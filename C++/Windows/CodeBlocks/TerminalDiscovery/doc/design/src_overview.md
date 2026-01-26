@@ -13,15 +13,15 @@ src/
  ├── td_commonlib/
  │   ├── include/            # 平台无关公共头（对外暴露，供 libtd_common.a 与平台复用）
  │   └── src/                # 平台无关公共源码（td_logging/td_config/terminal_manager/terminal_netlink/terminal_northbound）
- ├── include/
- │   └── realtek/            # 平台命名空间专属头，如 td_switch_mac_bridge.h
+├── include/
+│   └── realtek_mac_bridge.h # Realtek 平台专属桥接头
  ├── sidecar/
  │   └── netforward_sidecar.c/.h （共享 sidecar 逻辑，供 netforward/stub 复用）
  ├── main/
  │   └── terminal_main.c
- ├── stub/
- │   ├── td_switch_mac_stub.c/.h
- │   └── netforward_sidecar_stub.c
+├── stub/
+│   ├── realtek_mac_stub.c/.h
+│   └── netforward_sidecar_stub.c
  ├── tests/
  │   ├── terminal_manager_tests.c
  │   ├── terminal_integration_tests.cpp
@@ -34,7 +34,7 @@ src/
 
 - `adapter/` 集中适配层实现，当前涵盖 `realtek_adapter` 与 `netforward_adapter`；适配器代码在各平台工程内以对象形式链接，不再打包为独立静态库。
 - `td_commonlib/` 承载跨平台公共逻辑（终端管理器、配置、日志、netlink、北向桥接）与平台无关头文件，统一产出 `libtd_common.a` 供各平台复用。
-- `include/` 仅存放平台命名空间专属头（如 `include/realtek/td_switch_mac_bridge.h`）；公共头已搬迁至 `td_commonlib/include/` 并随静态库交付。
+- `include/` 仅存放平台专属头（如 `include/realtek_mac_bridge.h`）；公共头已搬迁至 `td_commonlib/include/` 并随静态库交付。
 - `sidecar/` 放置可复用的 netforward sidecar 服务端逻辑；stub 版在 `stub/` 内包含 `main` 入口。
 - `main/` 暴露 CLI/嵌入式入口与只读 accessor。
 - `stub/` 提供 MAC 桥接与 sidecar 等模拟组件，服务单元/集成测试与无硬件环境。
@@ -45,7 +45,7 @@ src/
 ### 构建形式
 
 - 公共跨平台代码（`td_commonlib/src` + `td_commonlib/include` + 公共对外头）由独立的 `build/common/Makefile` 产出静态库 `libtd_common.a`（输出至 `out/common/lib/`）；平台 makefile 仅调用该公共 makefile，不再重复列出公共源码。
-- 平台适配器以对象文件直接链接：Realtek/Netforward 主进程从各自 `adapter/*.o`（及 Realtek 桥接头 `include/realtek/`）、必要的 stub/sidecar 对象取用，不生成适配器静态库。
+- 平台适配器以对象文件直接链接：Realtek/Netforward 主进程从各自 `adapter/*.o`（及 Realtek 桥接头 `include/realtek_mac_bridge.h`）、必要的 stub/sidecar 对象取用，不生成适配器静态库。
 - 典型命令：
   - `make realtek-test` / `make netforward-test`：x86 本地构建并运行平台对应的单元/集成/嵌入初始化测试；构建过程中会先调用 `build/common` 生成 `libtd_common.a`。
   - `make netforward-sidecar`：构建 netforward sidecar（或 stub），产出独立二进制。
@@ -61,7 +61,7 @@ src/
 - 引入新平台时，新建 `adapter/<platform>.*`，在对应平台 makefile 中列入白名单编译并与 `libtd_common.a` 链接；运行期不支持动态选择，构建期必须唯一确定适配器。
 
 2) 链接顺序与裁剪
-- 平台 makefile 先调用 `build/common` 生成 `libtd_common.a`，再链接平台适配器对象；如需替换默认 MAC 桥接 stub（`stub/td_switch_mac_stub.o`），在链接命令中将真实 SDK/桥接对象置于 stub 之前或直接移除 stub 对象。
+- 平台 makefile 先调用 `build/common` 生成 `libtd_common.a`，再链接平台适配器对象；如需替换默认 MAC 桥接 stub（`stub/realtek_mac_stub.o`），在链接命令中将真实 SDK/桥接对象置于 stub 之前或直接移除 stub 对象。
 - 嵌入式或最小化场景可剔除 demo/ref 目录，不影响静态库与适配器/sidecar 编译。
 
 3) 工具链与目标
@@ -75,14 +75,14 @@ src/
 - 运行时参数（接口名、发包节流、VLAN 过滤等）只作用于已编译进二进制的适配器，配置文件/CLI 不提供跨平台切换。
 
 - 在 `adapter/<platform>.c/.h` 定义 `td_adapter_descriptor`，完整实现 `td_adapter_ops` 的 `init/start/stop/shutdown/register_packet_rx/send_arp`，确保报文订阅与发送路径均可用。
-- 若平台支持桥表查询，补齐 `td_adapter_mac_locator_ops`（`lookup`/`subscribe`/`get_version`）；若暂不支持，可先不实现该结构体，必要时仅保留 `stub/td_switch_mac_stub` 作为链接占位。
+- 若平台支持桥表查询，补齐 `td_adapter_mac_locator_ops`（`lookup`/`subscribe`/`get_version`）；若暂不支持，可先不实现该结构体，必要时仅保留 `stub/realtek_mac_stub` 作为链接占位。
 - Netforward 如需 sidecar，复用 `sidecar/` 共享逻辑并在 `stub/netforward_sidecar_stub.c` 提供独立进程入口。
 - RX 路径需将 VLAN、ifindex、源 MAC/IP 封装为 `td_adapter_packet_view` 再调用订阅回调；TX 路径需按照请求中的 VLAN 与回退接口信息填充并发送 ARP。
 - 在 `adapter_registry.c` 注册新描述符，并在平台侧构建脚本中将新适配器对象与 `libtd_common.a` 一起链接。
 
 6) 无桥表场景的默认行为
 - 若 `td_adapter_mac_locator_ops` 为空，管理器会跳过 MAC 点查与刷新订阅逻辑，保持 `meta.ifindex` 为空，仅依赖报文路径的 VLAN/接口绑定信息驱动状态机；事件仍可由报文触发，但不会产生基于桥表的漂移校验。
-- 可选方案：直接不暴露 `mac_locator_ops`，或在内部返回通用错误码以示不支持；此时可保留或替换 `stub/td_switch_mac_stub` 以满足链接。若想用 stub 提供“假桥表”能力，需要在适配层自行封装 `mac_locator_ops` 并转调 stub；否则 stub 仅作为占位，不会被管理器调用。
+- 可选方案：直接不暴露 `mac_locator_ops`，或在内部返回通用错误码以示不支持；此时可保留或替换 `stub/realtek_mac_stub` 以满足链接。若想用 stub 提供“假桥表”能力，需要在适配层自行封装 `mac_locator_ops` 并转调 stub；否则 stub 仅作为占位，不会被管理器调用。
 
 ### 架构视图（模块/组件层）
 
