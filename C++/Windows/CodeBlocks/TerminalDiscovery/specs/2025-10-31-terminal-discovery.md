@@ -20,7 +20,7 @@
 - 公共静态库独立仓/目录：平台无关静态库源码与头文件需放在独立目录并具备独立 makefile（可单独 SVN/仓库存放和编译），Realtek/Netforward 等平台的 makefile 通过调用该公共 makefile 获取产物后再链接平台代码，保持公共库与平台工程的物理与编译解耦。
 - 运行时配置仅覆盖当前已编译进进程的适配器参数（接口名、发包节流、VLAN 过滤等），无法通过配置启用其他平台适配器。
 - `src/` 目录物理分离平台无关/有关代码：公共代码编译成静态库，平台代码在各自工程内编译并与静态库解耦，便于增量集成新平台。
-- 头文件分层：平台无关头全部位于 `src/td_commonlib/include/` 并随 `libtd_common.a` 交付；`src/include/` 仅存放平台专属头且按命名空间分层（如 `src/include/realtek/td_switch_mac_bridge.h`），由对应平台 makefile 定向 `-I`。公共静态库不得依赖 `src/include/` 根目录；netforward sidecar 头（如 `netforward_sidecar.h`）仍放在 `src/sidecar/` 并仅在 netforward 构建包含。
+- 头文件分层：平台无关头全部位于 `src/td_commonlib/include/` 并随 `libtd_common.a` 交付；`src/include/` 仅存放平台专属头且按命名空间分层（如 `src/include/realtek/td_switch_mac_bridge.h`），由对应平台 makefile 定向 `-I`。公共静态库不得依赖 `src/include/` 根目录；netforward sidecar 头（如 `netforward_sidecar.h`）仍放在 `src/sidecar/` 并仅在 netforward 构建包含。平台文件命名：所有平台相关的源/头文件（含 demo、stub、测试、桥接等）必须以平台名称为前缀进行命名（例如 Realtek 平台使用 `realtek_*.c/.h`），避免与平台无关文件混淆；已存在未加前缀的历史文件需在重构时统一更名。命名合规后，平台文件可以与其他平台文件共存于同一目录（例如 `src/adapter/` 中同时存在 `realtek_adapter.c`、`netforward_adapter.c`），无需再通过额外子文件夹区分。
 - Realtek 先行落地：优先打通静态库与 Realtek 适配层的编译链，保持现有编译选项与桥接依赖可用，再渐进推广到其他平台，避免一次性拆分阻断现网集成。
  - 构建与测试布局：
    - 顶层 Makefile 仅作分发器，提供 `make realtek`、`make netforward`、`make linux` 等对等命名的入口跳转至对应子目录，不再用单一 Makefile 携带全部平台规则；各平台目标命名需对等、对齐，避免出现默认/主平台的特殊命名（如 `all` 只代表某一平台）。
