@@ -782,16 +782,18 @@ static void print_usage(FILE *stream) {
     fprintf(stream,
             "Usage: %s [options]\n"
             "Options:\n"
-            "  --adapter NAME            Adapter name (default: realtek)\n"
+            "  --adapter NAME            Adapter name (default: " TD_DEFAULT_ADAPTER ")\n"
             "  --rx-iface NAME           Interface to capture ARP (default: eth0)\n"
             "  --tx-iface NAME           Interface to transmit ARP (default: eth0)\n"
             "  --tx-interval MS          Minimum milliseconds between probes (default: 100)\n"
             "  --keepalive-interval SEC  Keepalive interval seconds (default: 120)\n"
             "  --keepalive-miss COUNT    Probe failure threshold (default: 3)\n"
             "  --iface-holdoff SEC       Holdoff after iface invalid (default: 1800)\n"
+            "  --scan-interval MS        Manager scan interval milliseconds (default: 1000)\n"
             "  --max-terminals COUNT     Maximum tracked terminals (default: 1000)\n"
             "  --ignore-vlan VID         Ignore ARP seen on VLAN VID (repeatable)\n"
             "  --stats-interval SEC      Stats log interval seconds, 0 disables (default: 0)\n"
+            "  --vlan-iface-format STR   VLAN L3 iface name format with %%u placeholder (default: vlan%%u)\n"
             "  --log-level LEVEL         Log level trace|debug|info|warn|error|none (default: info)\n"
             "  --help                    Show this help message\n",
             g_program_name);
@@ -846,9 +848,11 @@ int main(int argc, char **argv) {
         {"keepalive-interval", required_argument, NULL, 'k'},
         {"keepalive-miss", required_argument, NULL, 'm'},
         {"iface-holdoff", required_argument, NULL, 'H'},
+        {"scan-interval", required_argument, NULL, 's'},
         {"max-terminals", required_argument, NULL, 'M'},
         {"ignore-vlan", required_argument, NULL, 'I'},
         {"stats-interval", required_argument, NULL, 'S'},
+        {"vlan-iface-format", required_argument, NULL, 'f'},
         {"log-level", required_argument, NULL, 'l'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
@@ -883,6 +887,11 @@ int main(int argc, char **argv) {
             break;
         case 'H':
             if (parse_unsigned_option("--iface-holdoff", optarg, &runtime_cfg.iface_invalid_holdoff_sec) != 0) {
+                return EXIT_FAILURE;
+            }
+            break;
+        case 's':
+            if (parse_unsigned_option("--scan-interval", optarg, &runtime_cfg.scan_interval_ms) != 0) {
                 return EXIT_FAILURE;
             }
             break;
@@ -945,6 +954,13 @@ int main(int argc, char **argv) {
             runtime_cfg.log_level = level;
             break;
         }
+        case 'f':
+            if (!optarg || optarg[0] == '\0') {
+                fprintf(stderr, "%s: vlan-iface-format must be non-empty\n", g_program_name);
+                return EXIT_FAILURE;
+            }
+            runtime_cfg.vlan_iface_format = optarg;
+            break;
         case 'h':
             print_usage(stdout);
             return EXIT_SUCCESS;

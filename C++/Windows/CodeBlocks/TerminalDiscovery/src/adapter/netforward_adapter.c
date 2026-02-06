@@ -36,7 +36,7 @@ struct sockaddr_vlan {
     uint32_t port;
     uint16_t vlanid;
     uint16_t svlanid;
-    uint32_t length;    /* Length of Ethernet frame (excluding this header) */
+    uint32_t length;    /* Total length: sizeof(header) + payload (no Ethernet header) */
     uint16_t eth_type;
 };
 
@@ -285,35 +285,30 @@ static void discard_bytes(int fd, size_t len) {
 }
 
 static void deliver_packet(struct td_adapter *adapter,
-                           const uint8_t *frame,
-                           size_t frame_len,
-                           uint32_t ifindex,
-                           int vlan_id) {
-    if (!adapter || !frame || frame_len < sizeof(struct ethhdr)) {
+                           const struct sockaddr_vlan *header,
+                           const uint8_t *payload,
+                           size_t payload_len) {
+    if (!adapter || !header || !payload || payload_len == 0 || payload_len > TD_NETFORWARD_MAX_FRAME) {
         return;
     }
 
-    struct ethhdr eth;
-    memcpy(&eth, frame, sizeof(eth));
-
-    uint16_t ether_type = ntohs(eth.h_proto);
-    size_t offset = sizeof(struct ethhdr);
-
-    if (ether_type == ETH_P_8021Q || ether_type == ETH_P_8021AD) {
-        if (frame_len < offset + sizeof(struct vlan_header)) {
-            return;
-        }
-        struct vlan_header vlan;
-        memcpy(&vlan, frame + offset, sizeof(vlan));
-        ether_type = ntohs(vlan.encapsulated_proto);
-        offset += sizeof(vlan);
-    }
-
+    uint16_t ether_type = header->eth_type;
     if (ether_type != ETH_P_ARP) {
         return;
     }
 
-    size_t payload_len = frame_len > offset ? (frame_len - offset) : 0U;
+    if (payload_len < sizeof(struct ether_arp)) {
+        return;
+    }
+
+    /* Build a synthetic Ethernet frame so downstream consumers keep working. */
+    uint8_t frame_buf[sizeof(struct ethhdr) + TD_NETFORWARD_MAX_FRAME];
+    struct ethhdr *eth = (struct ethhdr *)frame_buf;
+    memcpy(eth->h_dest, header->dest_mac, ETH_ALEN);
+    memcpy(eth->h_source, header->src_mac, ETH_ALEN);
+    eth->h_proto = htons(ether_type);
+    memcpy(frame_buf + sizeof(struct ethhdr), payload, payload_len);
+    size_t frame_len = sizeof(struct ethhdr) + payload_len;
 
     struct td_adapter_packet_subscription sub;
     bool subscribed = false;
@@ -330,16 +325,16 @@ static void deliver_packet(struct td_adapter *adapter,
 
     struct td_adapter_packet_view view;
     memset(&view, 0, sizeof(view));
-    view.frame = frame;
+    view.frame = frame_buf;
     view.frame_len = frame_len;
-    view.payload = frame + offset;
+    view.payload = frame_buf + sizeof(struct ethhdr);
     view.payload_len = payload_len;
     view.ether_type = ether_type;
-    view.vlan_id = normalize_vlan(vlan_id);
+    view.vlan_id = normalize_vlan(header->vlanid);
     clock_gettime(CLOCK_REALTIME, &view.ts);
-    view.ifindex = ifindex;
-    memcpy(view.src_mac, eth.h_source, ETH_ALEN);
-    memcpy(view.dst_mac, eth.h_dest, ETH_ALEN);
+    view.ifindex = header->port;
+    memcpy(view.src_mac, header->src_mac, ETH_ALEN);
+    memcpy(view.dst_mac, header->dest_mac, ETH_ALEN);
 
     sub.callback(&view, sub.user_ctx);
 }
@@ -347,14 +342,20 @@ static void deliver_packet(struct td_adapter *adapter,
 static void *rx_thread_main(void *arg) {
     struct td_adapter *adapter = arg;
     uint8_t buffer[TD_NETFORWARD_MAX_FRAME + sizeof(struct sockaddr_vlan)];
+    int backoff_ms = 100;
 
     while (atomic_load(&adapter->running)) {
         if (adapter->sock_fd < 0) {
             if (connect_sidecar(adapter) != TD_ADAPTER_OK) {
-                struct timespec ts = {.tv_sec = 0, .tv_nsec = 100 * 1000000L};
+                if (backoff_ms > 300) {
+                    backoff_ms = 300;
+                }
+                struct timespec ts = {.tv_sec = backoff_ms / 1000, .tv_nsec = (backoff_ms % 1000) * 1000000L};
                 nanosleep(&ts, NULL);
+                backoff_ms = backoff_ms < 300 ? backoff_ms + 50 : 300;
                 continue;
             }
+            backoff_ms = 100;
         }
 
         struct sockaddr_vlan header;
@@ -380,10 +381,16 @@ static void *rx_thread_main(void *arg) {
             continue;
         }
 
-        size_t frame_len = header.length;
-        size_t total_len = sizeof(header) + frame_len;
-        if (frame_len == 0 || frame_len > TD_NETFORWARD_MAX_FRAME || total_len > sizeof(buffer)) {
-            nf_logf(adapter, TD_LOG_WARN, "dropping frame len=%zu (max %u)", frame_len, TD_NETFORWARD_MAX_FRAME);
+        size_t total_len = header.length;
+        if (total_len < sizeof(header)) {
+            nf_logf(adapter, TD_LOG_WARN, "dropping frame total_len=%zu < header", total_len);
+            discard_bytes(adapter->sock_fd, total_len);
+            continue;
+        }
+
+        size_t payload_len = total_len - sizeof(header);
+        if (payload_len == 0 || payload_len > TD_NETFORWARD_MAX_FRAME || total_len > sizeof(buffer)) {
+            nf_logf(adapter, TD_LOG_WARN, "dropping payload len=%zu (max %u)", payload_len, TD_NETFORWARD_MAX_FRAME);
             discard_bytes(adapter->sock_fd, total_len);
             continue;
         }
@@ -401,8 +408,8 @@ static void *rx_thread_main(void *arg) {
         }
 
         memcpy(&header, buffer, sizeof(header));
-        const uint8_t *frame = buffer + sizeof(header);
-        deliver_packet(adapter, frame, frame_len, header.port, header.vlanid);
+        const uint8_t *payload = buffer + sizeof(header);
+        deliver_packet(adapter, &header, payload, payload_len);
     }
 
     nf_logf(adapter, TD_LOG_INFO, "RX thread stopping");

@@ -14,17 +14,19 @@
 - 提供可嵌入外部守护进程的初始化入口，满足多平台统一集成和生命周期托管。
 
 ## 交付与运行模式
-- 公共逻辑（`common/`、`include/`）以 `libtd_common.a` 交付，平台主进程仅链接该跨平台静态库；Realtek/Netforward 主进程彼此独立运行。sidecar 仅在 Netforward 平台存在，位于 `stub/`，为独立进程且不依赖该静态库；其他平台（含 Realtek/Linux raw socket 等）不引入 sidecar。
+- 公共逻辑（`td_commonlib/src`、`td_commonlib/include`）以 `libtd_common.a` 交付，平台主进程仅链接该跨平台静态库；Realtek/Netforward 主进程彼此独立运行。sidecar 仅在 Netforward 平台存在，位于 `stub/`，为独立进程且不依赖该静态库；其他平台（含 Realtek/Linux raw socket 等）不引入 sidecar。
 - 平台适配器（Realtek、Netforward、Linux raw socket 等）在各自工程内单独编译成对象文件并与宿主进程/固件链接发布，运行时仅携带本平台适配器，不做动态切换或并行装载。
 - 构建隔离：各平台保持独立编译入口/目标（含 sidecar），只依赖 `libtd_common.a` 与公共头；构建任一平台不检查其他平台的工具链或适配器对象，禁止单二进制条件编译多适配器。
+- 公共静态库独立仓/目录：平台无关静态库源码与头文件需放在独立目录并具备独立 makefile（可单独 SVN/仓库存放和编译），Realtek/Netforward 等平台的 makefile 通过调用该公共 makefile 获取产物后再链接平台代码，保持公共库与平台工程的物理与编译解耦。
 - 运行时配置仅覆盖当前已编译进进程的适配器参数（接口名、发包节流、VLAN 过滤等），无法通过配置启用其他平台适配器。
 - `src/` 目录物理分离平台无关/有关代码：公共代码编译成静态库，平台代码在各自工程内编译并与静态库解耦，便于增量集成新平台。
+- 头文件分层：平台无关头全部位于 `src/td_commonlib/include/` 并随 `libtd_common.a` 交付；平台专属头直接放在 `src/include/`（如 `src/include/realtek_mac_bridge.h`），由对应平台 makefile 定向 `-I`。公共静态库不得依赖 `src/include/` 根目录；netforward sidecar 头（如 `netforward_sidecar.h`）仍放在 `src/sidecar/` 并仅在 netforward 构建包含。平台文件命名：所有平台相关的源/头文件（含 demo、stub、测试、桥接等）必须以平台名称为前缀进行命名（例如 Realtek 平台使用 `realtek_*.c/.h`），避免与平台无关文件混淆；已存在未加前缀的历史文件需在重构时统一更名。命名合规后，平台文件可以与其他平台文件共存于同一目录（例如 `src/adapter/` 中同时存在 `realtek_adapter.c`、`netforward_adapter.c`），无需再通过额外子文件夹区分。
 - Realtek 先行落地：优先打通静态库与 Realtek 适配层的编译链，保持现有编译选项与桥接依赖可用，再渐进推广到其他平台，避免一次性拆分阻断现网集成。
  - 构建与测试布局：
    - 顶层 Makefile 仅作分发器，提供 `make realtek`、`make netforward`、`make linux` 等对等命名的入口跳转至对应子目录，不再用单一 Makefile 携带全部平台规则；各平台目标命名需对等、对齐，避免出现默认/主平台的特殊命名（如 `all` 只代表某一平台）。
     - 每个平台拥有独立的 makefile 入口，负责本平台主进程与（仅 Netforward）sidecar 的编译、静态库的生成/清理（不单独暴露“仅编库”目标），并将对象文件与产物存放在平台私有输出目录（如 `out/<platform>/`），避免同名目标冲突。
     - 公共静态库仍为 `libtd_common.a`，由各平台 makefile 复用并在各自流程内生成/清理；平台适配器/sidecar 源文件以“白名单”方式写入各自 makefile，禁止跨平台引用。
-    - Realtek 专属实现（除适配器外）仅在 Realtek 平台构建：`stub/td_switch_mac_stub.c`（覆盖 Realtek MAC 桥接弱符号）、`demo/td_switch_mac_demo.c`（桥接示例）、`src/ref/realtek/*`（仅作参考）与其他依赖 Realtek SDK/桥接头文件的源文件不得在 Netforward/Linux raw socket 等平台的构建入口中被包含，避免因缺失 SDK 依赖导致编译失败；非 Realtek 平台仅链接 `libtd_common.a` 与各自的适配器/sidecar 对象。
+   - Realtek 专属实现（除适配器外）仅在 Realtek 平台构建：`stub/realtek_mac_stub.c`（覆盖 Realtek MAC 桥接弱符号）、`demo/realtek_mac_demo.c`（桥接示例）、`src/ref/realtek/*`（仅作参考）与其他依赖 Realtek SDK/桥接头文件的源文件不得在 Netforward/Linux raw socket 等平台的构建入口中被包含，避免因缺失 SDK 依赖导致编译失败；非 Realtek 平台仅链接 `libtd_common.a` 与各自的适配器/sidecar 对象。
     - Netforward 平台在 makefile 中提供 sidecar 专用目标（如 `sidecar`、`sidecar-stub`），主进程与 sidecar 分别产出独立二进制，允许通过变量切换真实 IPC 对象或 stub。
     - 测试程序按平台无关性划分：平台无关测试需在所有平台 makefile 中构建；平台相关测试仅在对应平台 makefile 中构建与执行。
       - 各平台 makefile 需支持 `CROSS_PREFIX`/`cross-generic` 目标，使用通用交叉工具链（如 `mips-linux-gnu-`、`aarch64-linux-gnu-` 前缀）完成编译，以验证嵌入式环境的可行性并保持与现网平台一致；`cross` 目标仅供厂商特定工具链（如 `mips-rtl83xx-linux-`）存在时选择性使用，默认交叉验证依赖 `cross-generic`，不得将厂商专有工具链设为必备。
@@ -138,12 +140,15 @@
       - 缓存可用但未命中目标 MAC/VLAN 时返回 `TD_ADAPTER_ERR_NOT_FOUND`，同时输出 `ifindex=0` 并保留当前版本号，禁止使用 `NOT_READY` 触发重复刷新；
       - 相关语义需在 `realtek_mac_locator_lookup` 与后续桥接实现中保持一致，确保 `mac_need_refresh` 队列不会因错误码混用而无限膨胀。
 - **Netforward 参考约束与流程**：
-   - sidecar 由来：与 hsl 进程间通信收包需要引入平台特定的进程框架，为避免污染/耦合集成本项目的主进程，采用 cloud-native sidecar 模式：sidecar 引入平台框架并完成与 hsl 的通信，再将报文透传给主进程。
+    - sidecar 由来：与 hsl 进程间通信收包需要引入平台特定的进程框架，为避免污染/耦合集成本项目的主进程，采用 cloud-native sidecar 模式：sidecar 引入平台框架并完成与 hsl 的通信，再将报文透传给主进程。
+    - sidecar 形态拆分：
+       1) `src/stub/` 下的 sidecar 源文件用于模拟独立 sidecar 进程，包含 `main`，负责参数解析、模拟 hsl 收包、信号处理等；用于无 hsl 环境的本地演练。
+      2) `src/sidecar/` 下的 sidecar 源文件负责与终端发现进程的 Unix Socket 建连与维护，作为服务端将模拟自 hsl 收到的 `sockaddr_vlan + payload` 通过 Unix Socket 透传给终端发现进程；该目录代码需在正式项目中复用，并实现 `void netforward_sidecar_forward(unsigned char *buf, int len)`（`buf` 含 `sockaddr_vlan` 头部加协议负载，netforward 现网 ARP 报文在头后直接以 Hardware Type 开始的 ARP 负载，不再附带以太网头，`len` 为总长度），实际环境中 epoll 从 hsl 读满报文后调用该函数完成转发。
    - 现阶段 sidecar 可不接入 hsl，默认以 stub/自发模拟报文完成终端发现链路验收；但需保持与 hsl 对接的兼容性（沿用相同 IPC 头部与收包流程），便于后续无缝切换为真实 hsl 数据源。
    - 收包链路：参考 `src/ref/netforward`，通过与用户态核心转发进程 hsl 的 IPC 收包，不再使用 Raw Socket。sidecar 负责接入平台框架并与 hsl 通信，将报文透传给主进程；主进程在适配器内解析后喂给已注册的 `register_packet_rx` 回调。提供 sidecar 打桩以便无 hsl 环境下验收。
    - 元数据解析：报文自带 CPU tag，`port` 字段即整机 ifindex（物理口），无需 `td_adapter_mac_locator_ops`。VLAN 取自 `vlanid` 字段；整机 ifindex 与 VLANIF 的 `kernel_ifindex` 语义独立，不混用。
    - 发包路径：主进程直接在对应 VLAN 虚接口（前缀 `Vlan`，如 `Vlan1`）发送，不经过 IPC/sidecar，也不使用“全局” `eth0`。平台不依赖且不提供 `libswitchapp.so`。
-   - IPC 报文格式（sidecar↔hsl）：地址头为 `struct sockaddr_vlan`，后随完整以太网帧。
+   - IPC 报文格式（sidecar↔hsl）：地址头为 `struct sockaddr_vlan`，后随协议负载；在 netforward 实际场景中 ARP 报文直接在 `struct sockaddr_vlan` 之后紧跟 ARP 头/体（首字段为 Hardware Type），不携带以太网头。
 
 ```
 struct sockaddr_vlan {
@@ -152,7 +157,7 @@ struct sockaddr_vlan {
    unsigned int port;        /* Outgoing/Incoming interface index */
    unsigned short vlanid;    /* Vlan id */
    unsigned short svlanid;   /* SVlan id */
-   unsigned int length;      /* Length of the Packet */
+   unsigned int length;      /* Total bytes = sizeof(sockaddr_vlan) + payload */
    unsigned short eth_type;  /* Ethernet type */
 };
 
@@ -160,9 +165,10 @@ struct sockaddr_vlan {
 ```
 
     sidecar 仅做透传，不修改报文；适配器负责将 `port`/`vlanid` 整理为平台无关层可用的 VLAN 和整机 ifindex。
-   - 参考收包链路（便于 sidecar 模拟）：参考代码中通过 `message_client` 异步连接 HSL（Unix 域 `HSL_ASYNC_PATH` 或 TCP `HSL_ASYNC_PORT`），epoll 激活后进入“先 peek 头、再按长度读全帧”的流程：先用 `MSG_PEEK` 读取 `struct sockaddr_vlan` 拿到 `length`，再按该长度读完完整报文，拷贝头部后将余下以太帧交给平台解析。sidecar stub 需保持同一封装（头部 + 完整二层帧）以复用解析逻辑。
-   - sidecar 与主进程（netforward 适配器）间的报文透传统一使用 Unix 域可靠流式 IPC，保证头部与帧数据的字节序、完整性与有序性，并与参考代码的 epoll/peek 读法天然对齐；本地同机场景无需退化到 UDP 或无序报文模式。
-   - sidecar模拟补充：参考代码的收包回调按报文粒度触发，每次 epoll 可读只消费一个完整报文（`struct sockaddr_vlan` 头 + 长度为 `length` 的以太帧），不会合并多帧或拆分半帧；`length` 表示纯以太网帧长度（不含 `struct sockaddr_vlan`），sidecar/hsl 应保证 `length` 与后续帧字节数一致。stub 发送时需先写完整头，再紧跟帧内容，避免出现短读或多帧黏连导致解析偏移。
+   - 参考收包链路（便于 sidecar 模拟）：参考代码中通过 `message_client` 异步连接 HSL（Unix 域 `HSL_ASYNC_PATH` 或 TCP `HSL_ASYNC_PORT`），epoll 激活后进入“先 peek 头、再按长度读负载”的流程：先用 `MSG_PEEK` 读取 `struct sockaddr_vlan` 拿到 `length`（总长度，含头），再按该长度读完报文，将头部与 payload 拆开后交给平台解析。sidecar stub 需保持同一封装（头部 + payload）以复用解析逻辑。
+   - sidecar 与主进程（netforward 适配器）间的报文透传统一使用 Unix 域可靠流式 IPC，保证头部与负载数据的字节序、完整性与有序性，并与参考代码的 epoll/peek 读法天然对齐；本地同机场景无需退化到 UDP 或无序报文模式。
+   - 单客户端、可重连策略：sidecar 只接受单个客户端连接，循环 accept；客户端断开或写失败即关闭并重新 accept，不做多客户端复用。适配器在读写错误或对端关闭时立即关闭 fd、置 -1，并按短暂退避（100–300ms，上限封顶）重连，RX 线程常驻。协议仍为 `sockaddr_vlan + payload`（ARP 负载首字段为 Hardware Type），此阶段不增加握手，仅依赖连接成功；sidecar 响应 SIGINT/SIGTERM 清理 socket 路径。
+   - sidecar模拟补充：参考代码的收包回调按报文粒度触发，每次 epoll 可读只消费一个完整报文（`struct sockaddr_vlan` 头 + 长度为 `length` 的 payload），不会合并多帧或拆分半帧；`length` 表示协议负载长度（例如 ARP 头/体，不含 `struct sockaddr_vlan` 也不含以太网头），sidecar/hsl 应保证 `length` 与后续负载字节数一致。stub 发送时需先写完整头，再紧跟 payload，避免出现短读或多帧黏连导致解析偏移。
    - 运行步骤：sidecar stub 模拟 hsl IPC→适配器解析 VLAN/CPU tag→`register_packet_rx` 驱动终端发现；上行发包沿 VLANIF 直出。
    - 构建提示：直接使用通用 ARM64 交叉工具链（如 `aarch64-linux-gnu-`），无需依赖 `aarch64-none-linux-gnu-`。
 - **北向 API 约束**：

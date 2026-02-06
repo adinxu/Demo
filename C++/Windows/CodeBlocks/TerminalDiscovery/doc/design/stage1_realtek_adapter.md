@@ -5,12 +5,12 @@
 - 说明在核心终端引擎落地前，如何完成入方向 ARP 抓取与出方向保活探测。
 
 ## 主要模块
-- `src/include/adapter_api.h`：定义 `td_adapter_ops` 与 `td_adapter_mac_locator_ops` 以及报文视图、接口信息、计时器、ARP 发送请求等数据结构，是引擎与适配器之间的 ABI；`td_adapter_mac_locator_ops` 新增 `lookup_by_vid` 指针，用于承载 VLAN 点查接口。
+- `td_commonlib/include/adapter_api.h`：定义 `td_adapter_ops` 与 `td_adapter_mac_locator_ops` 以及报文视图、接口信息、计时器、ARP 发送请求等数据结构，是引擎与适配器之间的 ABI；`td_adapter_mac_locator_ops` 新增 `lookup_by_vid` 指针，用于承载 VLAN 点查接口。
 - `src/adapter/adapter_registry.c`：延迟注册内置适配器并按名称解析，目前仅暴露 Realtek 描述符。
 - `src/adapter/realtek_adapter.c/.h`：阶段 1 的 Realtek 实现，负责原始套接字生命周期、收包回调、ARP 发送与日志透传。
-- `src/include/td_logging.h` + `src/common/td_logging.c`：进程内轻量日志器，可配置日志级别与输出函数。
-- `src/include/td_config.h` + `src/common/td_config.c`：提供统一默认配置装载器，方便核心模块在引入配置文件前使用既定的适配器/RX/TX/节流/日志默认值。
-- `src/Makefile`：生成可执行程序 `terminal_discovery` 及测试二进制（`terminal_discovery_tests`、`terminal_integration_tests`、`td_switch_mac_stub_tests`），并提供 `cross`/`cross-generic` 目标快速验证交叉编译链路。
+- `td_commonlib/include/td_logging.h` + `td_commonlib/src/td_logging.c`：进程内轻量日志器，可配置日志级别与输出函数。
+- `td_commonlib/include/td_config.h` + `td_commonlib/src/td_config.c`：提供统一默认配置装载器，方便核心模块在引入配置文件前使用既定的适配器/RX/TX/节流/日志默认值。
+- `build/realtek/Makefile`：调用 `build/common` 生成 `libtd_common.a` 后，构建可执行程序 `terminal_discovery` 及测试二进制（`terminal_discovery_tests`、`terminal_integration_tests`、`realtek_mac_stub_tests`、`terminal_embedded_init_tests`），并提供 `cross`/`cross-generic` 目标快速验证交叉编译链路。
 
 ## 关键数据结构
 - `struct td_adapter_ops`：适配器必须实现的函数表（`init/start/stop`、收包注册、`send_arp`、接口查询、计时器、日志桥接等）。
@@ -40,8 +40,8 @@
 - `atomic_bool running`：协调控制面与工作线程的启动/停止。
 
 ## MAC 表桥接与 ifindex 获取方案
-- Realtek 适配器在编译期直接链接外部团队交付的 `td_switch_mac_bridge` 模块（见 `src/include/td_switch_mac_bridge.h`），从而复用 demo 中已验证的 `td_switch_mac_get_capacity/td_switch_mac_snapshot` 调用路径。`realtek_init` 首次运行时会调用 `td_switch_mac_get_capacity`，将返回值缓存到 `adapter->mac_capacity`，并一次性 `calloc` 对应数量的 `SwUcMacEntry` 缓冲区；若桥接暂不可用，会以 `TD_ADAPTER_ERR_NOT_READY` 形式回传，调用方可按需重试。
-  - 开发环境缺失 `libswitchapp.so` 时启用工程内置的弱符号桩实现（`src/stub/td_switch_mac_stub.c`）。桩在第一次调用时打印提示、返回固定容量 1024，并填充少量示例条目；真实桥接编译进最终镜像后会自动覆盖弱符号，无需修改调用方逻辑。
+- Realtek 适配器在编译期直接链接外部团队交付的 MAC 桥接模块（见 `src/include/realtek_mac_bridge.h`），从而复用 demo 中已验证的 `td_switch_mac_get_capacity/td_switch_mac_snapshot` 调用路径。`realtek_init` 首次运行时会调用 `td_switch_mac_get_capacity`，将返回值缓存到 `adapter->mac_capacity`，并一次性 `calloc` 对应数量的 `SwUcMacEntry` 缓冲区；若桥接暂不可用，会以 `TD_ADAPTER_ERR_NOT_READY` 形式回传，调用方可按需重试。
+  - 开发环境缺失 `libswitchapp.so` 时启用工程内置的弱符号桩实现（`src/stub/realtek_mac_stub.c`）。桩在第一次调用时打印提示、返回固定容量 1024，并填充少量示例条目；真实桥接编译进最终镜像后会自动覆盖弱符号，无需修改调用方逻辑。
 - 适配器新增内部结构 `struct realtek_mac_cache`：
   - `SwUcMacEntry *entries`：指向上述静态缓冲区，生命周期与适配器一致。
   - `uint32_t capacity`/`uint32_t used`：缓存容量与最近一次快照条数。
@@ -60,14 +60,14 @@
   - 若桥接暂不可用或返回错误，线程不会执行退避重试，而是保留当前状态等待下一次常规唤醒；发生错误时仍会通过 `adapter_env.log_fn` 输出 WARN 供排查。
 - 为了与 demo 行为保持一致，适配器绝不在快照路径内分配临时缓冲区，所有 `SwUcMacEntry` 复用与容量缓存都在 `realtek_init` 阶段完成；桥接模块内部的 `createSwitch` 亦只在装载时执行一次，并由其自行管理线程安全与引用计数。
 - 适配器调用链在遇到桥接不可达、快照失败或查不到指定 MAC 时不会阻塞收包线程：查询函数仅返回错误码，终端管理器可选择保留 `ifindex=0` 并等待下次成功刷新；`mac_cache_worker` 将自动在后台重试刷新，避免在报文路径等待；点查路径也遵循同样策略，`TD_ADAPTER_ERR_NOT_READY` 直接透传回管理器，由其按需重新排队，`TD_ADAPTER_ERR_NOT_FOUND` 则用于阻止在同一 VLAN 内的重复点查。
-- `src/stub/td_switch_mac_stub.c` 为 `td_switch_mac_get_ifindex_by_vid` 提供弱符号桩实现，可通过 `TD_SWITCH_MAC_STUB_LOOKUP` 环境变量控制行为：默认按内建样例匹配 VLAN/MAC，设置为 `hit`/`miss`/具体下标可强制命中或未命中。桩命中时会打印 `[switch-mac-stub] td_switch_mac_get_ifindex_by_vid hit ...` 并写回样例 ifindex，未命中返回 `-ENOENT`，便于在 x86 环境验证终端管理器的点查与回退路径。
+- `src/stub/realtek_mac_stub.c` 为 `td_switch_mac_get_ifindex_by_vid` 提供弱符号桩实现，可通过 `TD_SWITCH_MAC_STUB_LOOKUP` 环境变量控制行为：默认按内建样例匹配 VLAN/MAC，设置为 `hit`/`miss`/具体下标可强制命中或未命中。桩命中时会打印 `[switch-mac-stub] td_switch_mac_get_ifindex_by_vid hit ...` 并写回样例 ifindex，未命中返回 `-ENOENT`，便于在 x86 环境验证终端管理器的点查与回退路径。
 ## 配置与日志
-- `td_config_load_defaults` 输出统一默认配置：适配器名 `realtek`、收包口 `eth0`、发包口 `eth0`、ARP 节流间隔 100 ms、日志级别 INFO。
+- `td_config_load_defaults` 输出统一默认配置：适配器名取自编译期宏 `TD_DEFAULT_ADAPTER`（由各平台 makefile 通过 `-DTD_DEFAULT_ADAPTER="<name>"` 注入，Realtek 构建默认值为 `realtek`），收包口 `eth0`、发包口 `eth0`、ARP 节流间隔 100 ms、日志级别 INFO。
 - `td_log_writef` 提供统一的结构化日志入口，通过 `td_adapter_env` 可注入外部日志管道。
 
 ## 构建产物
-- `src/Makefile` 默认构建可执行文件 `terminal_discovery` 以及测试二进制 `terminal_discovery_tests`、`terminal_integration_tests`、`td_switch_mac_stub_tests`。`make` 使用本地工具链直接产出这些目标；`make test` 会依次运行三组测试。
-- 通过 `make cross` 可指定 `mips-rtl83xx-linux-` 前缀完成 Realtek 平台交叉编译，`make cross-generic` 使用 `mips-linux-gnu-` 前缀进行通用 MIPS 交叉验证。
+- `build/realtek/Makefile` 默认先调用 `build/common` 产出 `libtd_common.a`，再构建可执行文件 `terminal_discovery` 以及测试二进制 `terminal_discovery_tests`、`terminal_integration_tests`、`realtek_mac_stub_tests`、`terminal_embedded_init_tests`。在 `build/realtek` 目录下执行 `make` 构建主程序，`make test` 会依次运行四组测试。
+- 在 `build/realtek` 目录下通过 `make cross` 可指定 `mips-rtl83xx-linux-` 前缀完成 Realtek 平台交叉编译，`make cross-generic` 使用 `mips-linux-gnu-` 前缀进行通用 MIPS 交叉验证。
 
 ## 集成建议
 - 阶段 2/3 代码应：

@@ -1,5 +1,5 @@
-#ifndef TD_SWITCH_MAC_BRIDGE_H
-#define TD_SWITCH_MAC_BRIDGE_H
+#ifndef REALTEK_MAC_BRIDGE_H
+#define REALTEK_MAC_BRIDGE_H
 
 #include <stdint.h>
 
@@ -7,8 +7,8 @@
 extern "C" {
 #endif
 
-#ifndef TD_SWITCH_MAC_FALLBACK_TYPES_DEFINED
-#define TD_SWITCH_MAC_FALLBACK_TYPES_DEFINED
+#ifndef REALTEK_MAC_FALLBACK_TYPES_DEFINED
+#define REALTEK_MAC_FALLBACK_TYPES_DEFINED
 
 typedef unsigned char uint8;
 typedef unsigned short uint16;
@@ -35,7 +35,7 @@ typedef struct __SwUcMacEntry {
     uint32 ifindex;
 } SwUcMacEntry;
 
-#endif /* TD_SWITCH_MAC_FALLBACK_TYPES_DEFINED */
+#endif /* REALTEK_MAC_FALLBACK_TYPES_DEFINED */
 
 int td_switch_mac_get_capacity(uint32_t *out_capacity);
 int td_switch_mac_snapshot(SwUcMacEntry *entries, uint32_t *out_count);
@@ -45,4 +45,4 @@ int td_switch_mac_get_ifindex_by_vid(SwUcMacEntry *entry);
 }
 #endif
 
-#endif /* TD_SWITCH_MAC_BRIDGE_H */
+#endif /* REALTEK_MAC_BRIDGE_H */
